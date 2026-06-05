@@ -4,18 +4,23 @@ ort.env.wasm.numThreads = 1;
 ort.env.wasm.wasmPaths = '/background/';
 ort.env.wasm.proxy = false;
 
-// LCU returns champion *display* names ("Nunu & Willump", "Dr. Mundo") but
-// the classifier labels file is keyed by sanitized asset names ("Nunu",
-// "Dr_ Mundo"). Without this map the exact-match lookup in `load` returns
-// localClassIndex=-1 and EVERY blob scores 0.0 forever — confirmed root
-// cause of issue #7 for a Nunu player whose tracking never recovered after
-// the first SCANNING-to-LOCKED transition. Keys + values are pre-lowercased
-// for the case-insensitive lookup. Add new entries here if a future
-// champion ships with a display name that doesn't match its label.
-const DISPLAY_TO_LABEL_NAME: Record<string, string> = {
-  'nunu & willump': 'nunu',
-  'dr. mundo': 'dr_ mundo',
-};
+// LCU returns champion *display* names ("Nunu & Willump", "Dr. Mundo"); the
+// classifier label file is keyed by the scraper's sanitized folder names, which
+// replace every character outside [A-Za-z0-9 space ' -] with "_" (so the labels
+// read "Nunu _ Willump", "Dr_ Mundo"). `resolveLocalClassIndex` normalizes BOTH
+// sides the same way before matching, so punctuation differences line up on
+// their own. This was the root cause of issue #7: a raw exact-match left
+// localClassIndex=-1 and EVERY blob scored 0.0 forever for a Nunu player.
+//
+// DISPLAY_TO_LABEL_NAME is the escape hatch for the rarer case where an LCU
+// display name differs from the asset name by more than punctuation — none
+// currently, since normalization covers the known cases. Keys pre-lowercased.
+const DISPLAY_TO_LABEL_NAME: Record<string, string> = {};
+
+/** Mirror the scraper's safeDir() so LCU names line up with label folders. */
+function normalizeChampionName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9 '-]/g, '_').trim().toLowerCase();
+}
 
 export class ChampionClassifier {
   private session: ort.InferenceSession | null = null;
@@ -64,16 +69,18 @@ export class ChampionClassifier {
 
   /**
    * Pure function — exposed for testing. Returns -1 if no match found.
-   * Applies DISPLAY_TO_LABEL_NAME first so champions whose LCU display
-   * name differs from their classifier label still resolve.
+   * Normalizes the LCU name and each label the same way (mirroring the
+   * scraper's folder sanitization) so punctuation lines up; DISPLAY_TO_LABEL_NAME
+   * is applied first for any non-punctuation display/asset mismatch.
    */
   static resolveLocalClassIndex(
     labelMap: Record<string, string>,
     localChampionName: string,
   ): number {
-    const needle = (DISPLAY_TO_LABEL_NAME[localChampionName.toLowerCase()] ?? localChampionName).toLowerCase();
+    const mapped = DISPLAY_TO_LABEL_NAME[localChampionName.toLowerCase()] ?? localChampionName;
+    const needle = normalizeChampionName(mapped);
     for (const [idx, name] of Object.entries(labelMap)) {
-      if (name.toLowerCase() === needle) return parseInt(idx);
+      if (normalizeChampionName(name) === needle) return parseInt(idx);
     }
     return -1;
   }
