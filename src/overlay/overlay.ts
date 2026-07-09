@@ -270,7 +270,7 @@ btnAllyProximity.addEventListener('click', () => {
 // + push to Rust.
 const PTT_VK_KEY = 'lolproxchat.pttVk';
 const TOGGLE_VK_KEY = 'lolproxchat.toggleVk';
-const DEFAULT_PTT_VK = 0x14;  // Caps Lock — matches Rust default
+const DEFAULT_PTT_VK: number | null = null;  // unbound by default (#27); Caps Lock as PTT ate the key — bind explicitly in Settings
 const FORBIDDEN_CODES = new Set([
   'Escape', 'Tab',
   // Common LoL bindings — would conflict with gameplay even though our

@@ -67,4 +67,49 @@ describe('resolveProximityTargets', () => {
     const t = resolveProximityTargets({ Ahri: 0.3 }, ['Ahri']);
     expect(t.get('Ahri')).toBe(0.3);
   });
+
+  // Grace window (#27): a peer that briefly drops out of the response (e.g. a
+  // dropped coords packet on a lossy / DPI-bypass tunnel) holds its last volume
+  // instead of flapping to silence and back.
+  test('holds the last volume for a peer absent within the grace window', () => {
+    // now=1500, last seen at 1000 → 500ms ago, inside a 1500ms grace → hold 0.6.
+    const t = resolveProximityTargets({}, ['Zed'], {
+      lastVolumes: new Map([['Zed', 0.6]]),
+      lastSeenMs: new Map([['Zed', 1000]]),
+      now: 1500,
+      graceMs: 1500,
+    });
+    expect(t.get('Zed')).toBe(0.6);
+  });
+
+  test('drops to 0 once a peer has been absent longer than the grace window', () => {
+    // now=3000, last seen at 1000 → 2000ms ago, past a 1500ms grace → 0.
+    const t = resolveProximityTargets({}, ['Zed'], {
+      lastVolumes: new Map([['Zed', 0.6]]),
+      lastSeenMs: new Map([['Zed', 1000]]),
+      now: 3000,
+      graceMs: 1500,
+    });
+    expect(t.get('Zed')).toBe(0);
+  });
+
+  test('a never-seen peer gets 0 even with grace state', () => {
+    const t = resolveProximityTargets({}, ['Zed'], {
+      lastVolumes: new Map(),
+      lastSeenMs: new Map(),
+      now: 1000,
+      graceMs: 1500,
+    });
+    expect(t.get('Zed')).toBe(0);
+  });
+
+  test('a present peer ignores the grace and takes the response value', () => {
+    const t = resolveProximityTargets({ Zed: 0.2 }, ['Zed'], {
+      lastVolumes: new Map([['Zed', 0.6]]),
+      lastSeenMs: new Map([['Zed', 0]]),
+      now: 100000,
+      graceMs: 1500,
+    });
+    expect(t.get('Zed')).toBe(0.2);
+  });
 });

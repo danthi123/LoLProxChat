@@ -39,19 +39,46 @@ export function computeFinalPeerVolume(proximityVol: number, sliderVol: number):
  * the server always included far peers at volume 0, so the client never had
  * to handle absence.
  *
+ * `grace` (optional) softens that absence: if a peer was in the response very
+ * recently (within `graceMs`), HOLD its last volume instead of dropping to 0.
+ * A single dropped coords packet — common on lossy / DPI-bypass tunnels (#27)
+ * — briefly removes a peer from the response; without the grace that blips the
+ * audio to silence and straight back, which reads as the volume "flapping".
+ * After the window elapses the peer falls to 0 and the caller's EMA fades it.
+ *
  * Exported for unit testing without AudioService's WebAudio dependencies.
  */
 export function resolveProximityTargets(
   responseVolumes: Record<string, number>,
   connectedPeerNames: Iterable<string>,
+  grace?: {
+    lastVolumes: Map<string, number>;
+    lastSeenMs: Map<string, number>;
+    now: number;
+    graceMs: number;
+  },
 ): Map<string, number> {
   const out = new Map<string, number>();
   for (const [name, v] of Object.entries(responseVolumes)) out.set(name, v);
   for (const name of connectedPeerNames) {
-    if (!out.has(name)) out.set(name, 0);
+    if (out.has(name)) continue;
+    if (grace) {
+      const seen = grace.lastSeenMs.get(name);
+      if (seen !== undefined && grace.now - seen <= grace.graceMs) {
+        out.set(name, grace.lastVolumes.get(name) ?? 0);
+        continue;
+      }
+    }
+    out.set(name, 0);
   }
   return out;
 }
+
+// How long to keep a peer at its last proximity volume after it drops out of
+// the server response before fading to 0. Covers a dropped coords packet or two
+// on a lossy / DPI-bypass connection so the audio doesn't blip to silence and
+// back (#27).
+const PROXIMITY_GRACE_MS = 1500;
 
 export class AudioService {
   private localStream: MediaStream | null = null;
@@ -67,14 +94,19 @@ export class AudioService {
   // setPlayerVolume so the slider applies on top of real distance, not a
   // hardcoded 1.0. Updated on every applyPeerVolumes tick.
   private lastProximityVolumes: Map<string, number> = new Map();
+  // performance.now() of the last tick each peer appeared in the server
+  // response — drives the proximity grace window (see PROXIMITY_GRACE_MS, #27).
+  private lastSeenInResponseMs: Map<string, number> = new Map();
   // Throttling state for the verbose applyPeerVolumes snapshot log
   private lastVolumeLogLine = '';
   private lastVolumeLogMs = 0;
   private settings: AudioSettings = {
-    // Always-open by default; PTT (F8 hold) available in Settings.
+    // Always-open by default. Push-to-talk is unbound by default (#27) and
+    // bound in Settings; the real PTT keybind lives in the overlay (localStorage
+    // `lolproxchat.pttVk`) + the Rust hook, not this (vestigial) field.
     inputMode: 'always',
     inputVolume: 1.0,
-    pttKey: 'V',
+    pttKey: '',
     playerVolumes: {},
   };
 
@@ -365,9 +397,20 @@ export class AudioService {
       this.lastVolumeLogMs = now;
     }
 
-    // Process the union of response peers AND connected peers — connected
-    // peers absent from `volumes` are silenced (0), see resolveProximityTargets.
-    const targets = resolveProximityTargets(volumes, this.peers.keys());
+    // Mark every peer present in this response as freshly seen, so the grace
+    // window below only holds peers that genuinely just dropped out.
+    for (const name of Object.keys(volumes)) this.lastSeenInResponseMs.set(name, now);
+
+    // Process the union of response peers AND connected peers. Connected peers
+    // absent from `volumes` are silenced (0) — but a peer seen within the last
+    // PROXIMITY_GRACE_MS holds its last volume first, so a single dropped coords
+    // packet on a lossy tunnel doesn't blip the audio to silence and back (#27).
+    const targets = resolveProximityTargets(volumes, this.peers.keys(), {
+      lastVolumes: this.lastProximityVolumes,
+      lastSeenMs: this.lastSeenInResponseMs,
+      now,
+      graceMs: PROXIMITY_GRACE_MS,
+    });
     for (const [name, volume] of targets) {
       // Remember the proximity volume per peer so setPlayerVolume (the
       // per-row slider in the UI) can recompute finalVol correctly without
