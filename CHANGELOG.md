@@ -4,6 +4,12 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.5.6] — 2026-07-09
+
+### Fixed
+- **Caps Lock is no longer captured by default (#27).** Push-to-talk shipped bound to Caps Lock, and the keyboard hook cancels that keys toggle while it is the PTT key, so Caps Lock silently stopped working. PTT is now unbound by default; bind any key (Caps Lock included, if you want it) in Settings.
+- **Proximity volume no longer flaps to silence on brief drop-outs (#27).** A single dropped position update on a lossy or VPN connection used to blip a peer to silence and back; the client now holds the last volume for a short grace window before fading, which smooths voice on unstable links.
+
 ## [v0.5.5] — 2026-06-24
 
 ### Changed
@@ -327,6 +333,7 @@ All notable changes to this project are documented here. Format adapted from [Ke
 Initial public iteration: Overwolf → Tauri 2 migration, Supabase-stack → custom 1-container WebSocket signaling server, minimap CV pipeline (HSV color filter + blob detection + ONNX champion classifier), WebRTC P2P voice with AES-GCM encrypted position blobs computed server-side, in-app updater. See `docs/plans/` for the historical design + implementation documents from that period.
 
 [Unreleased]: https://github.com/danthi123/LoLProxChat/compare/v0.4.4...HEAD
+[v0.5.6]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.6
 [v0.5.5]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.5
 [v0.5.4]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.4
 [v0.5.3]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.3
