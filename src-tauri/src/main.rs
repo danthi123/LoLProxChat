@@ -175,10 +175,11 @@ fn main() {
 
             // Install the low-level WH_KEYBOARD_LL hook for in-game PTT (#1).
             // Replaces the old RegisterHotKey-based plugin which LoL's
-            // DirectInput layer was eating. Default PTT = Caps Lock,
-            // toggle-mute unbound by default (rebind UI ships in a follow-up).
+            // DirectInput layer was eating. PTT and toggle-mute are both unbound
+            // by default (#27) — the overlay pushes the user's stored bind, if
+            // any, on startup. Caps Lock as the old default silently ate the key.
             global_keys::setup_hook(app.handle().clone());
-            rust_log(&app.handle(), "global_keys: WH_KEYBOARD_LL hook installed (PTT=CapsLock)".to_string());
+            rust_log(&app.handle(), "global_keys: WH_KEYBOARD_LL hook installed (PTT unbound until set in Settings)".to_string());
 
             let Some(window) = app.get_webview_window("overlay") else {
                 return Ok(());
