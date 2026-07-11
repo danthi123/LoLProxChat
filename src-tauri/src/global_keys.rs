@@ -37,11 +37,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const VK_CAPITAL: u32 = 0x14;
 
-/// Currently-bound PTT virtual-key code. 0 = unbound, and that's the default:
-/// the hook leaves every key alone until the user binds a PTT key in Settings.
-/// Caps Lock is still bindable (and keeps the LED flip-back below) — it's just
-/// no longer the default, which silently ate the Caps Lock key (#27).
-static PTT_VK: AtomicU32 = AtomicU32::new(0);
+/// Currently-bound PTT virtual-key code. Default = Caps Lock. (v0.5.6 tried
+/// defaulting to unbound to stop PTT eating the Caps Lock key, but that left
+/// push-to-talk users unable to transmit — no key bound — so v0.5.7 restored
+/// the Caps Lock default. A migration that fixes the key capture without
+/// stranding PTT users is the proper follow-up. See #27.)
+static PTT_VK: AtomicU32 = AtomicU32::new(VK_CAPITAL);
 
 /// Currently-bound toggle-self-mute virtual-key code. 0 = unbound.
 static TOGGLE_VK: AtomicU32 = AtomicU32::new(0);
