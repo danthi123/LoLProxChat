@@ -4,6 +4,11 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.5.7] — 2026-07-09
+
+### Fixed
+- **Restored push-to-talk out of the box (#27).** v0.5.6 changed the default push-to-talk key to unbound, which left push-to-talk users unable to transmit (no key was bound) so they could not hear each other. Reverted to the previous Caps Lock default so voice works again; a cleaner fix for the Caps Lock capture that does not strip PTT from people who use it will follow.
+
 ## [v0.5.6] — 2026-07-09
 
 ### Fixed
@@ -333,6 +338,7 @@ All notable changes to this project are documented here. Format adapted from [Ke
 Initial public iteration: Overwolf → Tauri 2 migration, Supabase-stack → custom 1-container WebSocket signaling server, minimap CV pipeline (HSV color filter + blob detection + ONNX champion classifier), WebRTC P2P voice with AES-GCM encrypted position blobs computed server-side, in-app updater. See `docs/plans/` for the historical design + implementation documents from that period.
 
 [Unreleased]: https://github.com/danthi123/LoLProxChat/compare/v0.4.4...HEAD
+[v0.5.7]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.7
 [v0.5.6]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.6
 [v0.5.5]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.5
 [v0.5.4]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.4
