@@ -13,7 +13,7 @@ name: proxchat
 #      HMAC credentials when the Cloudflare vars are absent)
 #   3. Uncomment the `coturn` service block at the bottom of this file
 #   4. Configure coturn/turnserver.conf and (optionally) TLS_CERT_DIR — see
-#      docs/SETUP.md § "Optional: self-host coturn"
+#      docs/self-hosting.md § "Optional: self-host coturn"
 # ============================================================================
 
 services:
@@ -31,7 +31,9 @@ services:
       # are unset). Safe to leave blank if you're on Cloudflare TURN.
       - TURN_SERVER=${TURN_SERVER:-}
       - TURN_SECRET=${TURN_SECRET:-}
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      # Legacy: only the old pre-v0.3 encrypted-position path used this; the
+      # current tiered path ignores it. Leave it unset — the :- keeps compose quiet.
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3100/health').then(r=>{if(!r.ok)throw 1})"]
@@ -42,7 +44,7 @@ services:
   # ----------------------------------------------------------------------------
   # Optional: self-hosted coturn. Uncomment this block if you set TURN_SERVER
   # and TURN_SECRET above and want to run your own TURN relay instead of using
-  # Cloudflare. See docs/SETUP.md for turnserver.conf and TLS_CERT_DIR setup.
+  # Cloudflare. See docs/self-hosting.md for turnserver.conf and TLS_CERT_DIR setup.
   # ----------------------------------------------------------------------------
   # coturn:
   #   container_name: proxchat-coturn

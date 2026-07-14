@@ -6,6 +6,17 @@ For client-side usage, see the [user guide](user-guide.md).
 
 **License note (AGPLv3).** If you run a *modified* version of the server as a network service, the AGPLv3 requires you to offer its users the corresponding source. Running it unmodified — or modifying it privately without offering it as a network service — carries no such obligation.
 
+## What you'll set up
+
+Four pieces — the first three are server-side, and the last one you build once:
+
+1. **The signaling server** — one small Node container via Docker Compose. Handles room presence, relays the WebRTC handshake, and does the distance→volume math.
+2. **A TURN relay** — so players behind strict NATs can still connect to each other. Easiest is **Cloudflare Realtime TURN** (nothing to run, generous free tier); or self-host **coturn** if you'd rather not use Cloudflare.
+3. **A reverse proxy for HTTPS** — Caddy or nginx in front of the server to terminate TLS and forward WebSockets. You almost certainly already run one.
+4. **The client, rebuilt to point at your server** — a one-time `tauri build` with your server URL baked in, which you then hand to your players.
+
+**The fast path is Steps 1–4 below** — Cloudflare TURN + Docker + Caddy — and that's all most people need. The coturn section near the end is only if you'd rather run your own relay.
+
 ## Architecture in one paragraph
 
 The server is a ~500-LOC Node process: WebSocket signaling (room presence + offer/answer/ICE relay + per-client XY coords store), per-pair distance → volume math against that store, and TURN credential issuance (Cloudflare Realtime TURN by default; coturn HMAC as a fallback). Single container deployed via Docker Compose. Stateless modulo the in-memory rooms table (which now also holds the latest coords per client) — restarts drop active rooms, clients reconnect automatically. See [`architecture.md`](architecture.md) for the full picture.
@@ -13,8 +24,9 @@ The server is a ~500-LOC Node process: WebSocket signaling (room presence + offe
 ## Prerequisites
 
 - A Linux host with Docker (or Node 18+ for the no-Docker path).
-- A domain name with a wildcard or specific TLS cert (Caddy or another auto-cert reverse proxy makes this painless).
+- A domain name, with a DNS record pointing at your host, plus a wildcard or specific TLS cert (Caddy or another auto-cert reverse proxy makes the cert painless).
 - A Cloudflare account if you're going the recommended TURN route. The free tier covers 1 TB egress/month — sufficient for thousands of voice-hours.
+- Only for the final "rebuild the client" step: the **Rust + Tauri build toolchain** on whatever machine you build on (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)). It's a heavier install than the server — nothing else here needs it.
 
 ## Step 1 — Get TURN credentials (Cloudflare Realtime TURN, recommended)
 
@@ -39,7 +51,9 @@ TURN_KEY_ID=<UUID from Cloudflare>
 TURN_KEY_API_TOKEN=<token from Cloudflare>
 ```
 
-The compose file is at `docker-compose.proxchat.yml` in the repo root. `.env` is already in `.gitignore`.
+The compose file is at [`docker-compose.proxchat.yml`](../docker-compose.proxchat.yml) in the repo root. `.env` is already in `.gitignore`.
+
+Those two lines are the whole file for a Cloudflare-TURN deployment. (You'll spot an `ENCRYPTION_KEY` in the compose — it's a leftover from the old pre-v0.3 position-encryption path that the current server ignores. Leave it unset.)
 
 ## Step 3 — Deploy via Docker
 
@@ -186,11 +200,11 @@ PROXCHAT_DEPLOY_PATH=/path/to/proxchat-server \
 
 ## Pointing the client at your server
 
-A built client baked in its `PROXCHAT_SERVER` URL at compile time. To point at your deployment:
+A built client bakes in its `PROXCHAT_SERVER` URL at compile time, so each operator builds their own. To point at your deployment:
 
 1. Clone the repo, `cp .env.example .env`.
 2. Edit `.env`: `PROXCHAT_SERVER=https://proxchat.your-domain.com`.
-3. `npx tauri build`.
+3. `npx tauri build` — this is the one step that needs the Rust + Tauri toolchain rather than just Docker (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)).
 4. Distribute the resulting `lolproxchat.exe` to your users (or run it yourself).
 
 The WebSocket URL is derived from `PROXCHAT_SERVER` (`https://` → `wss://`).
