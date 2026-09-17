@@ -1,4 +1,4 @@
-import { computeDesiredHeight } from '../../src/overlay/resize-helpers';
+import { computeDesiredHeight, shouldSendSize } from '../../src/overlay/resize-helpers';
 
 describe('computeDesiredHeight', () => {
   test('adds 4px breathing room for normal content sizes', () => {
@@ -29,5 +29,44 @@ describe('computeDesiredHeight', () => {
     expect(computeDesiredHeight(1196)).toBe(1200);
     // 1197 + 4 = 1201 → still clamped to 1200
     expect(computeDesiredHeight(1197)).toBe(1200);
+  });
+});
+
+describe('shouldSendSize', () => {
+  test('always sends the first measurement', () => {
+    expect(shouldSendSize(null, 300)).toBe(true);
+  });
+
+  test('suppresses an unchanged size — the resize-storm fix', () => {
+    // broadcastOverlayState() rewrites the panel DOM ~30x/sec; every one of
+    // those used to reach Rust as a window resize (NotOtakuu 2026-09-12).
+    expect(shouldSendSize(300, 300)).toBe(false);
+  });
+
+  test('suppresses sub-hysteresis jitter in both directions', () => {
+    expect(shouldSendSize(300, 302)).toBe(false);
+    expect(shouldSendSize(300, 298)).toBe(false);
+  });
+
+  test('sends once the change reaches the hysteresis band', () => {
+    expect(shouldSendSize(300, 303)).toBe(true);
+    expect(shouldSendSize(300, 297)).toBe(true);
+  });
+
+  test('a real content change (settings opened) always gets through', () => {
+    expect(shouldSendSize(120, 420)).toBe(true);
+  });
+
+  test('a two-value oscillation inside the band cannot sustain itself', () => {
+    // The feedback loop shape: resize -> remeasure -> slightly different -> resize.
+    let lastSent: number | null = null;
+    let sends = 0;
+    for (const measured of [300, 301, 300, 301, 300, 301]) {
+      if (shouldSendSize(lastSent, measured)) {
+        lastSent = measured;
+        sends++;
+      }
+    }
+    expect(sends).toBe(1);
   });
 });

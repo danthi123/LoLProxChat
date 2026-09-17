@@ -12,6 +12,8 @@ import {
   // (v0.3.1 reverted the classifier-confidence-dependent ones — see below)
   nextClassifierEma,
   shouldForceReacquisition,
+  computeNearFieldPx,
+  computeViewportCenter,
   FORCED_REACQUIRE_HOLD_MS,
 } from './tracking-helpers';
 
@@ -91,6 +93,7 @@ export class TrackingService {
   // Diagnostics
   private lockedTickCount = 0;
   private diagCounter = 0;
+  private scanFps = 30;
 
   constructor(screenWidth: number, screenHeight: number, mapType: MapType) {
     this.screenWidth = screenWidth;
@@ -117,6 +120,37 @@ export class TrackingService {
 
   getState(): TrackingState { return this.state; }
   getLastPosition(): Position | null { return this.lastPosition; }
+
+  /**
+   * Centre of League's camera viewport in game coordinates, or null when the
+   * rectangle isn't currently identifiable on the minimap. Independent of the
+   * tracking state machine — this is where the player is LOOKING, not where
+   * their champion is. See docs/compliance.md for why the two are kept apart.
+   */
+  getCameraPosition(): Position | null { return this.cameraPosition; }
+
+  /**
+   * Enable/disable camera-viewport detection. Off costs nothing — the scan is
+   * two extra passes over the mask per frame, so it only runs when someone is
+   * actually listening from their camera. Driven by the orchestrator so the
+   * tracker doesn't need to know about user preferences.
+   */
+  setCameraTracking(enabled: boolean): void {
+    if (this.cameraTrackingEnabled === enabled) return;
+    this.cameraTrackingEnabled = enabled;
+    if (!enabled) this.cameraPosition = null;
+  }
+
+  private updateCameraPosition(
+    viewportMask: Uint8Array,
+    region: { x: number; y: number; width: number; height: number },
+  ): void {
+    if (!this.cameraTrackingEnabled) return;
+    const centre = computeViewportCenter(viewportMask, region.width, region.height);
+    this.cameraPosition = centre
+      ? this.pixelToGamePosition(region.x + centre.cx, region.y + centre.cy, region)
+      : null;
+  }
 
   // Single chokepoint for lastPosition writes so we can flag impossible
   // jumps (recall/TP is fine; CV mis-tracking the icon to a wrong location
@@ -390,8 +424,12 @@ export class TrackingService {
     return bestScore;
   }
 
+  /** Current scan rate in FPS, so callers can skip a no-op restart. */
+  getScanFps(): number { return this.scanFps; }
+
   start(onPositionUpdate: (pos: Position) => void, fps: number = 30): void {
     this.onPositionUpdate = onPositionUpdate;
+    this.scanFps = fps;
     const intervalMs = Math.max(1, Math.round(1000 / fps));
     const now = performance.now();
     this.lastTickMs = now;
@@ -562,6 +600,11 @@ export class TrackingService {
 
   // Cached viewport mask (white pixels that are part of long straight runs)
   private viewportMask: Uint8Array | null = null;
+  // Centre of the camera viewport rectangle in game coords (#36), refreshed
+  // every tick while enabled. null when no plausible rectangle was found this
+  // frame, or when camera tracking is off.
+  private cameraTrackingEnabled = false;
+  private cameraPosition: Position | null = null;
 
   /**
    * Build a mask of white pixels, marking those that belong to the camera viewport
@@ -806,6 +849,12 @@ export class TrackingService {
             // Build white pixel masks (separating movement path from viewport rectangle)
             const { whiteMask, viewportMask } = this.buildWhiteMasks(imageData, region);
 
+            // Camera viewport centre → game coords, for "voice on camera" (#36).
+            // Cheap (two counting passes over a mask we already built) and
+            // independent of lock state, so it keeps working while the tracker
+            // is SCANNING.
+            this.updateCameraPosition(viewportMask, region);
+
             // Run classifier at most every 500ms (scan-rate independent)
             const tealBlobs = iconBlobs.filter(b => b.color === 'teal');
             if (
@@ -872,13 +921,24 @@ export class TrackingService {
     let bestBlob = tealBlobs[0];
     let bestScore = -Infinity;
 
-    for (const b of tealBlobs) {
+    // The classifier only earns its 0.45 weight if it actually discriminated
+    // this frame. updateClassifierScores() zeroes every blob when no raw score
+    // clears MIN_RAW_THRESHOLD, and the model genuinely returns ~0 for some
+    // champions at some minimap scales (NotOtakuu's Twisted Fate log). Scoring
+    // against an all-zero classifier just scales every candidate down by the
+    // same 0.45 while distorting the weights of the signals that DO have
+    // something to say, so fall back to the no-classifier weighting instead.
+    const clsScores = tealBlobs.map(b => this.getClassifierScore(b));
+    const classifierUsable = hasClassifier && clsScores.some(s => s > 0);
+
+    for (let i = 0; i < tealBlobs.length; i++) {
+      const b = tealBlobs[i];
       const peerScore = this.peerAvoidanceScore(b);
       const whiteScore = this.whitePixelScore(b, whiteMask, viewportMask, region.width, region.height);
-      const clsScore = this.getClassifierScore(b);
+      const clsScore = clsScores[i];
       const ringScore = Math.min(1, b.pixels * (1 - b.fillRatio) / 200);
 
-      const score = hasClassifier
+      const score = classifierUsable
         ? clsScore * 0.45 + whiteScore * 0.25 + peerScore * 0.20 + ringScore * 0.10
         : peerScore * 0.40 + whiteScore * 0.35 + ringScore * 0.25;
 
@@ -988,8 +1048,13 @@ export class TrackingService {
       peer: (b) => this.peerAvoidanceScore(b),
     };
 
-    // Phase 1: nearest in-range blob with composite scoring
-    const phase1 = pickBestBlobInRange(tealBlobs, lastReg, predicted, maxJumpPx, hasClassifier, scoreFns);
+    // Phase 1: nearest in-range blob with composite scoring. Blobs inside the
+    // near-field radius are followed on continuity alone — the classifier only
+    // gates candidates further out (see computeNearFieldPx).
+    const phase1 = pickBestBlobInRange(
+      tealBlobs, lastReg, predicted, maxJumpPx, hasClassifier, scoreFns,
+      computeNearFieldPx(this.expectedIconDiam),
+    );
 
     // Phase 2: classifier-based long-range reacquire if Phase 1 found nothing
     if (!phase1 && hasClassifier) {

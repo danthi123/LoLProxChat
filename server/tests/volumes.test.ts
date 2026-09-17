@@ -281,3 +281,87 @@ describe('computeTieredVolumes (v0.3 path)', () => {
     ).toThrow('Invalid position');
   });
 });
+
+describe('computeTieredVolumes — listenPosition ("voice on camera", #36)', () => {
+  const makeGetter = (clients: Array<{ name: string; team?: 'ORDER' | 'CHAOS'; position?: { x: number; y: number; updatedMs: number } }>) =>
+    () => clients;
+
+  const room = (enemyAt: { x: number; y: number }) => makeGetter([
+    { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: Date.now() } },
+    { name: 'Enemy', team: 'CHAOS', position: { ...enemyAt, updatedMs: Date.now() } },
+  ]);
+
+  it('hears an enemy near the camera that is out of range of the champion', () => {
+    // Champion at origin, enemy 5000u away — far outside the 1350u range.
+    // Camera panned to sit right next to the enemy.
+    const result = computeTieredVolumes(
+      {
+        myPosition: { x: 0, y: 0 },
+        roomId: 'r1',
+        name: 'Me',
+        listenPosition: { x: 5000, y: 0 },
+      },
+      room({ x: 5000, y: 0 }),
+    );
+    expect(result.peerVolumes.Enemy).toBe(1.0);
+  });
+
+  it('stops hearing an enemy next to the champion once the camera pans away', () => {
+    const result = computeTieredVolumes(
+      {
+        myPosition: { x: 0, y: 0 },
+        roomId: 'r1',
+        name: 'Me',
+        listenPosition: { x: 9000, y: 9000 },
+      },
+      room({ x: 100, y: 0 }),
+    );
+    expect(result.peerVolumes.Enemy).toBeUndefined();
+  });
+
+  it('falls back to the champion position when no listenPosition is sent', () => {
+    const result = computeTieredVolumes(
+      { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me' },
+      room({ x: 100, y: 0 }),
+    );
+    expect(result.peerVolumes.Enemy).toBeGreaterThan(0);
+  });
+
+  it('ignores a malformed listenPosition rather than throwing', () => {
+    for (const bad of [null, undefined, {}, { x: 1 }, { x: NaN, y: 0 }, { x: Infinity, y: 0 }, 'nope', 42]) {
+      const result = computeTieredVolumes(
+        { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me', listenPosition: bad as any },
+        room({ x: 100, y: 0 }),
+      );
+      expect(result.peerVolumes.Enemy).toBeGreaterThan(0);
+    }
+  });
+
+  it('is listen-only — it never changes what a peer hears from the requester', () => {
+    // The requester's camera is parked next to the enemy, but the enemy's own
+    // request measures against the requester's CHAMPION position in room state,
+    // which the camera never touches.
+    const enemyView = computeTieredVolumes(
+      { myPosition: { x: 5000, y: 0 }, roomId: 'r1', name: 'Enemy' },
+      makeGetter([
+        { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: Date.now() } },
+        { name: 'Enemy', team: 'CHAOS', position: { x: 5000, y: 0, updatedMs: Date.now() } },
+      ]),
+    );
+    expect(enemyView.peerVolumes.Me).toBeUndefined();
+  });
+
+  it('does not let a listenPosition bypass the team filter or the range cutoff', () => {
+    const result = computeTieredVolumes(
+      {
+        myPosition: { x: 0, y: 0 },
+        roomId: 'r1',
+        name: 'Me',
+        listenPosition: { x: 5000, y: 0 },
+      },
+      room({ x: 9000, y: 9000 }),
+    );
+    // Enemy is still far from the camera, so still absent from the response.
+    expect(result.peerVolumes.Enemy).toBeUndefined();
+  });
+});

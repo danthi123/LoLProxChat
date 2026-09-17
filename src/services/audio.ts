@@ -174,6 +174,11 @@ export class AudioService {
     outputDest: MediaStreamAudioDestinationNode,
   ): void {
     if (!this.audioContext) return;
+    // Defensive: never stack two monitors on one service instance.
+    if (this.levelMonitorId !== null) {
+      clearInterval(this.levelMonitorId);
+      this.levelMonitorId = null;
+    }
     this.micLevelAnalyser = this.audioContext.createAnalyser();
     this.micLevelAnalyser.fftSize = 1024;
     micSource.connect(this.micLevelAnalyser);
@@ -584,6 +589,18 @@ export class AudioService {
   }
 
   cleanup(): void {
+    // The level monitor is a bare setInterval that closes over the analyser
+    // nodes. Before v0.5.8 nothing ever cleared it, so every game left another
+    // 2s logging loop running against a closed AudioContext for the lifetime of
+    // the process — you can count three overlapping meter loops in NotOtakuu's
+    // 2026-09-12 log (interleaved mic=0.031 / mic=0.012 / mic=0.001 lines).
+    if (this.levelMonitorId !== null) {
+      clearInterval(this.levelMonitorId);
+      this.levelMonitorId = null;
+    }
+    this.micLevelAnalyser = null;
+    this.outputLevelAnalyser = null;
+
     for (const [, peer] of this.peers) {
       peer.close();
     }

@@ -51,6 +51,13 @@ A user running a modified ("cheating") client should not be able to derive enemy
 - A modified client can broadcast a fake position to make itself appear at base, at an enemy's location, or anywhere else.
 - This is fundamentally unfixable without Riot exposing authoritative game state to third-party tools (they don't).
 
+### "Voice on camera" widens the stock client's own reach (opt-in)
+
+- With the v0.5.8 `Voice on camera` setting enabled, the client sends a `listenPosition` (its camera centre) and the server scores what that client hears from *that* point instead of from their champion. An unmodified client can therefore hear enemies its champion has no vision of, by panning the camera — the fog-of-war reveal that [`compliance.md`](compliance.md) otherwise rules out. That is the feature working as designed, not an attack; it ships off by default and the setting says so.
+- It does **not** widen the side channel beyond what a *modified* client could already do. `myPosition` in the `/compute-volumes` request has always been client-asserted and unverifiable (see above), so a modified client could already ask "what would I hear from over there?" about any point on the map. `listenPosition` gives that to honest clients too, and changes nothing about the attacker's ceiling.
+- It stays **listen-only** on the server: the requester's `listenPosition` is used solely to score their own response. Peers' distances are measured against the requester's champion position held in room state (fed by `coords`), which the camera never touches. So the feature cannot be used to make yourself audible from somewhere you aren't.
+- The team filter and `MAX_HEARING_RANGE` cutoff still apply from the listen point — the server remains the authority for both.
+
 ### The server operator can read positions
 
 - The server holds every connected client's plaintext XY in process memory for as long as they're in a room. A malicious operator running the signaling server can log the positions of every player in every game using their server.

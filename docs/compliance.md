@@ -15,7 +15,7 @@ LoLProxChat is built to stay within the categories Riot Games explicitly publish
 - ❌ No network packet interception, modification, or replay.
 - ❌ No automation, scripting, or bot behavior — the app never takes any in-game action on your behalf.
 - ❌ No decision-making aids — no enemy ult timers, no warned-by, no jungle timers, no skill suggestions.
-- ❌ No exposure of obfuscated information — no fog-of-war reveals, no warded-by indicators, no enemy item builds, no spectator-mode data.
+- ❌ No exposure of obfuscated information — no fog-of-war reveals, no warded-by indicators, no enemy item builds, no spectator-mode data. **One caveat: the opt-in "Voice on camera" setting is a deliberate exception — see below.**
 - ❌ No in-game advertising (banned by Riot in May 2025).
 - ❌ No paid tier or freemium gating — Riot's monetization rules require a free tier; LoLProxChat is fully open source and free.
 
@@ -26,6 +26,16 @@ The volume falloff drops to zero at ~1350 game units — roughly a champion's vi
 The app does not reveal *where* an enemy is — only that one is somewhere within hearing range. This is strictly less information than Discord voice chat with the same opponent already provides (which has zero distance modulation).
 
 For the precise threat-modeling around how a modified client *could* extract additional information from the volume side channel, and the server-side quantization + jitter mitigations applied, see [`threat-model.md`](threat-model.md).
+
+## Specifically: "Voice on camera" (opt-in, default OFF)
+
+Added in v0.5.8 for [#36](https://github.com/danthi123/LoLProxChat/issues/36). When enabled, hearing range is measured from **the centre of your in-game camera** instead of from your champion. The camera position is read the same way as everything else — off the minimap, by finding the camera-viewport rectangle the game already draws there. It is **listen-only**: your own broadcast position remains your champion's, so panning your camera changes what *you* hear and never what anyone hears from you.
+
+**This one does not fit the argument made above, and we are not going to pretend otherwise.** The case for the default behaviour is that hearing is anchored to your champion, so you only ever hear enemies the game would already be hinting at. A free camera is not anchored to anything — you can pan it over a bush, an objective, or the enemy jungle and learn whether someone is there, with no vision and no ward. That is information the game deliberately withholds, which is exactly what the "no fog-of-war reveals" line above rules out.
+
+It ships because it is what people making content with the app asked for, and because the alternative — everyone hearing everything, which is what a plain Discord call already gives them — is no better. It is **off by default and stays off until you turn it on**, the setting says plainly what it does, and it is confined to what you hear rather than to what your team hears.
+
+If you play ranked, leave it off. If Riot objects to this feature specifically, it is a single self-contained toggle and it can be removed without touching the rest of the app.
 
 ## Riot Developer Portal status
 

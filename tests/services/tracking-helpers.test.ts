@@ -8,6 +8,8 @@ import {
   shouldForceReacquisition,
   FORCED_REACQUIRE_HOLD_MS,
   nextClassifierEma,
+  computeNearFieldPx,
+  computeViewportCenter,
 } from '../../src/services/tracking-helpers';
 import type { Blob } from '../../src/services/blob-types';
 
@@ -110,8 +112,11 @@ describe('pickBestBlobInRange', () => {
     expect(result).toBeNull();
   });
 
-  test('with classifier, drops blobs below CLS_FOLLOW_THRESHOLD even if positionally great', () => {
-    const blob = mkBlob(100, 100);
+  test('with classifier, drops FAR-FIELD blobs below CLS_FOLLOW_THRESHOLD', () => {
+    // 25px from the prediction with a 12px near-field radius — the classifier
+    // still has to vouch for it, which is what stops long holds from snapping
+    // the dot onto a minion wave (#13).
+    const blob = mkBlob(125, 100);
     const lowClsFns = { ...noScores, cls: () => CLS_FOLLOW_THRESHOLD - 0.01 };
     const result = pickBestBlobInRange(
       [blob],
@@ -120,8 +125,64 @@ describe('pickBestBlobInRange', () => {
       30,
       true,
       lowClsFns,
+      /*nearFieldPx*/ 12,
     );
     expect(result).toBeNull();
+  });
+
+  test('with classifier, follows a NEAR-FIELD blob the classifier scores at zero', () => {
+    const blob = mkBlob(102, 100);
+    const zeroClsFns = { ...noScores, cls: () => 0 };
+    const result = pickBestBlobInRange(
+      [blob],
+      { x: 100, y: 100 },
+      { x: 100, y: 100 },
+      30,
+      true,
+      zeroClsFns,
+      /*nearFieldPx*/ 12,
+    );
+    expect(result?.blob).toBe(blob);
+  });
+
+  test('near field is measured from lastReg too, so a stale velocity EMA cannot veto', () => {
+    // Champion standing still; velocity EMA still points 20px away, so the
+    // prediction is off but the blob has not moved from lastReg.
+    const blob = mkBlob(100, 100);
+    const zeroClsFns = { ...noScores, cls: () => 0 };
+    const result = pickBestBlobInRange(
+      [blob],
+      /*lastReg*/ { x: 100, y: 100 },
+      /*predicted*/ { x: 120, y: 100 },
+      /*maxJumpPx*/ 60,
+      true,
+      zeroClsFns,
+      /*nearFieldPx*/ 12,
+    );
+    expect(result?.blob).toBe(blob);
+  });
+
+  // Regression for the lock → hold → forced-reacquire → lock cycle in
+  // NotOtakuu's 2026-09-12 log (v0.5.7). Real values from that session:
+  // single teal blob at region (28,308), iconDiam 30, classifier raw=0.000 /
+  // ema=0.00 on every frame, velocity reset to 0 by the lock one tick earlier.
+  // Before the near-field exemption, Phase 1 rejected the blob it had just
+  // locked onto and the broadcast position froze at the fountain — which is
+  // what made every enemy fall outside MAX_HEARING_RANGE.
+  test('regression: follows the just-locked blob when the classifier scores it 0', () => {
+    const blob = mkBlob(28, 308);
+    const lastReg = { x: 28, y: 308 };
+    const predicted = { x: 28, y: 308 };
+    const maxJumpPx = computeMaxJumpPx(30, /*holdStartMs*/ 0, /*now*/ 1000);
+    const deadClassifier = { cls: () => 0.0, white: () => 0.8, peer: () => 1.0 };
+
+    const phase1 = pickBestBlobInRange(
+      [blob], lastReg, predicted, maxJumpPx, /*hasClassifier*/ true, deadClassifier,
+      computeNearFieldPx(30),
+    );
+
+    expect(phase1).not.toBeNull();
+    expect(phase1?.blob.cx).toBe(28);
   });
 
   test('without classifier, low cls scores do not exclude blobs', () => {
@@ -210,5 +271,81 @@ describe('nextClassifierEma (symmetric EMA — v0.3.0 snap-up reverted in v0.3.1
     let ema = 0;
     for (let i = 0; i < 5; i++) ema = nextClassifierEma(ema, 0.9, 0.7);
     expect(ema).toBeGreaterThan(0.6); // recovers without single-frame latching
+  });
+});
+
+describe('computeViewportCenter (#36 voice on camera)', () => {
+  const W = 340, H = 340;
+
+  /** Draw a rectangle OUTLINE into a fresh mask, the way the minimap shows it. */
+  function mkMask(
+    left: number, top: number, right: number, bottom: number,
+    w = W, h = H,
+  ): Uint8Array {
+    const mask = new Uint8Array(w * h);
+    for (let x = left; x <= right; x++) {
+      mask[top * w + x] = 1;
+      mask[bottom * w + x] = 1;
+    }
+    for (let y = top; y <= bottom; y++) {
+      mask[y * w + left] = 1;
+      mask[y * w + right] = 1;
+    }
+    return mask;
+  }
+
+  test('finds the centre of a plausible camera rectangle', () => {
+    // ~66x37px box, the rough shape of a 1920x1080 camera on a 340px minimap.
+    const c = computeViewportCenter(mkMask(100, 150, 166, 187), W, H);
+    expect(c).toEqual({ cx: 133, cy: 168.5 });
+  });
+
+  test('a stray long run elsewhere does not drag the centre off the box', () => {
+    // A rectangle plus an unrelated 20px horizontal streak in the far corner.
+    // A raw bounding box would put the centre between the two; using rows and
+    // columns that carry a full edge's worth of pixels ignores the streak.
+    const mask = mkMask(100, 150, 166, 187);
+    for (let x = 300; x < 320; x++) mask[330 * W + x] = 1;
+    const c = computeViewportCenter(mask, W, H);
+    expect(c).toEqual({ cx: 133, cy: 168.5 });
+  });
+
+  test('rejects a box spanning most of the minimap (mask noise, not a camera)', () => {
+    expect(computeViewportCenter(mkMask(5, 5, 334, 334), W, H)).toBeNull();
+  });
+
+  test('rejects a box too small to be the camera', () => {
+    expect(computeViewportCenter(mkMask(100, 100, 108, 108), W, H)).toBeNull();
+  });
+
+  test('returns null for an empty mask (no rectangle visible)', () => {
+    expect(computeViewportCenter(new Uint8Array(W * H), W, H)).toBeNull();
+  });
+
+  test('returns null when only one vertical edge is on screen', () => {
+    // Camera panned into the map edge — the box is clipped, so a centre would
+    // be off by half its width. Caller falls back to the champion position.
+    const mask = new Uint8Array(W * H);
+    for (let y = 150; y <= 187; y++) mask[y * W + 100] = 1;
+    for (let x = 100; x <= 166; x++) { mask[150 * W + x] = 1; mask[187 * W + x] = 1; }
+    expect(computeViewportCenter(mask, W, H)).toBeNull();
+  });
+
+  test('handles a 2px-thick (anti-aliased) rectangle outline', () => {
+    const mask = mkMask(100, 150, 166, 187);
+    // Second pixel of each edge, the way an anti-aliased box renders.
+    for (let x = 100; x <= 166; x++) { mask[151 * W + x] = 1; mask[186 * W + x] = 1; }
+    for (let y = 150; y <= 187; y++) { mask[y * W + 101] = 1; mask[y * W + 165] = 1; }
+    const c = computeViewportCenter(mask, W, H);
+    // The centre lands within a pixel of the true one — well under the ~44
+    // game units a single minimap pixel is worth at this scale.
+    expect(c).not.toBeNull();
+    expect(Math.abs(c!.cx - 133)).toBeLessThanOrEqual(1);
+    expect(Math.abs(c!.cy - 168.5)).toBeLessThanOrEqual(1);
+  });
+
+  test('guards against a mask smaller than the stated region', () => {
+    expect(computeViewportCenter(new Uint8Array(10), W, H)).toBeNull();
+    expect(computeViewportCenter(new Uint8Array(0), 0, 0)).toBeNull();
   });
 });

@@ -15,8 +15,8 @@ import {
   probeMicPermission,
 } from '../services/devices';
 import { getForceTurnRelay, setForceTurnRelay } from '../services/privacy';
-import { getAllyProximity, setAllyProximity } from '../services/audio-prefs';
-import { computeDesiredHeight } from './resize-helpers';
+import { getAllyProximity, setAllyProximity, getCameraListen, setCameraListen } from '../services/audio-prefs';
+import { computeDesiredHeight, shouldSendSize } from './resize-helpers';
 import { browserKeyToWin32Vk, humanizeVk } from '../core/keymap';
 import '../core/window-globals';
 
@@ -25,6 +25,10 @@ import '../core/window-globals';
 // requestAnimationFrame-batched so we don't ping Rust at full frame rate
 // when ResizeObserver fires rapidly (image load, etc).
 let resizeQueued = false;
+// Last height actually sent to Rust. The rAF guard below only coalesces within
+// a single frame; without this, a panel DOM rewrite every scan tick produced a
+// window resize every frame for the whole match (see shouldSendSize).
+let lastSentOverlayHeight: number | null = null;
 function syncOverlayHeight(): void {
   if (resizeQueued) return;
   resizeQueued = true;
@@ -40,7 +44,10 @@ function syncOverlayHeight(): void {
     // 100% ultrawide looked fine. Matches the panelResize convention below.
     const dpr = window.devicePixelRatio || 1;
     const desired = computeDesiredHeight(Math.ceil(panel.scrollHeight));
-    sendToBackground('resizeOverlay', { height: Math.round(desired * dpr) });
+    const height = Math.round(desired * dpr);
+    if (!shouldSendSize(lastSentOverlayHeight, height)) return;
+    lastSentOverlayHeight = height;
+    sendToBackground('resizeOverlay', { height });
   });
 }
 
@@ -263,6 +270,22 @@ btnAllyProximity.addEventListener('click', () => {
   syncAllyProximityButton();
 });
 
+// Voice-on-camera toggle (#36). When ON, the orchestrator sends the minimap
+// camera-rectangle centre as the point we hear from, so panning the camera moves
+// your ears without moving your champion. Read fresh on each /compute-volumes
+// tick, so flipping it takes effect on the next position update.
+const btnCameraListen = document.getElementById('btn-camera-listen') as HTMLButtonElement;
+function syncCameraListenButton(): void {
+  const on = getCameraListen();
+  btnCameraListen.textContent = on ? 'ON' : 'OFF';
+  btnCameraListen.classList.toggle('active', on);
+}
+queueMicrotask(syncCameraListenButton);
+btnCameraListen.addEventListener('click', () => {
+  setCameraListen(!getCameraListen());
+  syncCameraListenButton();
+});
+
 // v0.3 (#1): PTT + toggle-mute key rebind. The Rust WH_KEYBOARD_LL hook
 // reads the bound VK code from atomics it exposes via set_ptt_key /
 // set_toggle_key Tauri commands. UI pattern: click the button → "Press a
@@ -399,12 +422,19 @@ volumeInput.addEventListener('input', () => {
 
 const scanRateInput = document.getElementById('input-scan-rate') as HTMLInputElement;
 const scanRateLabel = document.getElementById('scan-rate-label')!;
+// Each setScanRate tears down and restarts the tracking loop, so the label
+// follows the drag live but the backend only hears the value the user settled on.
+let scanRateDebounceId: number | null = null;
 scanRateInput.addEventListener('input', () => {
   const raw = parseInt(scanRateInput.value);
   scanRateLabel.textContent = String(raw);
   // Map 0-100 → 1-60 FPS for backend scan rate (default 50 → 30 FPS)
   const fps = Math.max(1, Math.round(1 + (raw / 100) * 59));
-  sendToBackground('setScanRate', { fps });
+  if (scanRateDebounceId !== null) clearTimeout(scanRateDebounceId);
+  scanRateDebounceId = window.setTimeout(() => {
+    scanRateDebounceId = null;
+    sendToBackground('setScanRate', { fps });
+  }, 200);
 });
 
 function sendToBackground(action: string, payload: any): void {
@@ -417,12 +447,18 @@ function sendToBackground(action: string, payload: any): void {
 // follows collapse/expand/settings open. Multiply by devicePixelRatio
 // because offsetWidth/Height are CSS pixels but the Rust side compares
 // against physical-pixel cursor coords from GetCursorPos.
+let lastSentPanelWidth: number | null = null;
+let lastSentPanelHeight: number | null = null;
 const reportPanelSize = () => {
   const dpr = window.devicePixelRatio || 1;
-  sendToBackground('panelResize', {
-    width: Math.round(panel.offsetWidth * dpr),
-    height: Math.round(panel.offsetHeight * dpr),
-  });
+  const width = Math.round(panel.offsetWidth * dpr);
+  const height = Math.round(panel.offsetHeight * dpr);
+  // Same dedupe as syncOverlayHeight — the hit-rect only needs updating when
+  // the panel actually changed size (collapse/expand/settings open).
+  if (!shouldSendSize(lastSentPanelWidth, width) && !shouldSendSize(lastSentPanelHeight, height)) return;
+  lastSentPanelWidth = width;
+  lastSentPanelHeight = height;
+  sendToBackground('panelResize', { width, height });
 };
 new ResizeObserver(reportPanelSize).observe(panel);
 // Initial report once the layout has settled

@@ -47,6 +47,11 @@ export class PeerConnection {
   private pc: RTCPeerConnection;
   private remoteStream: MediaStream = new MediaStream();
   private audioElement: HTMLAudioElement;
+  // Output device the user picked, and the one actually in effect on the
+  // element. Kept apart so applySinkId() can retry without re-setting a sink
+  // that already took.
+  private desiredSinkId: string | null = null;
+  private appliedSinkId: string | null = null;
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private hasRemoteDescription = false;
   readonly remoteName: string;
@@ -108,6 +113,12 @@ export class PeerConnection {
       this.remoteStream.addTrack(event.track);
       // Ensure audio plays (autoplay may be blocked by Chromium policy)
       this.tryPlay();
+      // Re-apply the output device now that the element has a live track.
+      // Chromium rejects setSinkId with AbortError on an element whose stream
+      // is still empty, which is exactly when connectToPeer used to call it —
+      // NotOtakuu's 2026-09-12 log shows the failure ~230ms before the track
+      // arrived, silently leaving that peer on the default device.
+      void this.applySinkId();
     };
 
     this.pc.onconnectionstatechange = () => {
@@ -140,12 +151,30 @@ export class PeerConnection {
 
   /** Route this peer's audio to the chosen output device via the element sink. */
   async setOutputDevice(deviceId: string | null): Promise<void> {
+    this.desiredSinkId = deviceId;
+    await this.applySinkId();
+  }
+
+  /**
+   * Push `desiredSinkId` onto the audio element. Safe to call repeatedly — it's
+   * retried from ontrack because setSinkId only reliably succeeds once the
+   * element has a track to route.
+   */
+  private async applySinkId(): Promise<void> {
     const el = this.audioElement as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> };
-    if (!deviceId || typeof el.setSinkId !== 'function') return;
+    if (typeof el.setSinkId !== 'function') return;
+    // '' is Chromium's "system default device". Picking Default in Settings
+    // used to be a no-op here, leaving peers stuck on the previously chosen
+    // device until the next session.
+    const sink = this.desiredSinkId ?? '';
+    if (this.appliedSinkId === sink) return;
     try {
-      await el.setSinkId(deviceId);
+      await el.setSinkId(sink);
+      this.appliedSinkId = sink;
     } catch (e) {
-      console.warn('[WebRTC] setSinkId failed for ' + this.remoteName + ':', e);
+      // Not fatal and not necessarily final — ontrack retries once the stream
+      // is live. Logged at debug volume so a first-attempt miss isn't alarming.
+      console.log('[WebRTC] setSinkId deferred for ' + this.remoteName + ':', e);
     }
   }
 

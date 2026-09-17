@@ -39,6 +39,13 @@ export interface VolumeRequestV2 {
   // enemies) instead of always at full volume. Per-user preference; optional for
   // backward compatibility — absent means global/full (the default, #22).
   allyProximity?: boolean;
+  // "Voice on camera" (#36). When present, THIS is the point the requester
+  // hears the map from — the centre of their in-game camera rather than their
+  // champion. Strictly listen-only: it is used solely to score what this
+  // requester hears, and never replaces the champion position that peers
+  // measure their own distance against (that one lives in room state, fed by
+  // `coords`). Absent means "hear from my champion", the default.
+  listenPosition?: { x: number; y: number };
 }
 
 export interface VolumeResponse {
@@ -58,6 +65,12 @@ export interface VolumeResponse {
 const STALE_POSITION_MS = 5_000;
 
 // ---------- helpers ----------
+
+function isFinitePoint(p: unknown): p is { x: number; y: number } {
+  return !!p && typeof p === 'object' &&
+    typeof (p as any).x === 'number' && typeof (p as any).y === 'number' &&
+    isFinite((p as any).x) && isFinite((p as any).y);
+}
 
 function hexToBytes(hex: string): Uint8Array {
   const bytes = new Uint8Array(hex.length / 2);
@@ -279,6 +292,14 @@ export function computeTieredVolumes(
   if (typeof body.roomId !== 'string' || !body.roomId) throw new Error('Invalid roomId');
   if (typeof body.name !== 'string' || !body.name) throw new Error('Invalid name');
 
+  // The point this requester hears FROM. `listenPosition` (camera centre, #36)
+  // when the client sent one, otherwise their champion position. Validated the
+  // same way as myPosition — a malformed one falls back rather than throwing,
+  // so an older/broken client still gets normal proximity audio.
+  const listenFrom = isFinitePoint(body.listenPosition)
+    ? body.listenPosition!
+    : body.myPosition;
+
   const clients = getRoomClients(body.roomId);
   const me = clients.find(c => c.name === body.name);
   if (!me) {
@@ -324,8 +345,8 @@ export function computeTieredVolumes(
       continue;
     }
 
-    const dx = body.myPosition.x - peer.position.x;
-    const dy = body.myPosition.y - peer.position.y;
+    const dx = listenFrom.x - peer.position.x;
+    const dy = listenFrom.y - peer.position.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist >= range) {
       if (DEBUG_VOLUMES) trace.push(peer.name + '[cross team=' + peer.team + ' dist=' + Math.round(dist) + ' >= range=' + range + ']=skip');
@@ -336,8 +357,11 @@ export function computeTieredVolumes(
   }
 
   if (DEBUG_VOLUMES) {
+    const listenTag = listenFrom === body.myPosition
+      ? ''
+      : ' listenFrom=camera(' + Math.round(listenFrom.x) + ',' + Math.round(listenFrom.y) + ')';
     console.log('[volumes] req me=' + JSON.stringify(me.name) +
-      ' team=' + me.team + ' legacy=' + legacy + ' range=' + range +
+      ' team=' + me.team + ' legacy=' + legacy + ' range=' + range + listenTag +
       ' | ' + (trace.length ? trace.join(' ') : '(no peers)'));
   }
 
