@@ -9,6 +9,7 @@ import {
   FORCED_REACQUIRE_HOLD_MS,
   nextClassifierEma,
   computeNearFieldPx,
+  computeViewportCenter,
 } from '../../src/services/tracking-helpers';
 import type { Blob } from '../../src/services/blob-types';
 
@@ -270,5 +271,81 @@ describe('nextClassifierEma (symmetric EMA — v0.3.0 snap-up reverted in v0.3.1
     let ema = 0;
     for (let i = 0; i < 5; i++) ema = nextClassifierEma(ema, 0.9, 0.7);
     expect(ema).toBeGreaterThan(0.6); // recovers without single-frame latching
+  });
+});
+
+describe('computeViewportCenter (#36 voice on camera)', () => {
+  const W = 340, H = 340;
+
+  /** Draw a rectangle OUTLINE into a fresh mask, the way the minimap shows it. */
+  function mkMask(
+    left: number, top: number, right: number, bottom: number,
+    w = W, h = H,
+  ): Uint8Array {
+    const mask = new Uint8Array(w * h);
+    for (let x = left; x <= right; x++) {
+      mask[top * w + x] = 1;
+      mask[bottom * w + x] = 1;
+    }
+    for (let y = top; y <= bottom; y++) {
+      mask[y * w + left] = 1;
+      mask[y * w + right] = 1;
+    }
+    return mask;
+  }
+
+  test('finds the centre of a plausible camera rectangle', () => {
+    // ~66x37px box, the rough shape of a 1920x1080 camera on a 340px minimap.
+    const c = computeViewportCenter(mkMask(100, 150, 166, 187), W, H);
+    expect(c).toEqual({ cx: 133, cy: 168.5 });
+  });
+
+  test('a stray long run elsewhere does not drag the centre off the box', () => {
+    // A rectangle plus an unrelated 20px horizontal streak in the far corner.
+    // A raw bounding box would put the centre between the two; using rows and
+    // columns that carry a full edge's worth of pixels ignores the streak.
+    const mask = mkMask(100, 150, 166, 187);
+    for (let x = 300; x < 320; x++) mask[330 * W + x] = 1;
+    const c = computeViewportCenter(mask, W, H);
+    expect(c).toEqual({ cx: 133, cy: 168.5 });
+  });
+
+  test('rejects a box spanning most of the minimap (mask noise, not a camera)', () => {
+    expect(computeViewportCenter(mkMask(5, 5, 334, 334), W, H)).toBeNull();
+  });
+
+  test('rejects a box too small to be the camera', () => {
+    expect(computeViewportCenter(mkMask(100, 100, 108, 108), W, H)).toBeNull();
+  });
+
+  test('returns null for an empty mask (no rectangle visible)', () => {
+    expect(computeViewportCenter(new Uint8Array(W * H), W, H)).toBeNull();
+  });
+
+  test('returns null when only one vertical edge is on screen', () => {
+    // Camera panned into the map edge — the box is clipped, so a centre would
+    // be off by half its width. Caller falls back to the champion position.
+    const mask = new Uint8Array(W * H);
+    for (let y = 150; y <= 187; y++) mask[y * W + 100] = 1;
+    for (let x = 100; x <= 166; x++) { mask[150 * W + x] = 1; mask[187 * W + x] = 1; }
+    expect(computeViewportCenter(mask, W, H)).toBeNull();
+  });
+
+  test('handles a 2px-thick (anti-aliased) rectangle outline', () => {
+    const mask = mkMask(100, 150, 166, 187);
+    // Second pixel of each edge, the way an anti-aliased box renders.
+    for (let x = 100; x <= 166; x++) { mask[151 * W + x] = 1; mask[186 * W + x] = 1; }
+    for (let y = 150; y <= 187; y++) { mask[y * W + 101] = 1; mask[y * W + 165] = 1; }
+    const c = computeViewportCenter(mask, W, H);
+    // The centre lands within a pixel of the true one — well under the ~44
+    // game units a single minimap pixel is worth at this scale.
+    expect(c).not.toBeNull();
+    expect(Math.abs(c!.cx - 133)).toBeLessThanOrEqual(1);
+    expect(Math.abs(c!.cy - 168.5)).toBeLessThanOrEqual(1);
+  });
+
+  test('guards against a mask smaller than the stated region', () => {
+    expect(computeViewportCenter(new Uint8Array(10), W, H)).toBeNull();
+    expect(computeViewportCenter(new Uint8Array(0), 0, 0)).toBeNull();
   });
 });

@@ -6,7 +6,7 @@ import { AudioService } from './audio';
 import { TrackingService, TrackingState } from './tracking';
 import { ChampionClassifier } from './champion-classifier';
 import { VolumeClient } from './volume-client';
-import { getAllyProximity } from './audio-prefs';
+import { getAllyProximity, getCameraListen } from './audio-prefs';
 import { PeerState } from '../core/types';
 import '../core/window-globals';
 import { isStreamerMode } from '../core/streamer-detect';
@@ -278,6 +278,11 @@ export class Orchestrator {
   private async positionTickInner(): Promise<void> {
     if (!this.audio || !this.session || !this.tracking || !this.volumeClient) return;
 
+    // Keep camera-viewport detection in step with the toggle. Set before the
+    // early returns below so the 30 FPS tracking loop is already producing
+    // camera positions by the time we need one, rather than a tick behind.
+    this.tracking.setCameraTracking(getCameraListen());
+
     // Broadcast presence over signaling so peers can discover us.
     // Coordinates go separately via sendCoords() — kept off this message so
     // every peer doesn't see them, and so server-side staleness can be
@@ -338,12 +343,21 @@ export class Orchestrator {
       console.log('[LoLProxChat] My position: (' + Math.round(position.x) + ', ' + Math.round(position.y) + ')');
     }
 
+    // "Voice on camera" (#36): when the user has opted in, hear the map from
+    // wherever they're looking instead of from their champion. Falls back to the
+    // champion position whenever the camera rectangle isn't readable this frame,
+    // so a missed detection is a no-op rather than a dropout. Listen-only — the
+    // coords we broadcast above are always the champion's.
+    const listenPosition = getCameraListen() ? this.tracking.getCameraPosition() : null;
+    this.logCameraListen(listenPosition);
+
     try {
       const result = await this.volumeClient.computeVolumes(
         position,
         this.session.roomId,
         this.localSummonerName,
         getAllyProximity(),
+        listenPosition,
       );
       this.audio.applyPeerVolumes(result.peerVolumes);
     } catch (e) {
@@ -351,6 +365,23 @@ export class Orchestrator {
     }
 
     this.broadcastOverlayState();
+  }
+
+  // Log camera-listen transitions only — at 10 Hz a per-tick line would be the
+  // next resizeOverlay-style log flood.
+  private lastCameraListenState: string | null = null;
+  private logCameraListen(listenPosition: { x: number; y: number } | null): void {
+    if (!getCameraListen()) {
+      this.lastCameraListenState = null;
+      return;
+    }
+    const state = listenPosition ? 'camera' : 'fallback-champion';
+    if (state === this.lastCameraListenState) return;
+    this.lastCameraListenState = state;
+    console.log('[LoLProxChat] Voice on camera: hearing from ' + state +
+      (listenPosition
+        ? ' (' + Math.round(listenPosition.x) + ', ' + Math.round(listenPosition.y) + ')'
+        : ' — camera rectangle not readable on the minimap'));
   }
 
   private async handlePeerPosition(peer: PositionBroadcast): Promise<void> {

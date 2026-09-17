@@ -13,6 +13,7 @@ import {
   nextClassifierEma,
   shouldForceReacquisition,
   computeNearFieldPx,
+  computeViewportCenter,
   FORCED_REACQUIRE_HOLD_MS,
 } from './tracking-helpers';
 
@@ -119,6 +120,37 @@ export class TrackingService {
 
   getState(): TrackingState { return this.state; }
   getLastPosition(): Position | null { return this.lastPosition; }
+
+  /**
+   * Centre of League's camera viewport in game coordinates, or null when the
+   * rectangle isn't currently identifiable on the minimap. Independent of the
+   * tracking state machine — this is where the player is LOOKING, not where
+   * their champion is. See docs/compliance.md for why the two are kept apart.
+   */
+  getCameraPosition(): Position | null { return this.cameraPosition; }
+
+  /**
+   * Enable/disable camera-viewport detection. Off costs nothing — the scan is
+   * two extra passes over the mask per frame, so it only runs when someone is
+   * actually listening from their camera. Driven by the orchestrator so the
+   * tracker doesn't need to know about user preferences.
+   */
+  setCameraTracking(enabled: boolean): void {
+    if (this.cameraTrackingEnabled === enabled) return;
+    this.cameraTrackingEnabled = enabled;
+    if (!enabled) this.cameraPosition = null;
+  }
+
+  private updateCameraPosition(
+    viewportMask: Uint8Array,
+    region: { x: number; y: number; width: number; height: number },
+  ): void {
+    if (!this.cameraTrackingEnabled) return;
+    const centre = computeViewportCenter(viewportMask, region.width, region.height);
+    this.cameraPosition = centre
+      ? this.pixelToGamePosition(region.x + centre.cx, region.y + centre.cy, region)
+      : null;
+  }
 
   // Single chokepoint for lastPosition writes so we can flag impossible
   // jumps (recall/TP is fine; CV mis-tracking the icon to a wrong location
@@ -568,6 +600,11 @@ export class TrackingService {
 
   // Cached viewport mask (white pixels that are part of long straight runs)
   private viewportMask: Uint8Array | null = null;
+  // Centre of the camera viewport rectangle in game coords (#36), refreshed
+  // every tick while enabled. null when no plausible rectangle was found this
+  // frame, or when camera tracking is off.
+  private cameraTrackingEnabled = false;
+  private cameraPosition: Position | null = null;
 
   /**
    * Build a mask of white pixels, marking those that belong to the camera viewport
@@ -811,6 +848,12 @@ export class TrackingService {
 
             // Build white pixel masks (separating movement path from viewport rectangle)
             const { whiteMask, viewportMask } = this.buildWhiteMasks(imageData, region);
+
+            // Camera viewport centre → game coords, for "voice on camera" (#36).
+            // Cheap (two counting passes over a mask we already built) and
+            // independent of lock state, so it keeps working while the tracker
+            // is SCANNING.
+            this.updateCameraPosition(viewportMask, region);
 
             // Run classifier at most every 500ms (scan-rate independent)
             const tealBlobs = iconBlobs.filter(b => b.color === 'teal');

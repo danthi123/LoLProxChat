@@ -56,11 +56,16 @@ function sendCoords(ws: WebSocket, x: number, y: number): void {
   ws.send(JSON.stringify({ type: 'coords', x, y }));
 }
 
-async function computeVolumes(myPosition: { x: number; y: number }, roomId: string, name: string) {
+async function computeVolumes(
+  myPosition: { x: number; y: number },
+  roomId: string,
+  name: string,
+  listenPosition?: { x: number; y: number },
+) {
   const resp = await fetch(`${BASE}/compute-volumes`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ myPosition, roomId, name }),
+    body: JSON.stringify({ myPosition, roomId, name, ...(listenPosition ? { listenPosition } : {}) }),
   });
   expect(resp.ok).toBe(true);
   return resp.json() as Promise<{ myBlob: string; peerVolumes: Record<string, number> }>;
@@ -115,6 +120,32 @@ describe('tiered proximity — end-to-end against the real server', () => {
     expect(result.peerVolumes.EnemyBeyond).toBeUndefined();      // > 1350u → omitted
 
     alice.close(); ally.close(); enemyClose.close(); enemyEdge.close(); enemyBeyond.close();
+  });
+
+  it('"voice on camera" moves what the requester hears, not what peers hear (#36)', async () => {
+    const room = 'r-camera';
+    const alice = await joinRoom(room, 'CamAlice', 'ORDER');
+    const enemy = await joinRoom(room, 'CamEnemy', 'CHAOS');
+
+    // Alice's champion is at the origin; the enemy is 5000u away — far outside
+    // the 1350u cross-team range, so normally inaudible in both directions.
+    sendCoords(alice, 0, 0);
+    sendCoords(enemy, 5000, 0);
+    await sleep(500);
+
+    const withoutCamera = await computeVolumes({ x: 0, y: 0 }, room, 'CamAlice');
+    expect(withoutCamera.peerVolumes.CamEnemy).toBeUndefined();
+
+    // Alice pans her camera over to the enemy → she hears them.
+    const withCamera = await computeVolumes({ x: 0, y: 0 }, room, 'CamAlice', { x: 5000, y: 0 });
+    expect(withCamera.peerVolumes.CamEnemy).toBe(1.0);
+
+    // ...and the enemy still does NOT hear Alice, because their distance is
+    // measured against Alice's champion position in room state. Listen-only.
+    const enemyView = await computeVolumes({ x: 5000, y: 0 }, room, 'CamEnemy');
+    expect(enemyView.peerVolumes.CamAlice).toBeUndefined();
+
+    alice.close(); enemy.close();
   });
 
   it('legacy v0.1 clients (no team on join) still get team-blind volumes', async () => {

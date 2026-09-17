@@ -209,3 +209,116 @@ export function shouldForceReacquisition(holdStartMs: number, nowMs: number): bo
 export function nextClassifierEma(currentEma: number, raw: number, decay: number): number {
   return currentEma * decay + raw * (1 - decay);
 }
+
+// ---------- v0.5.8: camera viewport centre (issue #36, "voice on camera") ----------
+
+/**
+ * Locate the centre of League's camera-viewport rectangle on the minimap, in
+ * region-relative pixels. Returns null when no plausible rectangle is visible.
+ *
+ * Input is the `viewportMask` built by TrackingService.buildWhiteMasks — white
+ * pixels that belong to long straight runs, which on the minimap is the camera
+ * rectangle (the short diagonal movement-path line is deliberately excluded).
+ *
+ * Method: a rectangle outline puts a lot of marked pixels in exactly four
+ * lines — its top and bottom rows, and its left and right columns. So rows
+ * holding at least `minRunPx` marked pixels are the horizontal edges, columns
+ * holding at least `minRunPx` are the vertical edges, and the centre is the
+ * midpoint between the outermost of each. Taking edges this way rather than a
+ * raw bounding box keeps a stray run elsewhere on the minimap from dragging the
+ * centre off the rectangle.
+ *
+ * Both edge pairs must be present and separated by a plausible fraction of the
+ * minimap, so a rectangle clipped by the edge of the map (camera panned into a
+ * corner) reports null instead of a centre that is off by half its width. The
+ * caller falls back to the champion's own position in that case.
+ */
+export function computeViewportCenter(
+  viewportMask: Uint8Array,
+  width: number,
+  height: number,
+  minRunPx = 12,
+): { cx: number; cy: number } | null {
+  if (width <= 0 || height <= 0 || viewportMask.length < width * height) return null;
+
+  const rowCounts = new Uint32Array(height);
+  const colCounts = new Uint32Array(width);
+  for (let y = 0; y < height; y++) {
+    const rowBase = y * width;
+    for (let x = 0; x < width; x++) {
+      if (viewportMask[rowBase + x] === 1) {
+        rowCounts[y]++;
+        colCounts[x]++;
+      }
+    }
+  }
+
+  // A real camera box covers a meaningful slice of the map but never most of
+  // it. Anything outside this band is noise (or the whole minimap border got
+  // marked) and reports null so the caller falls back to the champion position.
+  const MIN_SPAN_FRACTION = 0.04;
+  const MAX_SPAN_FRACTION = 0.70;
+
+  const rows = findOpposingEdges(rowCounts, minRunPx, height * MIN_SPAN_FRACTION);
+  const cols = findOpposingEdges(colCounts, minRunPx, width * MIN_SPAN_FRACTION);
+  if (!rows || !cols) return null;
+
+  const spanX = cols.far - cols.near;
+  const spanY = rows.far - rows.near;
+  if (spanX > width * MAX_SPAN_FRACTION || spanY > height * MAX_SPAN_FRACTION) return null;
+
+  // Consistency: the horizontal edges should be about as long as the box is
+  // wide, and the vertical edges about as tall as it is high. A pairing that
+  // fails this is two unrelated runs, not one rectangle.
+  if (!spansAgree(rows.strength, spanX) || !spansAgree(cols.strength, spanY)) return null;
+
+  return { cx: (cols.near + cols.far) / 2, cy: (rows.near + rows.far) / 2 };
+}
+
+/**
+ * Given per-row (or per-column) counts of marked pixels, find the two opposing
+ * edges of the rectangle: the strongest line, and the strongest line at least
+ * `minSeparation` away from it.
+ *
+ * Picking by strength rather than by "outermost line over the threshold" is
+ * what keeps an unrelated straight run elsewhere on the minimap from being
+ * mistaken for an edge — the rectangle's own edges are far denser than stray
+ * marks. The second edge additionally has to be comparable in length to the
+ * first, since both sides of a rectangle are the same length.
+ */
+function findOpposingEdges(
+  counts: Uint32Array,
+  minRunPx: number,
+  minSeparation: number,
+): { near: number; far: number; strength: number } | null {
+  let primary = -1;
+  for (let i = 0; i < counts.length; i++) {
+    if (primary < 0 || counts[i] > counts[primary]) primary = i;
+  }
+  if (primary < 0 || counts[primary] < minRunPx) return null;
+
+  let secondary = -1;
+  for (let i = 0; i < counts.length; i++) {
+    if (Math.abs(i - primary) < minSeparation) continue;
+    if (counts[i] < minRunPx) continue;
+    if (secondary < 0 || counts[i] > counts[secondary]) secondary = i;
+  }
+  if (secondary < 0) return null;
+
+  // Opposite edges of a rectangle are equal length; allow half, for an edge
+  // partially hidden behind an icon or clipped by the minimap border.
+  if (counts[secondary] * 2 < counts[primary]) return null;
+
+  return {
+    near: Math.min(primary, secondary),
+    far: Math.max(primary, secondary),
+    strength: counts[secondary],
+  };
+}
+
+/** Whether an edge's pixel length is consistent with the box's opposite span. */
+function spansAgree(edgeLength: number, span: number): boolean {
+  if (span <= 0) return false;
+  const ratio = edgeLength / span;
+  return ratio >= 0.5 && ratio <= 2.0;
+}

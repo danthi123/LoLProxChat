@@ -15,7 +15,7 @@ import {
   probeMicPermission,
 } from '../services/devices';
 import { getForceTurnRelay, setForceTurnRelay } from '../services/privacy';
-import { getAllyProximity, setAllyProximity } from '../services/audio-prefs';
+import { getAllyProximity, setAllyProximity, getCameraListen, setCameraListen } from '../services/audio-prefs';
 import { computeDesiredHeight, shouldSendSize } from './resize-helpers';
 import { browserKeyToWin32Vk, humanizeVk } from '../core/keymap';
 import '../core/window-globals';
@@ -268,6 +268,22 @@ queueMicrotask(syncAllyProximityButton);
 btnAllyProximity.addEventListener('click', () => {
   setAllyProximity(!getAllyProximity());
   syncAllyProximityButton();
+});
+
+// Voice-on-camera toggle (#36). When ON, the orchestrator sends the minimap
+// camera-rectangle centre as the point we hear from, so panning the camera moves
+// your ears without moving your champion. Read fresh on each /compute-volumes
+// tick, so flipping it takes effect on the next position update.
+const btnCameraListen = document.getElementById('btn-camera-listen') as HTMLButtonElement;
+function syncCameraListenButton(): void {
+  const on = getCameraListen();
+  btnCameraListen.textContent = on ? 'ON' : 'OFF';
+  btnCameraListen.classList.toggle('active', on);
+}
+queueMicrotask(syncCameraListenButton);
+btnCameraListen.addEventListener('click', () => {
+  setCameraListen(!getCameraListen());
+  syncCameraListenButton();
 });
 
 // v0.3 (#1): PTT + toggle-mute key rebind. The Rust WH_KEYBOARD_LL hook
