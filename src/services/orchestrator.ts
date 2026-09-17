@@ -507,6 +507,11 @@ export class Orchestrator {
   setScanRate(fps: number): void {
     if (!this.tracking) return;
     const clamped = Math.max(1, Math.min(60, Math.round(fps)));
+    // Restarting the scan loop resets warmup + classifier timers, so a slider
+    // drag used to tear tracking down dozens of times a second (NotOtakuu's log
+    // has ~50 setScanRate in one second). The overlay debounces the drag; this
+    // is the backstop for any caller that doesn't.
+    if (clamped === this.tracking.getScanFps()) return;
     console.log('[LoLProxChat] Scan rate changed to ' + clamped + ' FPS');
     this.tracking.stop();
     this.tracking.start(() => {

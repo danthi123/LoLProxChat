@@ -61,6 +61,33 @@ export function computeBlobScore(s: BlobScoreInputs, hasClassifier: boolean): nu
 /** Minimum classifier confidence to follow a blob during Phase 1 tracking. */
 export const CLS_FOLLOW_THRESHOLD = 0.2;
 
+/**
+ * Radius (in minimap px) around the predicted position inside which frame-to-frame
+ * *continuity* outranks classifier identity — the classifier follow-threshold is
+ * not applied to a blob this close.
+ *
+ * Why this exists (v0.5.8, NotOtakuu's 2026-09-12 log): the 172-class classifier
+ * returns raw≈0 for some champions at some minimap scales (his Twisted Fate scored
+ * 0.000 every frame). The Phase-1 veto below then rejected the very blob we had
+ * locked onto one tick earlier, sitting 0 px from the prediction, so the tracker
+ * fell into a permanent lock → hold → forced-reacquire → lock cycle and the
+ * broadcast position froze at the lock point. That froze his coords at the
+ * fountain, which made every enemy fall outside MAX_HEARING_RANGE — the
+ * user-visible symptom was "allies are perfect, enemies are way too quiet".
+ *
+ * A blob one icon-diameter from where we predicted the icon would be IS the icon;
+ * no classifier opinion should override that. Identity still gates the far field,
+ * where a wrong pick means clinging to a minion wave or a turret (issue #13).
+ *
+ * This completes Phase A item 2 of docs/plans/2026-06-03-cv-tracking-research.md
+ * ("loosen the over-strict v0.3 gates that gate on classifier confidence"). The
+ * sibling gate on the SCANNING→LOCKED transition was already reverted in v0.3.1;
+ * this one was missed.
+ */
+export function computeNearFieldPx(expectedIconDiam: number): number {
+  return Math.max(10, Math.round(expectedIconDiam));
+}
+
 export interface ScoreFns {
   cls: (b: Blob) => number;
   white: (b: Blob) => number;
@@ -74,8 +101,17 @@ export interface ScoredBlob {
 
 /**
  * Phase 1: pick the best teal blob within jump range of the predicted
- * position. Returns null if no candidate scored above the (classifier-gated)
- * follow threshold.
+ * position.
+ *
+ * The classifier follow-threshold gates the FAR field only. A blob within
+ * `nearFieldPx` of either the predicted position or our last known position is
+ * followed on positional continuity alone, whatever the classifier thinks of it
+ * (see computeNearFieldPx). Beyond that radius the classifier still has to vouch
+ * for the blob, which is what keeps a long hold from snapping the dot onto a
+ * minion wave.
+ *
+ * Returns null when no candidate is in range, or when every in-range candidate
+ * is in the far field and below the follow threshold.
  */
 export function pickBestBlobInRange(
   tealBlobs: Blob[],
@@ -84,21 +120,31 @@ export function pickBestBlobInRange(
   maxJumpPx: number,
   hasClassifier: boolean,
   scoreFns: ScoreFns,
+  nearFieldPx = 0,
 ): ScoredBlob | null {
   const maxJumpSq = maxJumpPx * maxJumpPx;
+  const nearFieldSq = nearFieldPx * nearFieldPx;
   let best: ScoredBlob | null = null;
 
   for (const b of tealBlobs) {
     const dxLast = b.cx - lastReg.x;
     const dyLast = b.cy - lastReg.y;
-    if (dxLast * dxLast + dyLast * dyLast > maxJumpSq) continue;
+    const distLastSq = dxLast * dxLast + dyLast * dyLast;
+    if (distLastSq > maxJumpSq) continue;
 
     const dxPred = b.cx - predicted.x;
     const dyPred = b.cy - predicted.y;
-    const posScore = 1 - (dxPred * dxPred + dyPred * dyPred) / maxJumpSq;
+    const distPredSq = dxPred * dxPred + dyPred * dyPred;
+    const posScore = 1 - distPredSq / maxJumpSq;
+
+    // Near field is measured against whichever reference is more forgiving:
+    // `predicted` covers smooth movement, `lastReg` covers a standing champion
+    // whose velocity EMA hasn't decayed to zero yet.
+    // Strict `<` so the default nearFieldPx=0 disables the exemption entirely.
+    const isNearField = Math.min(distPredSq, distLastSq) < nearFieldSq;
 
     const clsScore = scoreFns.cls(b);
-    if (hasClassifier && clsScore < CLS_FOLLOW_THRESHOLD) continue;
+    if (hasClassifier && !isNearField && clsScore < CLS_FOLLOW_THRESHOLD) continue;
 
     const score = computeBlobScore(
       { posScore, clsScore, whiteScore: scoreFns.white(b), peerScore: scoreFns.peer(b) },

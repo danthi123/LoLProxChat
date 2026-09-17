@@ -8,6 +8,7 @@ import {
   shouldForceReacquisition,
   FORCED_REACQUIRE_HOLD_MS,
   nextClassifierEma,
+  computeNearFieldPx,
 } from '../../src/services/tracking-helpers';
 import type { Blob } from '../../src/services/blob-types';
 
@@ -110,8 +111,11 @@ describe('pickBestBlobInRange', () => {
     expect(result).toBeNull();
   });
 
-  test('with classifier, drops blobs below CLS_FOLLOW_THRESHOLD even if positionally great', () => {
-    const blob = mkBlob(100, 100);
+  test('with classifier, drops FAR-FIELD blobs below CLS_FOLLOW_THRESHOLD', () => {
+    // 25px from the prediction with a 12px near-field radius — the classifier
+    // still has to vouch for it, which is what stops long holds from snapping
+    // the dot onto a minion wave (#13).
+    const blob = mkBlob(125, 100);
     const lowClsFns = { ...noScores, cls: () => CLS_FOLLOW_THRESHOLD - 0.01 };
     const result = pickBestBlobInRange(
       [blob],
@@ -120,8 +124,64 @@ describe('pickBestBlobInRange', () => {
       30,
       true,
       lowClsFns,
+      /*nearFieldPx*/ 12,
     );
     expect(result).toBeNull();
+  });
+
+  test('with classifier, follows a NEAR-FIELD blob the classifier scores at zero', () => {
+    const blob = mkBlob(102, 100);
+    const zeroClsFns = { ...noScores, cls: () => 0 };
+    const result = pickBestBlobInRange(
+      [blob],
+      { x: 100, y: 100 },
+      { x: 100, y: 100 },
+      30,
+      true,
+      zeroClsFns,
+      /*nearFieldPx*/ 12,
+    );
+    expect(result?.blob).toBe(blob);
+  });
+
+  test('near field is measured from lastReg too, so a stale velocity EMA cannot veto', () => {
+    // Champion standing still; velocity EMA still points 20px away, so the
+    // prediction is off but the blob has not moved from lastReg.
+    const blob = mkBlob(100, 100);
+    const zeroClsFns = { ...noScores, cls: () => 0 };
+    const result = pickBestBlobInRange(
+      [blob],
+      /*lastReg*/ { x: 100, y: 100 },
+      /*predicted*/ { x: 120, y: 100 },
+      /*maxJumpPx*/ 60,
+      true,
+      zeroClsFns,
+      /*nearFieldPx*/ 12,
+    );
+    expect(result?.blob).toBe(blob);
+  });
+
+  // Regression for the lock → hold → forced-reacquire → lock cycle in
+  // NotOtakuu's 2026-09-12 log (v0.5.7). Real values from that session:
+  // single teal blob at region (28,308), iconDiam 30, classifier raw=0.000 /
+  // ema=0.00 on every frame, velocity reset to 0 by the lock one tick earlier.
+  // Before the near-field exemption, Phase 1 rejected the blob it had just
+  // locked onto and the broadcast position froze at the fountain — which is
+  // what made every enemy fall outside MAX_HEARING_RANGE.
+  test('regression: follows the just-locked blob when the classifier scores it 0', () => {
+    const blob = mkBlob(28, 308);
+    const lastReg = { x: 28, y: 308 };
+    const predicted = { x: 28, y: 308 };
+    const maxJumpPx = computeMaxJumpPx(30, /*holdStartMs*/ 0, /*now*/ 1000);
+    const deadClassifier = { cls: () => 0.0, white: () => 0.8, peer: () => 1.0 };
+
+    const phase1 = pickBestBlobInRange(
+      [blob], lastReg, predicted, maxJumpPx, /*hasClassifier*/ true, deadClassifier,
+      computeNearFieldPx(30),
+    );
+
+    expect(phase1).not.toBeNull();
+    expect(phase1?.blob.cx).toBe(28);
   });
 
   test('without classifier, low cls scores do not exclude blobs', () => {

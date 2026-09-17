@@ -12,6 +12,7 @@ import {
   // (v0.3.1 reverted the classifier-confidence-dependent ones — see below)
   nextClassifierEma,
   shouldForceReacquisition,
+  computeNearFieldPx,
   FORCED_REACQUIRE_HOLD_MS,
 } from './tracking-helpers';
 
@@ -91,6 +92,7 @@ export class TrackingService {
   // Diagnostics
   private lockedTickCount = 0;
   private diagCounter = 0;
+  private scanFps = 30;
 
   constructor(screenWidth: number, screenHeight: number, mapType: MapType) {
     this.screenWidth = screenWidth;
@@ -390,8 +392,12 @@ export class TrackingService {
     return bestScore;
   }
 
+  /** Current scan rate in FPS, so callers can skip a no-op restart. */
+  getScanFps(): number { return this.scanFps; }
+
   start(onPositionUpdate: (pos: Position) => void, fps: number = 30): void {
     this.onPositionUpdate = onPositionUpdate;
+    this.scanFps = fps;
     const intervalMs = Math.max(1, Math.round(1000 / fps));
     const now = performance.now();
     this.lastTickMs = now;
@@ -872,13 +878,24 @@ export class TrackingService {
     let bestBlob = tealBlobs[0];
     let bestScore = -Infinity;
 
-    for (const b of tealBlobs) {
+    // The classifier only earns its 0.45 weight if it actually discriminated
+    // this frame. updateClassifierScores() zeroes every blob when no raw score
+    // clears MIN_RAW_THRESHOLD, and the model genuinely returns ~0 for some
+    // champions at some minimap scales (NotOtakuu's Twisted Fate log). Scoring
+    // against an all-zero classifier just scales every candidate down by the
+    // same 0.45 while distorting the weights of the signals that DO have
+    // something to say, so fall back to the no-classifier weighting instead.
+    const clsScores = tealBlobs.map(b => this.getClassifierScore(b));
+    const classifierUsable = hasClassifier && clsScores.some(s => s > 0);
+
+    for (let i = 0; i < tealBlobs.length; i++) {
+      const b = tealBlobs[i];
       const peerScore = this.peerAvoidanceScore(b);
       const whiteScore = this.whitePixelScore(b, whiteMask, viewportMask, region.width, region.height);
-      const clsScore = this.getClassifierScore(b);
+      const clsScore = clsScores[i];
       const ringScore = Math.min(1, b.pixels * (1 - b.fillRatio) / 200);
 
-      const score = hasClassifier
+      const score = classifierUsable
         ? clsScore * 0.45 + whiteScore * 0.25 + peerScore * 0.20 + ringScore * 0.10
         : peerScore * 0.40 + whiteScore * 0.35 + ringScore * 0.25;
 
@@ -988,8 +1005,13 @@ export class TrackingService {
       peer: (b) => this.peerAvoidanceScore(b),
     };
 
-    // Phase 1: nearest in-range blob with composite scoring
-    const phase1 = pickBestBlobInRange(tealBlobs, lastReg, predicted, maxJumpPx, hasClassifier, scoreFns);
+    // Phase 1: nearest in-range blob with composite scoring. Blobs inside the
+    // near-field radius are followed on continuity alone — the classifier only
+    // gates candidates further out (see computeNearFieldPx).
+    const phase1 = pickBestBlobInRange(
+      tealBlobs, lastReg, predicted, maxJumpPx, hasClassifier, scoreFns,
+      computeNearFieldPx(this.expectedIconDiam),
+    );
 
     // Phase 2: classifier-based long-range reacquire if Phase 1 found nothing
     if (!phase1 && hasClassifier) {
