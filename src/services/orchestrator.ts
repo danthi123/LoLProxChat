@@ -659,6 +659,12 @@ export class Orchestrator {
       // Proximity being off is the whole story for this session, and unlike a
       // geometry warning it never resolves itself.
       if (this.session.proximityDisabledReason) return this.session.proximityDisabledReason;
+      // A refused minimap region outranks everything below: tracking can never
+      // leave SCANNING while it stands, and the log line that explains it is
+      // only written to disk when Debug is already on. Optional call because
+      // orchestrator test doubles implement only the surface they exercise.
+      const refusal = this.tracking?.getGeometryRefusal?.() ?? null;
+      if (refusal) return refusal;
       const ts = this.tracking?.getState();
       // A geometry problem is the most useful thing to say while nothing is
       // locked — including when tracking never started at all, which is what a

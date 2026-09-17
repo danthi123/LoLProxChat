@@ -97,31 +97,35 @@ describe('E2 allies are audible at any distance', () => {
   it('holds a teammate at 1.0 across the whole map, and the server is what says so', async () => {
     const { players, a, b } = roster('ORDER');
     const [one, two] = track(makeClient(a, players), makeClient(b, players));
-    await startAll([one, two]);
-    await waitForMesh(one, two);
-
     // Opposite corners of Summoner's Rift — about 17000 units apart, well past
-    // the 1350 cross-team hearing range.
+    // the 1350 cross-team hearing range — and set before the first tick, so
+    // there is no exchange in this test that the distance rule could also have
+    // answered with 1.0.
     one.tracker.moveTo(1000, 1000);
     two.tracker.moveTo(13000, 13000);
+    await startAll([one, two]);
+    await waitForMesh(one, two);
 
     const exchange = await waitFor(
       () => volumesFor(a).find((e) => e.response?.peerVolumes?.[b] === 1),
       'the server to return the ally at 1.0',
     );
     expect(exchange.request.allyProximity).toBe(false);
-    await waitFor(() => one.peerFor(b)!.volume === 1, 'the ally to be played at full volume');
+    // The recorded setVolume history rather than the live field: a peer
+    // connection is constructed at volume 1, so the field alone reads true
+    // before the client has applied anything at all.
+    await waitFor(() => one.peerFor(b)!.volumes.includes(1), 'the ally to be played at full volume');
   });
 
   it('fades the same teammate once the user opts into ally proximity (#22)', async () => {
     const { players, a, b } = roster('ORDER');
     const [one, two] = track(makeClient(a, players), makeClient(b, players));
+    one.tracker.moveTo(1000, 1000);
+    two.tracker.moveTo(13000, 13000);
     await startAll([one, two]);
     await waitForMesh(one, two);
 
-    one.tracker.moveTo(1000, 1000);
-    two.tracker.moveTo(13000, 13000);
-    await waitFor(() => one.peerFor(b)!.volume === 1, 'the ally to be audible first');
+    await waitFor(() => one.peerFor(b)!.volumes.includes(1), 'the ally to be audible first');
 
     // The only configuration whose answer the client-side SCANNING fallback
     // could not also have produced: an ally the server declines to return.
@@ -145,21 +149,30 @@ describe('E3 enemies fade with distance', () => {
 
     one.tracker.moveTo(7000, 7000);
     two.tracker.moveTo(7400, 7000);
+    // Anchored on A's own moved coordinate, and asserted absolutely rather than
+    // only against `far`: an exchange sent before the move carries a start
+    // position instead, and a distance reading taken off one of those describes
+    // wherever the two clients happened to begin.
     const near = await waitFor(
-      () => volumesFor(a).map((e) => e.response?.peerVolumes?.[b]).filter((v) => v > 0.5).pop(),
+      () => volumesFor(a).filter((e) => e.request?.myPosition?.x === 7000)
+        // B's coords reach the server up to a tick behind A's, so the first
+        // anchored exchanges carry no entry for B at all.
+        .map((e) => e.response?.peerVolumes?.[b]).filter((v) => v !== undefined).pop(),
       'the enemy to be audible at 400 units',
     );
+    expect(near).toBeGreaterThan(0.5);
 
     two.tracker.moveTo(8300, 7000);
     const far = await waitFor(
-      () => volumesFor(a).map((e) => e.response?.peerVolumes?.[b])
-        .filter((v) => v !== undefined && v > 0 && v < 0.5).pop(),
+      () => volumesFor(a).filter((e) => e.request?.myPosition?.x === 7000)
+        .map((e) => e.response?.peerVolumes?.[b])
+        .filter((v) => v !== undefined && v < 0.5).pop(),
       'the enemy to fade at 1300 units',
     );
 
     expect(near).toBeGreaterThan(far);
     expect(far).toBeGreaterThan(0);
-    await waitFor(() => one.peerFor(b)!.volume === far, 'the faded volume to be applied');
+    await waitFor(() => one.peerFor(b)!.volumes.includes(far), 'the faded volume to be applied');
   });
 });
 
@@ -170,13 +183,20 @@ describe('E4 an enemy past vision range is held, then silenced (#27)', () => {
     await startAll([one, two]);
     await waitForMesh(one, two);
 
-    // In range FIRST. resolveProximityTargets only holds a peer that has a
-    // previous last-seen timestamp, so a peer that was never in a response
-    // falls straight to 0 and the grace path is never reached at all.
+    // In range FIRST, and waited on through the server's own answer:
+    // resolveProximityTargets only holds a peer that has a previous last-seen
+    // timestamp, and that timestamp is written when a response containing the
+    // peer is applied. A peer that was never in one falls straight to 0 and the
+    // grace path is never reached at all.
     one.tracker.moveTo(7000, 7000);
     two.tracker.moveTo(7400, 7000);
     const peer = one.peerFor(b)!;
-    await waitFor(() => peer.volume > 0.5, 'a settled in-range volume');
+    const inRange = await waitFor(
+      () => volumesFor(a).filter((e) => e.request?.myPosition?.x === 7000)
+        .map((e) => e.response?.peerVolumes?.[b]).filter((v) => v !== undefined && v > 0.5).pop(),
+      'the server to place the enemy in range',
+    );
+    await waitFor(() => peer.volumes.includes(inRange), 'that in-range volume to be applied');
 
     two.tracker.moveTo(9000, 7000);
     await waitFor(
@@ -184,15 +204,17 @@ describe('E4 an enemy past vision range is held, then silenced (#27)', () => {
       'the server to drop the out-of-range enemy',
     );
     const atDrop = peer.volumes.length;
-    expect(peer.volume).toBeGreaterThan(0);
 
     await waitFor(() => peer.volume === 0, 'the enemy to fall silent after the grace window', 6000);
 
     // Several ticks of hold, not a single one — a one-tick hold would be
-    // indistinguishable from the drop simply landing between two ticks.
-    let held = 0;
-    for (let i = atDrop; i < peer.volumes.length && peer.volumes[i] > 0; i++) held++;
-    expect(held).toBeGreaterThanOrEqual(3);
+    // indistinguishable from the drop simply landing between two ticks. Each of
+    // them has to be the volume the server last returned, which is what
+    // separates a grace hold from any other way of arriving at a non-zero gain.
+    const held: number[] = [];
+    for (let i = atDrop; i < peer.volumes.length && peer.volumes[i] > 0; i++) held.push(peer.volumes[i]);
+    expect(held.length).toBeGreaterThanOrEqual(3);
+    for (const volume of held) expect(volume).toBe(inRange);
   });
 });
 
@@ -200,9 +222,9 @@ describe('E5 voice on camera moves only the listener (#36)', () => {
   it('lets A hear a distant enemy from the camera while B still cannot hear A', async () => {
     const { players, a, b } = roster('CHAOS');
     const [one, two] = track(makeClient(a, players), makeClient(b, players));
-    // Positioned before the first tick: every scripted tracker starts at the
-    // same default coordinate, and two champions standing on the same pixel are
-    // audible to each other by the ordinary distance rule.
+    // Positioned before the first tick: the distance the camera is supposed to
+    // override is the whole subject here, so it has to hold from the first
+    // exchange rather than from whenever a move happens to land.
     one.tracker.moveTo(1000, 1000);
     two.tracker.moveTo(12000, 12000);
     await startAll([one, two]);

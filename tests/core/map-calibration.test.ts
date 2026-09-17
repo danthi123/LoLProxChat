@@ -10,12 +10,12 @@ import {
 describe('getMinimapBounds', () => {
   it('returns bounds in bottom-right of screen for 1920x1080', () => {
     const bounds = getMinimapBounds(1920, 1080);
-    // captureSize = round(1080 * 0.35) = 378
-    // x = 1920 - 378 = 1542, y = 1080 - 378 = 702
-    expect(bounds.x).toBe(1542);
-    expect(bounds.y).toBe(702);
-    expect(bounds.width).toBe(378);
-    expect(bounds.height).toBe(378);
+    // captureSize = round(1080 * 0.40) = 432
+    // x = 1920 - 432 = 1488, y = 1080 - 432 = 648
+    expect(bounds.x).toBe(1488);
+    expect(bounds.y).toBe(648);
+    expect(bounds.width).toBe(432);
+    expect(bounds.height).toBe(432);
   });
 
   // The origin-less entry point must stay a pure delegate, so nothing that
@@ -31,31 +31,31 @@ describe('getCaptureBoundsForRect', () => {
   // express: it always anchored the capture square to the primary monitor's
   // bottom-right corner, i.e. to (0, 0) + primary size.
   it('anchors to a monitor RIGHT of the primary one', () => {
-    // 2560x1440 at x=1920: captureSize = round(1440 * 0.35) = 504
+    // 2560x1440 at x=1920: captureSize = round(1440 * 0.40) = 576
     expect(getCaptureBoundsForRect({ x: 1920, y: 0, width: 2560, height: 1440 }))
-      .toEqual({ x: 3976, y: 936, width: 504, height: 504 });
+      .toEqual({ x: 3904, y: 864, width: 576, height: 576 });
   });
 
   it('anchors to a monitor LEFT of the primary one (negative x)', () => {
     expect(getCaptureBoundsForRect({ x: -1920, y: 0, width: 1920, height: 1080 }))
-      .toEqual({ x: -378, y: 702, width: 378, height: 378 });
+      .toEqual({ x: -432, y: 648, width: 432, height: 432 });
   });
 
   it('anchors to a monitor ABOVE the primary one (negative y)', () => {
     expect(getCaptureBoundsForRect({ x: 0, y: -1080, width: 1920, height: 1080 }))
-      .toEqual({ x: 1542, y: -378, width: 378, height: 378 });
+      .toEqual({ x: 1488, y: -432, width: 432, height: 432 });
   });
 
   it('anchors to a monitor both left of and above the primary one', () => {
-    // captureSize = round(1440 * 0.35) = 504
+    // captureSize = round(1440 * 0.40) = 576
     expect(getCaptureBoundsForRect({ x: -2560, y: -400, width: 2560, height: 1440 }))
-      .toEqual({ x: -504, y: 536, width: 504, height: 504 });
+      .toEqual({ x: -576, y: 464, width: 576, height: 576 });
   });
 
   it('anchors to a WINDOWED client rect inside the primary monitor', () => {
-    // captureSize = round(720 * 0.35) = 252
+    // captureSize = round(720 * 0.40) = 288
     expect(getCaptureBoundsForRect({ x: 100, y: 80, width: 1280, height: 720 }))
-      .toEqual({ x: 1128, y: 548, width: 252, height: 252 });
+      .toEqual({ x: 1092, y: 512, width: 288, height: 288 });
   });
 });
 
@@ -88,10 +88,10 @@ describe('getMinimapRegionForRect', () => {
 
   it('places the minimap in the bottom-right of the capture square', () => {
     const rect = { x: -1920, y: 0, width: 1920, height: 1080 };
-    const capture = getCaptureBoundsForRect(rect); // 378px
+    const capture = getCaptureBoundsForRect(rect); // 432px
     const region = getMinimapRegionForRect(rect, 1, capture); // 273px minimap
 
-    expect(region).toEqual({ x: 105, y: 105, width: 273, height: 273 });
+    expect(region).toEqual({ x: 159, y: 159, width: 273, height: 273 });
     // The minimap's bottom-right corner is the capture square's bottom-right.
     expect(region.x + region.width).toBe(capture.width);
     expect(region.y + region.height).toBe(capture.height);
@@ -104,7 +104,7 @@ describe('minimapRegionFitsCapture', () => {
   // The geometry invariant: the minimap must fit inside the capture square, or
   // the region gets a negative origin and the mask builder — which indexes
   // ((region.y + y) * width + region.x + x) with no clamping — wraps into the
-  // previous scanline. 0.35 * height covers MinimapScale up to ~2.4.
+  // previous scanline.
   it.each(heights)('a scale of 2.3 fits at %ip', (height) => {
     const rect = { x: 0, y: 0, width: Math.round(height * 16 / 9), height };
     const capture = getCaptureBoundsForRect(rect);
@@ -112,22 +112,39 @@ describe('minimapRegionFitsCapture', () => {
     expect(minimapRegionFitsCapture(getMinimapRegionForRect(rect, 2.3, capture), capture)).toBe(true);
   });
 
-  // The documented top of the calibration range does NOT fit: at 1080p the
-  // formula asks for 420px against a 378px capture square. The guard must catch
-  // it — without it, region.x is -42.
-  it('rejects the scale-3 minimap at 1080p', () => {
+  // The user-facing promise of the capture factor: every MinimapScale League's
+  // HUD slider can produce is trackable, at every resolution. At scale 3 the
+  // formula's ±40 terms cancel and it asks for exactly 7/18 = 0.3889 of the
+  // window height, so this is a single resolution-independent margin — if
+  // MINIMAP_CAPTURE_FACTOR ever drops back below that, every row fails.
+  it.each(heights)('the top of the MinimapScale range fits at %ip', (height) => {
+    const rect = { x: 0, y: 0, width: Math.round(height * 16 / 9), height };
+    const capture = getCaptureBoundsForRect(rect);
+    expect(minimapSizeForHeight(height, 3)).toBeLessThanOrEqual(capture.width);
+    expect(minimapRegionFitsCapture(getMinimapRegionForRect(rect, 3, capture), capture)).toBe(true);
+  });
+
+  it('the capture factor clears the scale-3 requirement of 7/18 of the height', () => {
+    expect(MINIMAP_CAPTURE_FACTOR).toBeGreaterThan(7 / 18);
+  });
+
+  // Past the calibrated range the guard must still bite: at 1080p scale 3.5
+  // asks for 457px against a 432px capture square, and without the refusal
+  // region.x is -25. game.cfg is a plain text file, so out-of-range values do
+  // reach here — parseMinimapScale logs them and applies them anyway.
+  it('rejects a minimap past the top of the calibrated range', () => {
     const rect = { x: 0, y: 0, width: 1920, height: 1080 };
     const capture = getCaptureBoundsForRect(rect);
-    const region = getMinimapRegionForRect(rect, 3, capture);
+    const region = getMinimapRegionForRect(rect, 3.5, capture);
 
-    expect(minimapSizeForHeight(1080, 3)).toBeGreaterThan(Math.round(1080 * MINIMAP_CAPTURE_FACTOR));
-    expect(region.x).toBe(-42);
+    expect(minimapSizeForHeight(1080, 3.5)).toBeGreaterThan(Math.round(1080 * MINIMAP_CAPTURE_FACTOR));
+    expect(region.x).toBe(-25);
     expect(minimapRegionFitsCapture(region, capture)).toBe(false);
   });
 
   it('accepts a region exactly filling the capture square', () => {
-    const capture = { x: 0, y: 0, width: 378, height: 378 };
-    expect(minimapRegionFitsCapture({ x: 0, y: 0, width: 378, height: 378 }, capture)).toBe(true);
-    expect(minimapRegionFitsCapture({ x: 0, y: 0, width: 379, height: 378 }, capture)).toBe(false);
+    const capture = { x: 0, y: 0, width: 432, height: 432 };
+    expect(minimapRegionFitsCapture({ x: 0, y: 0, width: 432, height: 432 }, capture)).toBe(true);
+    expect(minimapRegionFitsCapture({ x: 0, y: 0, width: 433, height: 432 }, capture)).toBe(false);
   });
 });

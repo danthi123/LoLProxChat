@@ -93,13 +93,13 @@ describe('decodeCaptureFrame', () => {
     expect(() => decodeCaptureFrame({ width: 3 } as unknown as ArrayBuffer)).toThrow(/not a buffer/);
   });
 
-  // Ties the wire format to the 378px capture square that
+  // Ties the wire format to the 432px capture square that
   // tests/core/map-calibration.test.ts pins for a 1080p game window.
   test('parses a full-size 1080p frame', () => {
-    const raw = makeFrame(378, 378);
-    expect(raw.byteLength).toBe(571544);
+    const raw = makeFrame(432, 432);
+    expect(raw.byteLength).toBe(746504);
     const frame = decodeCaptureFrame(raw);
-    expect([frame.width, frame.height]).toEqual([378, 378]);
+    expect([frame.width, frame.height]).toEqual([432, 432]);
   });
 });
 
@@ -108,7 +108,7 @@ describe('decodeCaptureFrame', () => {
  * capture_minimap returns. Drives the real tick, not a stand-in for it.
  */
 describe('TrackingService.tick over the capture frame wire format', () => {
-  /** A borderless 1080p game window on the primary monitor — capture is 378x378. */
+  /** A borderless 1080p game window on the primary monitor — capture is 432x432. */
   const FULL_HD = { x: 0, y: 0, width: 1920, height: 1080 };
 
   let errors: unknown[][];
@@ -136,7 +136,7 @@ describe('TrackingService.tick over the capture frame wire format', () => {
   test('a well-formed frame runs the CV pass and releases the tick guard', async () => {
     const svc = newService();
     svc.setMinimapRegion({ x: 0, y: 0, width: 100, height: 100 });
-    mockInvoke.mockResolvedValue(makeFrame(378, 378));
+    mockInvoke.mockResolvedValue(makeFrame(432, 432));
 
     (svc as unknown as { tick(): void }).tick();
     await settle();
@@ -165,7 +165,7 @@ describe('TrackingService.tick over the capture frame wire format', () => {
     const svc = newService();
     svc.setMinimapRegion({ x: 0, y: 0, width: 100, height: 100 });
     mockInvoke.mockImplementation((cmd: string) =>
-      cmd === 'capture_minimap' ? Promise.resolve(makeFrame(377, 377)) : Promise.resolve(undefined),
+      cmd === 'capture_minimap' ? Promise.resolve(makeFrame(431, 431)) : Promise.resolve(undefined),
     );
 
     (svc as unknown as { tick(): void }).tick();
@@ -173,7 +173,7 @@ describe('TrackingService.tick over the capture frame wire format', () => {
 
     expect(errors).toHaveLength(1);
     expect(errors[0][0]).toBe('[Tracking] frame decode failed:');
-    expect(String(errors[0][1])).toContain('377x377');
+    expect(String(errors[0][1])).toContain('431x431');
     // Nothing was indexed against the mismatched frame.
     expect((svc as unknown as { diagCounter: number }).diagCounter).toBe(0);
     // ...and the bounds were re-pushed once, as the only recovery available.

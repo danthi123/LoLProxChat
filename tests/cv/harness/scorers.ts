@@ -54,3 +54,46 @@ export class UnloadedScorer implements BlobScorer {
     return blobs.map(() => 0);
   }
 }
+
+/**
+ * A model that is silent about every blob except on one inference run, where it
+ * is briefly certain about one wrong point — a single-frame misclassification.
+ *
+ * This is the input the classifier EMA exists to absorb. v0.3.0's "snap up to
+ * raw on any increase" branch let one such frame latch a blob's confidence at
+ * 1.0, and the tracker then followed a minion wave or a structure with
+ * conviction; v0.3.1 reverted it to a symmetric EMA that damps the spike to
+ * 0.4. See nextClassifierEma in src/services/tracking-helpers.ts.
+ */
+export class SpikingScorer implements BlobScorer {
+  runs = 0;
+  constructor(
+    private readonly spikeAt: number,
+    private readonly target: () => Point,
+  ) {}
+  isLoaded(): boolean { return true; }
+  async scoreBlobsForLocalChampion(_frame: CaptureFrame, blobs: BlobCropBox[]): Promise<number[]> {
+    const run = this.runs++;
+    if (run !== this.spikeAt) return blobs.map(() => 0);
+    const t = this.target();
+    return blobs.map(b => (cropContains(b, t) ? 1 : 0));
+  }
+}
+
+/**
+ * A model that cannot tell two teal blobs apart — it vouches for both.
+ *
+ * Not a contrived input: updateClassifierScores divides every raw score by the
+ * largest one, so a weak model answering 0.060 and 0.055 for two allies hands
+ * the tracker 1.00 and 0.92. Both clear CLS_FOLLOW_THRESHOLD, the identity gate
+ * lets both through, and whatever the composite score does next is the only
+ * thing choosing between them.
+ */
+export class IndiscriminateScorer implements BlobScorer {
+  runs = 0;
+  isLoaded(): boolean { return true; }
+  async scoreBlobsForLocalChampion(_frame: CaptureFrame, blobs: BlobCropBox[]): Promise<number[]> {
+    this.runs++;
+    return blobs.map(() => 1);
+  }
+}

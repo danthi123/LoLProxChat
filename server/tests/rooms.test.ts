@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { RoomManager } from '../src/rooms.js';
+import { handleConnection } from '../src/ws-handler.js';
+import type { LivenessTracker } from '../src/heartbeat.js';
 import type { WebSocket } from 'ws';
 
 // Minimal mock WebSocket — just needs to be a unique object reference
@@ -332,4 +335,144 @@ describe('RoomManager', () => {
     });
   });
 
+});
+
+// docs/threat-model.md Part 1 — "Clients never see another client's raw
+// position." tests/e2e/compliance.e2e.test.ts sweeps the same invariant over a
+// live two-client session, but that suite runs only in the `e2e` job, which is
+// continue-on-error: on its own it cannot stop a leak from reaching main, and
+// making a server-spawning polling suite a required check would trade this gap
+// for merge-gate flakiness. This is the same guard inside the blocking `server`
+// job — exact key sets over the frames the handler actually puts on the wire,
+// so a coordinate added to `ServerMessage` and populated anywhere in
+// ws-handler fails here in milliseconds.
+describe('wire shape of the frames a room lifecycle emits', () => {
+  let rooms: RoomManager;
+
+  beforeEach(() => {
+    rooms = new RoomManager();
+  });
+
+  /**
+   * Stand-in for a `ws` socket that records what the handler serialises, since
+   * the wire form — not the object literal — is what the client sees. Fields
+   * left undefined are dropped by JSON.stringify and so never appear in a key
+   * set.
+   */
+  class FrameSocket extends EventEmitter {
+    readyState = 1;
+    readonly OPEN = 1;
+    readonly frames: Record<string, any>[] = [];
+
+    send(raw: string): void {
+      this.frames.push(JSON.parse(raw));
+    }
+
+    close(): void {
+      this.readyState = 3;
+    }
+
+    terminate(): void {
+      this.readyState = 3;
+    }
+
+    /** Feed an inbound client message, the way the ws library would. */
+    deliver(msg: unknown): void {
+      this.emit('message', Buffer.from(JSON.stringify(msg)));
+    }
+
+    get ws(): WebSocket {
+      return this as unknown as WebSocket;
+    }
+  }
+
+  const noHeartbeat: LivenessTracker = { markAlive: () => {} };
+
+  // Every frame type the handler emits, and every key each one is allowed to
+  // carry. `signal` is absent on purpose: its payload is client data relayed
+  // opaquely, so nothing asserted about it here would be about the server.
+  const FRAME_KEYS: Record<string, string[]> = {
+    room_state: ['peers', 'type'],
+    peer_joined: ['name', 'type'],
+    peer_left: ['name', 'type'],
+    position: ['blob', 'from', 'type'],
+  };
+
+  /** Every object anywhere in `value`, the root included. */
+  function objectsIn(value: unknown, out: Record<string, unknown>[] = []): Record<string, unknown>[] {
+    if (Array.isArray(value)) {
+      for (const item of value) objectsIn(item, out);
+    } else if (value && typeof value === 'object') {
+      out.push(value as Record<string, unknown>);
+      for (const item of Object.values(value)) objectsIn(item, out);
+    }
+    return out;
+  }
+
+  /** A numeric x/y pair is what a leaked game coordinate looks like on the wire. */
+  function coordinateShaped(value: unknown): Record<string, unknown>[] {
+    return objectsIn(value).filter(o => typeof o.x === 'number' && typeof o.y === 'number');
+  }
+
+  it('carries exactly the documented keys, and nothing coordinate-shaped', () => {
+    const blob = JSON.stringify({
+      summonerName: 'Bob', championName: 'Zed', team: 'CHAOS', isMuted: false, isDead: false,
+    });
+    const a = new FrameSocket();
+    const b = new FrameSocket();
+    handleConnection(a.ws, rooms, noHeartbeat);
+    handleConnection(b.ws, rooms, noHeartbeat);
+
+    a.deliver({ type: 'join', room: 'r1', name: 'Alice', team: 'ORDER' });
+    b.deliver({ type: 'join', room: 'r1', name: 'Bob', team: 'CHAOS' });
+    // Coordinates reach the server and stop there: both clients report one, so
+    // the sweep below runs against room state that HAS positions to leak.
+    a.deliver({ type: 'coords', x: 4200, y: 7300 });
+    b.deliver({ type: 'coords', x: 4600, y: 7300 });
+    b.deliver({ type: 'position', blob });
+    b.emit('close');
+
+    const frames = [...a.frames, ...b.frames];
+    // An `error` frame means the session never got going, which would satisfy
+    // an allowlist while proving nothing.
+    expect(frames.filter(f => f.type === 'error')).toEqual([]);
+    // The sweep is only evidence if every frame type actually flowed.
+    expect(new Set(frames.map(f => f.type))).toEqual(new Set(Object.keys(FRAME_KEYS)));
+
+    for (const frame of frames) {
+      expect(Object.keys(frame).sort()).toEqual(FRAME_KEYS[frame.type]);
+      expect(coordinateShaped(frame)).toEqual([]);
+    }
+
+    // room_state lists names, not peer records — the shape an "enriched" roster
+    // would grow a position on.
+    for (const frame of frames.filter(f => f.type === 'room_state')) {
+      for (const peer of frame.peers) expect(typeof peer).toBe('string');
+    }
+
+    // The presence blob is relayed byte-for-byte. Its contents are the
+    // sender's, so the server-side claim is only that nothing was merged into
+    // it — room state holds Bob's coords and must not reach Alice this way.
+    expect(a.frames.filter(f => f.type === 'position').map(f => f.blob)).toEqual([blob]);
+  });
+
+  it('keeps error frames to a type and a message', () => {
+    // The fifth thing a client can receive, and the one most likely to grow a
+    // helpful detail: an error raised while the server is holding the room's
+    // coordinates must still say nothing about them.
+    const a = new FrameSocket();
+    handleConnection(a.ws, rooms, noHeartbeat);
+    a.deliver({ type: 'join', room: 'r1', name: 'Alice' });
+    a.deliver({ type: 'coords', x: 4200, y: 7300 });
+    a.deliver({ type: 'signal', to: 'Nobody', payload: { sdp: 'x' } });
+    a.deliver({ type: 'not-a-real-type' });
+
+    const errors = a.frames.filter(f => f.type === 'error');
+    expect(errors.length).toBe(2);
+    for (const frame of errors) {
+      expect(Object.keys(frame).sort()).toEqual(['message', 'type']);
+      expect(typeof frame.message).toBe('string');
+      expect(frame.message).not.toMatch(/4200|7300/);
+    }
+  });
 });

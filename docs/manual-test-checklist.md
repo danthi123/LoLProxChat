@@ -79,7 +79,7 @@ rather than one you ran from `npm run dev`.
 | 6.4 | Turn on "voice on camera" and pan the camera across the map | You hear from the camera; the other player's volume for you does not change | `tests/e2e/session.e2e.test.ts` (E5) |
 | 6.5 | End the game, then start a second one without restarting the app | The second session joins cleanly, and the log shows one meter loop, not two | `tests/services/orchestrator-lifecycle.test.ts` |
 | 6.6 | Restart the app mid-game while the other player stays in | The restarted client rejoins under the same name and voice comes back | `tests/e2e/session.e2e.test.ts` (E7), server takeover path |
-| 6.7 | One player closes their laptop lid / drops the network without quitting | The other stops hearing them within ~30s rather than holding them at full volume | `server/tests/heartbeat.test.ts` |
+| 6.7 | One player closes their laptop lid / drops the network without quitting | The other stops hearing them within ~60s (one to two 30 s heartbeat sweeps) rather than holding them at full volume | `server/tests/heartbeat.test.ts` |
 
 ---
 

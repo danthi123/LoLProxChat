@@ -16,9 +16,26 @@ import { TrackingState } from '../../../src/services/tracking';
 import { Position } from '../../../src/core/types';
 import { ScreenRect } from '../../../src/core/map-calibration';
 
+// Successive trackers start on different corners of the map, every pair of them
+// further apart than the 1350-unit cross-team hearing range. A shared start
+// coordinate put two champions on the same pixel until the first scripted move
+// propagated, and a zero-distance exchange answers "ally at 1.0" and "enemy in
+// range" on the ordinary distance rule alone — so assertions about the rules
+// that are supposed to produce those answers held whether or not the rules
+// existed. Consecutive entries are always distinct, which is what the two
+// clients of a test need; the list is round-robined so a long run stays inside
+// the map.
+const START_POSITIONS: readonly Position[] = [
+  { x: 1500, y: 1500 },
+  { x: 13000, y: 13000 },
+  { x: 1500, y: 13000 },
+  { x: 13000, y: 1500 },
+];
+let startSeq = 0;
+
 export class ScriptedTracker {
   state: TrackingState = TrackingState.LOCKED;
-  position: Position | null = { x: 1000, y: 1000 };
+  position: Position | null = { ...START_POSITIONS[startSeq++ % START_POSITIONS.length] };
   cameraPosition: Position | null = null;
   holdSec = 0;
   cameraTrackingEnabled = false;

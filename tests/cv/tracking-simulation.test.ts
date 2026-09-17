@@ -11,13 +11,22 @@
 // state machine and the scoring wiring. It does NOT prove that the ONNX
 // classifier recognises real icons (models/champion-classifier-metrics.json and
 // real-game validation cover that), nor that classifyPixel's thresholds survive
-// real minimap rendering.
+// real minimap rendering. How much easier those flat rings are than a real icon
+// is measured, not assumed: see "the frames are not easier than a real minimap"
+// in tests/cv/harness-selfcheck.test.ts, which pins the border loss and the
+// portrait-art fraction at which the detector stops seeing an icon at all.
 
 import { MAP_DIMENSIONS } from '../../src/core/types';
 import { TrackingState } from '../../src/services/tracking';
 import { FORCED_REACQUIRE_HOLD_MS } from '../../src/services/tracking-helpers';
 import { driveTracker, FRAME_MS, metrics, newTracker } from './harness/drive';
-import { OracleScorer, UnloadedScorer, ZeroScorer } from './harness/scorers';
+import {
+  IndiscriminateScorer,
+  OracleScorer,
+  SpikingScorer,
+  UnloadedScorer,
+  ZeroScorer,
+} from './harness/scorers';
 import {
   ICON_DIAM,
   Point,
@@ -222,6 +231,17 @@ describe('losing the icon', () => {
     expect(distance(last.px!, vanishPoint)).toBeLessThan(12);
     expect(last.px!.x).toBeGreaterThanOrEqual(0);
     expect(last.px!.x).toBeLessThan(REGION.width);
+
+    // ...and it has to have EXTRAPOLATED, not merely stayed inside the bound.
+    // A tracker that freezes at the vanish point, or one whose velocity EMA
+    // points backwards, satisfies every assertion above — so check that the
+    // drift went the way the champion was walking, and got somewhere.
+    const drift = { x: last.px!.x - vanishPoint.x, y: last.px!.y - vanishPoint.y };
+    const stepMag = Math.hypot(STEP.x, STEP.y);
+    const along = (drift.x * STEP.x + drift.y * STEP.y) / stepMag;
+    const across = Math.abs(drift.x * -STEP.y + drift.y * STEP.x) / stepMag;
+    expect(along).toBeGreaterThan(3);
+    expect(across).toBeLessThan(2);
   });
 
   test('a hold past the forced-reacquire budget drops to SCANNING and re-locks when the icon returns', async () => {
@@ -390,5 +410,175 @@ describe('a mid-session config poll', () => {
     const last = records[records.length - 1];
     expect(last.state).toBe(TrackingState.LOCKED);
     expect(distance(last.px!, last.truth!)).toBeLessThanOrEqual(3);
+  });
+});
+
+describe('a second teal icon inside the jump radius', () => {
+  // Every other scenario in this file keeps the backdrop allies ~150px away, so
+  // exactly one candidate is ever in jump range and Phase 1 never actually has
+  // to choose. These two put a second icon inside the radius, which is what
+  // makes the composite score — rather than iteration order — decide the lock.
+  const STOP: Point = at(START, STEP, 15);
+  /** Raster-first (smaller y), inside the 48px jump radius, outside the near field. */
+  const NEIGHBOUR: Point = { x: STOP.x, y: STOP.y - 34 };
+
+  function standStill(count: number, trail: Point | null): SceneSpec[] {
+    return Array.from({ length: count }, () => ({
+      ...BACKDROP,
+      allies: [...BACKDROP.allies!, NEIGHBOUR],
+      self: STOP,
+      selfTrail: trail,
+    }));
+  }
+
+  test('the movement trail keeps the lock on the champion, not on the ally beside it', async () => {
+    const scenes = renderScenes([...walk(16), ...standStill(12, { x: -STEP.x, y: -STEP.y })]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new UnloadedScorer() });
+
+    const records = await driveTracker(h, scenes);
+    const last = records[records.length - 1];
+
+    expect(distance(NEIGHBOUR, STOP)).toBeLessThan(48);
+    expect(distance(NEIGHBOUR, STOP)).toBeGreaterThan(ICON_DIAM);
+    expect(distance(last.px!, STOP)).toBeLessThanOrEqual(3);
+    expect(distance(last.px!, NEIGHBOUR)).toBeGreaterThan(20);
+  });
+
+  test('with no trail and no classifier, position alone still picks the right one', async () => {
+    // The champion has stopped and its movement trail has faded; the ally is
+    // nearer the top of the frame, so it reaches Phase 1 first. Nothing but the
+    // position term separates them.
+    const scenes = renderScenes([...walk(16), ...standStill(12, null)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new UnloadedScorer() });
+
+    const records = await driveTracker(h, scenes);
+    const last = records[records.length - 1];
+
+    expect(last.state).toBe(TrackingState.LOCKED);
+    expect(distance(last.px!, STOP)).toBeLessThanOrEqual(3);
+    expect(distance(last.px!, NEIGHBOUR)).toBeGreaterThan(20);
+  });
+
+  test('...and still picks it when the classifier vouches for both', async () => {
+    // Score normalization turns a weak model's 0.060/0.055 into 1.00/0.92, so
+    // "the classifier vouches for every candidate" is the ordinary case, not a
+    // contrived one. With identity saying nothing and no trail to break the
+    // tie, the position term is carrying the lock by itself.
+    const scenes = renderScenes([...walk(16), ...standStill(12, null)]);
+    const classifier = new IndiscriminateScorer();
+    const h = newTracker(scenes.map(s => s.frame), { classifier });
+
+    const records = await driveTracker(h, scenes);
+    const last = records[records.length - 1];
+
+    expect(classifier.runs).toBeGreaterThan(0);
+    expect(last.state).toBe(TrackingState.LOCKED);
+    expect(distance(last.px!, STOP)).toBeLessThanOrEqual(3);
+    expect(distance(last.px!, NEIGHBOUR)).toBeGreaterThan(20);
+  });
+});
+
+describe('how far the lock may travel in one frame', () => {
+  const VANISH: Point = at(START, STEP, 15);
+
+  test('a hold widens the jump radius enough to catch up with a moved icon', async () => {
+    // The icon is hidden (a ping, an overlapping icon, fog) and reappears where
+    // the champion walked to in the meantime — 75px away, far outside the 48px
+    // base radius. computeMaxJumpPx's hold expansion is the only thing that
+    // reaches it without a classifier.
+    const RETURN: Point = { x: 150, y: 140 };
+    const scenes = renderScenes([...walk(16), ...vanished(16), ...Array.from({ length: 8 }, () => ({
+      ...BACKDROP,
+      self: RETURN,
+      selfTrail: { x: -STEP.x, y: -STEP.y },
+    }))]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new UnloadedScorer() });
+
+    const records = await driveTracker(h, scenes);
+    const last = records[records.length - 1];
+
+    expect(distance(VANISH, RETURN)).toBeGreaterThan(48);
+    expect(distance(VANISH, RETURN)).toBeLessThan(96);
+    expect(last.state).toBe(TrackingState.LOCKED);
+    expect(distance(last.px!, RETURN)).toBeLessThanOrEqual(3);
+  });
+
+  test('...but never far enough to reach an ally across the map', async () => {
+    // Same hold, no classifier to veto anything, and the backdrop ally at
+    // (40,45) sitting ~149px away. The radius must not have grown that far in
+    // the 3s this hold lasts.
+    const HOLD_FRAMES = 24;
+    const scenes = renderScenes([...walk(16), ...vanished(HOLD_FRAMES)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new UnloadedScorer() });
+
+    const records = await driveTracker(h, scenes);
+    const last = records[records.length - 1];
+
+    // 48px base + one icon diameter per held second, held for 3s.
+    const widest = 48 + ICON_DIAM * (HOLD_FRAMES * FRAME_MS) / 1000;
+    for (const ally of BACKDROP.allies!) {
+      expect(distance(VANISH, ally)).toBeGreaterThan(widest);
+      expect(distance(last.px!, ally)).toBeGreaterThan(50);
+    }
+    expect(distance(last.px!, VANISH)).toBeLessThan(12);
+  });
+
+  test('a one-frame jump across the widened radius does not fling the extrapolation off the map', async () => {
+    // VEL_CAP_PX's reason for existing: after a long hold the radius is wide
+    // enough for Phase 1 to accept a blob 110px away, the velocity EMA takes
+    // half of that as the frame's speed, and if the icon vanishes again on the
+    // next frame every remaining tick extrapolates at a speed no champion can
+    // produce. A real user log drifted 12000 game units in 500ms that way.
+    const JUMP: Point = { x: 190, y: 140 };
+    const HOLD_FRAMES = 24;
+    const JUMP_FRAME = 16 + HOLD_FRAMES;
+    const scenes = renderScenes([
+      ...walk(16),
+      ...vanished(HOLD_FRAMES),
+      { ...BACKDROP, self: JUMP },
+      ...vanished(10),
+    ]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new UnloadedScorer() });
+
+    const records = await driveTracker(h, scenes);
+
+    // The jump is inside the hold-widened radius and outside the base one, so
+    // Phase 1 takes it in a single frame — which is what loads the EMA.
+    expect(distance(VANISH, JUMP)).toBeGreaterThan(96);
+    expect(distance(VANISH, JUMP)).toBeLessThan(48 + ICON_DIAM * (HOLD_FRAMES * FRAME_MS) / 1000);
+    expect(distance(records[JUMP_FRAME].px!, JUMP)).toBeLessThanOrEqual(3);
+
+    // Capped, the ten extrapolated frames that follow add up to ~32px and stop.
+    // Uncapped they cover three times that and only the region clamp stops them.
+    const last = records[records.length - 1];
+    expect(distance(last.px!, JUMP)).toBeLessThan(45);
+    expect(last.px!.x).toBeLessThan(REGION.width);
+    expect(last.px!.y).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('a single-frame classifier misfire', () => {
+  test('one confident frame on a distant ally does not steal a stationary lock', async () => {
+    // The v0.3.0 "snap up to raw" EMA turned one wrong frame into a permanent
+    // 1.0, and the tracker teleported onto structures and minion waves. With
+    // the symmetric EMA the spike damps to 0.4, well under the 0.85 bar
+    // computeReacquireThreshold sets once the champion has been stationary.
+    const VANISH: Point = at(START, STEP, 15);
+    const FAR_ALLY: Point = BACKDROP.allies![1];
+    // The tenth inference run lands ~4.5s in: past the 3s of standing still
+    // that raises the Phase-2 bar to 0.85, and before the 5s hold budget that
+    // would have dropped the tracker to SCANNING and made the spike moot.
+    const scenes = renderScenes([...walk(16), ...vanished(34)]);
+    const classifier = new SpikingScorer(9, () => toFramePoint(FAR_ALLY));
+    const h = newTracker(scenes.map(s => s.frame), { classifier });
+
+    const records = await driveTracker(h, scenes);
+    const last = records[records.length - 1];
+
+    expect(classifier.runs).toBeGreaterThan(9);
+    expect(distance(VANISH, FAR_ALLY)).toBeGreaterThan(144);
+    expect(logs.some(l => l.includes('Re-acquired via classifier'))).toBe(false);
+    expect(distance(last.px!, FAR_ALLY)).toBeGreaterThan(50);
+    expect(distance(last.px!, VANISH)).toBeLessThan(12);
   });
 });

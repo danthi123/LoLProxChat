@@ -60,6 +60,14 @@ jobs:
   # never mask the fast signal — the lifecycle transitions it would otherwise be
   # the only cover for are duplicated in the fast suite on purpose.
   #
+  # That duplication now covers the anti-cheat invariant too. compliance.e2e.test.ts
+  # sweeps a live session for leaked coordinates, but a continue-on-error job
+  # cannot stop a leak from merging, and promoting a server-spawning polling
+  # suite to a required check would import its flakiness into the merge gate
+  # instead. The same invariant is asserted as exact wire key sets in the
+  # blocking `server` job — server/tests/rooms.test.ts (every frame the handler
+  # emits) and server/tests/volumes.test.ts (the /compute-volumes response).
+  #
   # node 24, unlike the 20 the other jobs use, because the suite drives the real
   # SignalingService over the WebSocket client that only became a stable global
   # in node 22 — which is what lets it run with no new dependency in

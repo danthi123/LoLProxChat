@@ -30,8 +30,8 @@ export const MINIMAP_SCALE = 1.0;
 // the self-check asserts the tracker agrees, and a calibration change that
 // moves the minimap fails there, loudly, instead of silently relabelling every
 // ground-truth coordinate in this suite.
-export const CAPTURE_SIZE = 378;
-export const REGION = { x: 105, y: 105, width: 273, height: 273 };
+export const CAPTURE_SIZE = 432;
+export const REGION = { x: 159, y: 159, width: 273, height: 273 };
 /** Math.round(REGION.width * 0.087) — TrackingService.expectedIconDiam. */
 export const ICON_DIAM = 24;
 

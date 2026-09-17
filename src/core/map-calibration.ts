@@ -19,11 +19,19 @@ export interface ScreenRect {
 
 /**
  * Fraction of the game window's height captured as the minimap search square.
- * This covers MinimapScale up to ~2.4 at every resolution; anything larger does
- * not fit and is rejected rather than read out of bounds — see
+ *
+ * The requirement is resolution-independent: at MinimapScale 3 the formula in
+ * `minimapSizeForHeight` asks for exactly 7/18 = 0.3889 of the window height,
+ * because the +/-40 terms cancel. 0.40 clears that at every resolution (the
+ * crossover sits at ~3.15), so the whole 0.0-3.0 range League's HUD exposes
+ * fits. Anything beyond it is rejected rather than read out of bounds — see
  * `minimapRegionFitsCapture`.
+ *
+ * Raising this costs pixels quadratically on the 30 Hz scan tick, which
+ * user-guide.md names as an audio-crackle cause; don't move it without that
+ * trade in mind.
  */
-export const MINIMAP_CAPTURE_FACTOR = 0.35;
+export const MINIMAP_CAPTURE_FACTOR = 0.40;
 
 /**
  * Capture square for a game window, in screen coordinates. The minimap sits in

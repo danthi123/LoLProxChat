@@ -11,7 +11,17 @@ import { decodeCaptureFrame } from '../../src/core/capture-frame';
 import type { Blob } from '../../src/services/blob-types';
 import { TrackingService } from '../../src/services/tracking';
 import { computeViewportCenter } from '../../src/services/tracking-helpers';
-import { blankFrame, encodeFrame, ring, TEAL } from './harness/frames';
+import {
+  blankFrame,
+  brokenRing,
+  encodeFrame,
+  ovalRing,
+  portraitArt,
+  ring,
+  setPixel,
+  SynthFrame,
+  TEAL,
+} from './harness/frames';
 import {
   CAPTURE_SIZE,
   ICON_DIAM,
@@ -57,6 +67,15 @@ interface Inspection {
  * of it.
  */
 function inspect(spec: SceneSpec): Inspection {
+  return inspectEncoded(renderScene(spec).frame);
+}
+
+/** The same, for a frame composed pixel by pixel rather than from a SceneSpec. */
+function inspectFrame(f: SynthFrame): Inspection {
+  return inspectEncoded(encodeFrame(f));
+}
+
+function inspectEncoded(encoded: ArrayBuffer): Inspection {
   const svc = newService();
   const inner = svc as unknown as {
     createMask(f: unknown, r: unknown): Uint8Array;
@@ -67,7 +86,7 @@ function inspect(spec: SceneSpec): Inspection {
     whitePixelScore(b: Blob, w: Uint8Array, v: Uint8Array, rw: number, rh: number): number;
   };
 
-  const frame = decodeCaptureFrame(renderScene(spec).frame);
+  const frame = decodeCaptureFrame(encoded);
   const mask = inner.dilate(inner.createMask(frame, REGION), REGION.width, REGION.height);
   const allBlobs = inner.findBlobs(mask, REGION.width, REGION.height);
   const { whiteMask, viewportMask } = inner.buildWhiteMasks(frame, REGION);
@@ -79,6 +98,19 @@ function inspect(spec: SceneSpec): Inspection {
     viewportMask,
     whiteScore: (b) => inner.whitePixelScore(b, whiteMask, viewportMask, REGION.width, REGION.height),
   };
+}
+
+/** A frame holding nothing but what the caller draws into it. */
+function bare(draw: (f: SynthFrame) => void): Inspection {
+  const f = blankFrame(CAPTURE_SIZE, CAPTURE_SIZE);
+  draw(f);
+  return inspectFrame(f);
+}
+
+function bboxOf(b: Blob): { w: number; h: number; aspect: number } {
+  const w = b.maxX - b.minX + 1;
+  const h = b.maxY - b.minY + 1;
+  return { w, h, aspect: w / h };
 }
 
 function newService(): TrackingService {
@@ -237,5 +269,134 @@ describe('icon ring thickness is load-bearing', () => {
     expect(t2.accepted).toBe(true);
     expect(t3.fill).toBeGreaterThan(0.40);
     expect(t3.accepted).toBe(false);
+  });
+});
+
+describe('teal shapes that are not champion icons', () => {
+  // The reference scene above only ever asks filterIconBlobs to reject DENSE
+  // teal (the minion wave, the turret), so fillRatio was the only gate under
+  // test and the size and aspect gates could both be deleted with the whole
+  // suite staying green. These are the shapes that exercise the other two.
+  const AT: Point = { x: 120, y: 120 };
+  const frameAt = (p: Point) => ({ x: REGION.x + p.x, y: REGION.y + p.y });
+
+  test('a ping ring is icon-shaped and icon-hollow, and rejected on size alone', () => {
+    // An ally ping part-way through its expansion: a round teal outline about
+    // twice an icon across. Only the size band stands between it and a lock.
+    const { allBlobs, iconBlobs } = bare(f => {
+      const c = frameAt(AT);
+      ring(f, c.x, c.y, Math.round(ICON_DIAM * 2.2), TEAL, 1);
+    });
+
+    expect(allBlobs).toHaveLength(1);
+    const box = bboxOf(allBlobs[0]);
+    expect(box.aspect).toBeGreaterThan(0.6);
+    expect(box.aspect).toBeLessThan(1.7);
+    expect(allBlobs[0].fillRatio).toBeGreaterThan(0.08);
+    expect(allBlobs[0].fillRatio).toBeLessThan(0.40);
+    expect(allBlobs[0].pixels).toBeGreaterThan(15);
+    expect(box.w).toBeGreaterThan(ICON_DIAM * 1.6);
+
+    expect(iconBlobs).toHaveLength(0);
+  });
+
+  test('an elongated outline is icon-sized and icon-hollow, and rejected on aspect alone', () => {
+    // Two adjacent icons whose borders dilate() has bridged, or a ping caught
+    // mid-animation: inside the size band, inside the ring fill band, far too
+    // wide to be a circle.
+    const { allBlobs, iconBlobs } = bare(f => {
+      const c = frameAt(AT);
+      // Derived from ICON_DIAM so the shape keeps straddling the gates if the
+      // calibration ever moves: ~1.4 icons wide, ~0.55 of one tall.
+      ovalRing(f, c.x, c.y, Math.round(ICON_DIAM * 0.71), Math.round(ICON_DIAM * 0.25), TEAL);
+    });
+
+    expect(allBlobs).toHaveLength(1);
+    const box = bboxOf(allBlobs[0]);
+    expect(box.w).toBeGreaterThanOrEqual(ICON_DIAM * 0.6);
+    expect(box.w).toBeLessThanOrEqual(ICON_DIAM * 1.6);
+    expect(box.h).toBeGreaterThanOrEqual(ICON_DIAM * 0.6);
+    expect(box.h).toBeLessThanOrEqual(ICON_DIAM * 1.6);
+    expect(allBlobs[0].fillRatio).toBeGreaterThan(0.08);
+    expect(allBlobs[0].fillRatio).toBeLessThan(0.40);
+    expect(box.aspect).toBeGreaterThan(1.7);
+
+    expect(iconBlobs).toHaveLength(0);
+  });
+
+  test('a stray teal pixel never becomes a blob at all', () => {
+    // Compression noise or a single cyan terrain pixel. findBlobs' 10-pixel
+    // floor is the only thing keeping it out of the candidate list: even after
+    // dilate() a lone pixel is a 5-pixel cross.
+    const { allBlobs } = bare(f => {
+      const c = frameAt(AT);
+      setPixel(f, c.x, c.y, TEAL);
+    });
+    expect(allBlobs).toHaveLength(0);
+  });
+});
+
+describe('the frames are not easier than a real minimap', () => {
+  const AT: Point = { x: 120, y: 120 };
+  const frameAt = (p: Point) => ({ x: REGION.x + p.x, y: REGION.y + p.y });
+
+  test('the 1px border every scene draws is the fragile end of the detector', () => {
+    // Scenes draw icons with a one-pixel border, because the fill cap rejects
+    // three (see above) — but that is also the border least able to survive
+    // the anti-aliasing and terrain occlusion a real capture has. Losing one
+    // border pixel in twelve is the whole budget: at one in six the ring
+    // fragments and the surviving arc's centroid lands 4px off the icon, which
+    // is outside the 3px accuracy band every scenario in
+    // tests/cv/tracking-simulation.test.ts asserts against.
+    const thin = (dropEvery: number) => bare(f => {
+      const c = frameAt(AT);
+      brokenRing(f, c.x, c.y, ICON_DIAM, TEAL, dropEvery, 1);
+    });
+
+    const intact = thin(12);
+    expect(intact.iconBlobs).toHaveLength(1);
+    expect(near(intact.iconBlobs[0], AT, 1)).toBe(true);
+
+    const fragmented = thin(6);
+    expect(fragmented.allBlobs.length).toBeGreaterThan(1);
+    expect(fragmented.iconBlobs).toHaveLength(1);
+    expect(near(fragmented.iconBlobs[0], AT, 2)).toBe(false);
+
+    // A two-pixel border — what League actually draws at this minimap size —
+    // takes a third of its pixels missing and still centres exactly. The
+    // detector is not the fragile part; the harness's choice of border is.
+    const thick = bare(f => {
+      const c = frameAt(AT);
+      brokenRing(f, c.x, c.y, ICON_DIAM, TEAL, 3, 2);
+    });
+    expect(thick.allBlobs).toHaveLength(1);
+    expect(thick.iconBlobs).toHaveLength(1);
+    expect(near(thick.iconBlobs[0], AT, 1)).toBe(true);
+  });
+
+  test('champion art inside the border is tolerated only up to about a tenth cyan', () => {
+    // Scenes here draw hollow rings on flat fog. A real icon is a portrait, and
+    // every portrait pixel classifyPixel calls teal joins the border's blob —
+    // then dilate() spreads each one into a five-pixel cross — so the interior
+    // drives fillRatio at the 0.40 cap far faster than its pixel count suggests.
+    const withArt = (cyanFraction: number) => bare(f => {
+      const c = frameAt(AT);
+      portraitArt(f, c.x, c.y, ICON_DIAM, cyanFraction, 7);
+      ring(f, c.x, c.y, ICON_DIAM, TEAL, 1);
+    });
+
+    const typical = withArt(0.10);
+    expect(typical.iconBlobs).toHaveLength(1);
+    expect(near(typical.iconBlobs[0], AT, 2)).toBe(true);
+    expect(typical.iconBlobs[0].fillRatio).toBeLessThan(0.40);
+
+    // HONEST LIMIT: past roughly a tenth, the icon stops existing as far as the
+    // tracker is concerned — detected as a blob, rejected as too dense, never
+    // offered to the scorer. Nothing in this repo measures how many of the 172
+    // champion icons land on the wrong side of that line; only a real capture
+    // can, and this suite's green run is not evidence about it either way.
+    const cyanHeavy = withArt(0.20);
+    expect(cyanHeavy.iconBlobs).toHaveLength(0);
+    expect(cyanHeavy.allBlobs[0].fillRatio).toBeGreaterThan(0.40);
   });
 });

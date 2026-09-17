@@ -40,7 +40,17 @@ class FakeSocket extends EventEmitter {
 
   /** Feed an inbound client message, the way the ws library would. */
   deliver(msg: unknown): void {
-    this.emit('message', Buffer.from(JSON.stringify(msg)));
+    this.deliverRaw(JSON.stringify(msg));
+  }
+
+  /**
+   * Feed bytes that never went through JSON.stringify. `emit` is synchronous,
+   * so a handler that throws throws out of here — which is exactly what it does
+   * to the process in production, where nothing sits between the receiver and
+   * the listener.
+   */
+  deliverRaw(raw: string): void {
+    this.emit('message', Buffer.from(raw));
   }
 
   received(type: ServerMessage['type']): ServerMessage[] {
@@ -221,7 +231,7 @@ describe('handleConnection', () => {
   describe('join validation', () => {
     const bad: Array<[string, unknown]> = [
       ['a name past the length cap', { type: 'join', room: 'r1', name: 'a'.repeat(65) }],
-      ['a control character in the name', { type: 'join', room: 'r1', name: 'Ali ce' }],
+      ['a control character in the name', { type: 'join', room: 'r1', name: 'Ali\x00ce' }],
       ['a non-string name', { type: 'join', room: 'r1', name: {} }],
       ['a non-string room', { type: 'join', room: 123, name: 'Alice' }],
       ['a room id outside the charset', { type: 'join', room: 'r 1', name: 'Alice' }],
@@ -296,6 +306,69 @@ describe('handleConnection', () => {
 
       alice.deliver({ type: 'signal', to: 'Bob', payload: {} });
       expect(alice.received('error')).toHaveLength(1);
+    });
+  });
+
+  describe('malformed frames', () => {
+    // Every case here is reachable by a stranger with no auth and no join.
+    // `'null'` is four bytes and used to take the process down: JSON.parse
+    // returns null, and reading `.type` off it throws out of the synchronous
+    // 'message' emit with nothing above to catch it.
+    const nonObjects: Array<[string, string]> = [
+      ['null', 'null'],
+      ['a bare number', '1'],
+      ['a bare string', '"x"'],
+      ['an array', '[1,2]'],
+      ['a bare boolean', 'false'],
+    ];
+
+    for (const [label, raw] of nonObjects) {
+      it(`answers ${label} with an error instead of throwing`, () => {
+        const sock = connect();
+
+        expect(() => sock.deliverRaw(raw)).not.toThrow();
+
+        // The exact text matters: the catch-all below the switch would also
+        // produce *an* error frame after a crash, which is what made a weaker
+        // assertion here pass with the guard deleted.
+        expect(sock.received('error')).toHaveLength(1);
+        expect(sock.received('error')[0].message).toBe('Invalid message');
+        expect(sock.closes).toHaveLength(0);
+      });
+    }
+
+    it('answers unparseable bytes with an error instead of throwing', () => {
+      const sock = connect();
+
+      expect(() => sock.deliverRaw('{')).not.toThrow();
+
+      expect(sock.received('error')[0].message).toBe('Invalid JSON');
+    });
+
+    it('keeps the connection usable after a malformed frame', () => {
+      // The crash cost every room on the process; the floor for the fix is that
+      // the sender's own session survives its own bad frame.
+      const alice = connect();
+      const sock = connect();
+      alice.deliver({ type: 'join', room: 'r1', name: 'Alice' });
+
+      sock.deliverRaw('null');
+      sock.deliver({ type: 'join', room: 'r1', name: 'Bob' });
+
+      expect(sock.received('room_state')[0].peers).toEqual(['Alice']);
+      expect(alice.received('peer_joined').map(m => m.name)).toEqual(['Bob']);
+    });
+
+    it('does not let a throw deeper in the handler escape the listener', () => {
+      // Defence in depth for the switch arms: any future throw inside one has
+      // the same blast radius as the null deref did.
+      const sock = connect();
+      const boom = new Error('kaboom');
+      vi.spyOn(rooms, 'getClientInfo').mockImplementationOnce(() => {
+        throw boom;
+      });
+
+      expect(() => sock.deliver({ type: 'coords', x: 1, y: 2 })).not.toThrow();
     });
   });
 });

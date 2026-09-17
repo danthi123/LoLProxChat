@@ -10,18 +10,20 @@ import {
   ConcurrencyLimiter,
   LIMITS,
   clientIp,
-  parseTrustProxyHops,
+  resolveProxyTrust,
+  describeProxyTrust,
   playerKey,
   RejectionCounters,
 } from './rate-limit.js';
 
 const PORT = parseInt(process.env.PORT || '3100');
-// How many reverse proxies of ours sit in front. Deployment topology, not limit
-// tuning — it can't be a compile-time constant because the same build runs
-// behind one Caddy, behind a CDN→Caddy chain, or on a bare port. See
-// rate-limit.ts for how the value is used and docs/self-hosting.md for the
-// operator-facing rules.
-const TRUST_PROXY_HOPS = parseTrustProxyHops(process.env.TRUST_PROXY);
+// Which addresses in front of us are our own reverse proxies. Deployment
+// topology, not limit tuning — it can't be a compile-time constant because the
+// same build runs behind one Caddy, behind a CDN→Caddy chain, or on a bare
+// port. TRUST_PROXY is the deprecated hop-count spelling, still honoured so an
+// existing deployment survives the upgrade. See rate-limit.ts for how the value
+// is used and docs/self-hosting.md for the operator-facing rules.
+const PROXY_TRUST = resolveProxyTrust(process.env.TRUSTED_PROXIES, process.env.TRUST_PROXY);
 // Ping interval for the WebSocket liveness sweep. Overridable so tests (and a
 // self-hoster behind an unusually impatient proxy) can tighten it; a bad value
 // falls back to the default rather than being used, because setInterval(fn, NaN)
@@ -107,7 +109,7 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
   }
 
   if (req.method === 'POST' && req.url === '/compute-volumes') {
-    const ip = clientIp(req, TRUST_PROXY_HOPS, onUntrustedForward);
+    const ip = clientIp(req, PROXY_TRUST, onUntrustedForward);
     // Cheap per-IP backstop first: bounds total throughput (and the body
     // buffering below) from any single source before we know who's asking.
     if (!computeVolumesIpLimiter.tryConsume(ip)) {
@@ -167,7 +169,7 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
   }
 
   if (req.url === '/turn-credentials') {
-    if (!turnCredsLimiter.tryConsume(clientIp(req, TRUST_PROXY_HOPS, onUntrustedForward))) {
+    if (!turnCredsLimiter.tryConsume(clientIp(req, PROXY_TRUST, onUntrustedForward))) {
       rejections.bump('turn_creds_ip');
       sendError(res, 429, 'rate limit exceeded — slow down');
       return;
@@ -193,8 +195,20 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
 // headroom and blocks anyone trying to flood the relay with huge payloads.
 const wss = new WebSocketServer({ server: httpServer, maxPayload: LIMITS.WS_PAYLOAD_BYTES });
 
+// Failures during the HTTP upgrade emit on the server, before any socket exists
+// to carry them. An 'error' event with no listener is a throw, and a throw here
+// is the whole process.
+wss.on('error', (err) => console.warn('[wss] server error:', err.message));
+
 wss.on('connection', (ws, req) => {
-  const ip = clientIp(req as any, TRUST_PROXY_HOPS, onUntrustedForward);
+  // Must stay the first statement. A socket that fails the per-IP check below
+  // is only sent a close frame — it keeps receiving, so it can still error —
+  // and `maxPayload` above makes an oversized frame a routine way to get there.
+  // Unlistened, that 'error' event is an uncaught throw that kills the process
+  // and every room in it.
+  ws.on('error', (err) => console.warn('[ws] socket error:', (err as Error).message));
+
+  const ip = clientIp(req as any, PROXY_TRUST, onUntrustedForward);
   if (!wsConnectionLimiter.acquire(ip)) {
     // The address is deliberately absent: docs/threat-model.md promises no
     // per-user logging, and the aggregate counter covers the operator need.
@@ -223,10 +237,6 @@ setInterval(() => {
 httpServer.listen(PORT, () => {
   console.log(`proxchat-server listening on :${PORT}`);
   // Printed so an operator can confirm in `docker logs` what the running
-  // process resolved TRUST_PROXY to, rather than inferring it from behaviour.
-  console.log(
-    TRUST_PROXY_HOPS > 0
-      ? `proxchat-server trust-proxy: ${TRUST_PROXY_HOPS} hop(s), private peers only`
-      : 'proxchat-server trust-proxy: disabled (forwarding headers ignored)',
-  );
+  // process resolved its proxy trust to, rather than inferring it from behaviour.
+  console.log(`proxchat-server trust-proxy: ${describeProxyTrust(PROXY_TRUST)}`);
 });

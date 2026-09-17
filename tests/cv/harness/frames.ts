@@ -165,3 +165,100 @@ export function encodeFrame(f: SynthFrame): ArrayBuffer {
   new Uint8ClampedArray(buf, CAPTURE_FRAME_HEADER_BYTES).set(f.data);
   return buf;
 }
+
+/**
+ * A ring with every `dropEvery`-th border pixel missing.
+ *
+ * The plain `ring` above is an unbroken circle, which a real minimap icon never
+ * is: the border is anti-aliased, and terrain and other icons punch holes in
+ * it. dilate() exists to close exactly those holes — without it even the solid
+ * ring falls apart into sub-threshold fragments, because a 1px circle is only
+ * diagonally connected in its shallow sections and findBlobs is 4-connected.
+ */
+export function brokenRing(
+  f: SynthFrame,
+  cx: number,
+  cy: number,
+  diam: number,
+  color: Rgb,
+  dropEvery = 4,
+  thickness = 1,
+): void {
+  const rOuter = diam / 2;
+  const rInner = rOuter - thickness;
+  let n = 0;
+  for (let dy = Math.floor(-rOuter - 1); dy <= Math.ceil(rOuter + 1); dy++) {
+    for (let dx = Math.floor(-rOuter - 1); dx <= Math.ceil(rOuter + 1); dx++) {
+      const d = Math.hypot(dx, dy);
+      if (d > rOuter || d <= rInner) continue;
+      if (n % dropEvery !== 0) setPixel(f, cx + dx, cy + dy, color);
+      n++;
+    }
+  }
+}
+
+/**
+ * An icon-sized outline that is not round — an ally ping part-way through its
+ * expansion, or a pair of adjacent icons whose borders dilate() has bridged.
+ *
+ * Sized so that filterIconBlobs' aspect gate is the ONLY thing that rejects it:
+ * the bounding box stays inside the size band and the fill ratio inside the
+ * ring band. tests/cv/harness-selfcheck.test.ts pins all three.
+ */
+export function ovalRing(
+  f: SynthFrame,
+  cx: number,
+  cy: number,
+  rx: number,
+  ry: number,
+  color: Rgb,
+): void {
+  for (let dy = -ry - 1; dy <= ry + 1; dy++) {
+    for (let dx = -rx - 1; dx <= rx + 1; dx++) {
+      const outer = (dx / rx) ** 2 + (dy / ry) ** 2;
+      const inner = (dx / (rx - 1)) ** 2 + (dy / (ry - 1)) ** 2;
+      if (outer <= 1 && inner > 1) setPixel(f, cx + dx, cy + dy, color);
+    }
+  }
+}
+
+/**
+ * Champion art inside the border ring.
+ *
+ * Real minimap icons are not hollow, and that matters to the detector: any
+ * portrait pixel that lands inside classifyPixel's teal box joins the border's
+ * blob and pushes fillRatio toward the 0.40 rejection cap. `cyanFraction` is
+ * how much of the art falls in that box; the rest is warm colour that
+ * classifies as nothing. Deterministic, so a failure is reproducible.
+ */
+export function portraitArt(
+  f: SynthFrame,
+  cx: number,
+  cy: number,
+  diam: number,
+  cyanFraction: number,
+  seed = 1,
+): void {
+  let state = seed >>> 0 || 1;
+  const rand = () => {
+    // xorshift32: no dependency, same sequence on every platform.
+    state ^= state << 13; state >>>= 0;
+    state ^= state >> 17;
+    state ^= state << 5; state >>>= 0;
+    return state / 0x100000000;
+  };
+  const r = diam / 2 - 2;
+  for (let dy = -Math.floor(r); dy <= Math.floor(r); dy++) {
+    for (let dx = -Math.floor(r); dx <= Math.floor(r); dx++) {
+      if (Math.hypot(dx, dy) > r) continue;
+      const cyan = rand() < cyanFraction;
+      // The warm half sits in the gap between the two thresholds — r above
+      // teal's 100 and below red's 140 — so it classifies as nothing and only
+      // the cyan half can change the blob.
+      const c: Rgb = cyan
+        ? [Math.floor(rand() * 90), 145 + Math.floor(rand() * 105), 145 + Math.floor(rand() * 105)]
+        : [105 + Math.floor(rand() * 33), 55 + Math.floor(rand() * 60), 30 + Math.floor(rand() * 60)];
+      setPixel(f, cx + dx, cy + dy, c);
+    }
+  }
+}

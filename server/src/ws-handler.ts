@@ -67,138 +67,157 @@ export function handleConnection(
   const limitKey = 'self'; // single bucket per connection — key is irrelevant
 
   ws.on('message', (data) => {
-    // Before the rate limit: a client that is being throttled is still alive,
-    // and reaping it would tear down working audio for every peer.
-    heartbeat.markAlive(ws);
-
-    if (!msgLimiter.tryConsume(limitKey)) {
-      onReject?.('ws_messages');
-      sendError(ws, 'message rate limit exceeded — slow down');
-      return;
-    }
-    let msg: ClientMessage;
+    // Everything below runs inside try/catch because `ws` emits this listener
+    // synchronously: anything that throws here escapes to the EventEmitter and
+    // takes the whole process — every room with it — down with one frame from
+    // one unauthenticated stranger.
     try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      sendError(ws, 'Invalid JSON');
-      return;
-    }
+      // Before the rate limit: a client that is being throttled is still alive,
+      // and reaping it would tear down working audio for every peer.
+      heartbeat.markAlive(ws);
 
-    switch (msg.type) {
-      case 'join': {
-        const valid = validateJoin(msg.room, msg.name);
-        if (!valid.ok) {
-          // The socket stays open: a retry with the same values can't succeed,
-          // and closing would send the client's reconnect loop around forever.
-          sendError(ws, valid.error);
-          return;
-        }
-        const { room, name } = valid;
+      if (!msgLimiter.tryConsume(limitKey)) {
+        onReject?.('ws_messages');
+        sendError(ws, 'message rate limit exceeded — slow down');
+        return;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(data.toString());
+      } catch {
+        sendError(ws, 'Invalid JSON');
+        return;
+      }
+      // `null`, numbers, strings and arrays are all well-formed JSON that carry
+      // no `type`. Only `null` is fatal — reading `.type` off it throws — but the
+      // rest have no business reaching the switch either.
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        sendError(ws, 'Invalid message');
+        return;
+      }
+      const msg = parsed as ClientMessage;
 
-        // v0.3: optional team field. v0.2.x clients omit it; we pass undefined
-        // and computeTieredVolumes falls back to legacy team-blind behavior.
-        const team = msg.team === 'ORDER' || msg.team === 'CHAOS' ? msg.team : undefined;
-
-        const existing = rooms.getClientInfo(ws);
-        if (existing) {
-          if (existing.roomId === room && existing.name === name) {
-            // Repeat join on a live socket. Returning here is load-bearing:
-            // falling through would have `join` find this socket's OWN entry as
-            // the duplicate and evict the connection that just spoke.
-            if (team) rooms.setTeam(ws, team);
-            send(ws, { type: 'room_state', peers: rooms.getOthersInRoom(ws).map(c => c.name) });
+      switch (msg.type) {
+        case 'join': {
+          const valid = validateJoin(msg.room, msg.name);
+          if (!valid.ok) {
+            // The socket stays open: a retry with the same values can't succeed,
+            // and closing would send the client's reconnect loop around forever.
+            sendError(ws, valid.error);
             return;
           }
-          // Moving rooms: the old room has to be told, and it has to be told
-          // from `remaining` — after `leave`, `getOthersInRoom` has no entry to
-          // resolve the room from and returns nothing.
-          const gone = rooms.leave(ws);
-          if (gone) {
-            for (const peer of gone.remaining) {
-              send(peer.ws, { type: 'peer_left', name: gone.name });
+          const { room, name } = valid;
+
+          // v0.3: optional team field. v0.2.x clients omit it; we pass undefined
+          // and computeTieredVolumes falls back to legacy team-blind behavior.
+          const team = msg.team === 'ORDER' || msg.team === 'CHAOS' ? msg.team : undefined;
+
+          const existing = rooms.getClientInfo(ws);
+          if (existing) {
+            if (existing.roomId === room && existing.name === name) {
+              // Repeat join on a live socket. Returning here is load-bearing:
+              // falling through would have `join` find this socket's OWN entry as
+              // the duplicate and evict the connection that just spoke.
+              if (team) rooms.setTeam(ws, team);
+              send(ws, { type: 'room_state', peers: rooms.getOthersInRoom(ws).map(c => c.name) });
+              return;
+            }
+            // Moving rooms: the old room has to be told, and it has to be told
+            // from `remaining` — after `leave`, `getOthersInRoom` has no entry to
+            // resolve the room from and returns nothing.
+            const gone = rooms.leave(ws);
+            if (gone) {
+              for (const peer of gone.remaining) {
+                send(peer.ws, { type: 'peer_left', name: gone.name });
+              }
             }
           }
+
+          const { peers, evicted } = rooms.join(room, name, ws, team);
+
+          if (evicted && evicted.ws !== ws) {
+            console.log('[ws] takeover: "' + name + '" in room ' + room + ' moved to a newer connection');
+            evict(evicted.ws);
+            // No peer_left for the evicted socket: the name is still in the room,
+            // and telling peers it left would make them tear down the connection
+            // to the client that just took it over.
+          }
+
+          // Send room_state to the joiner
+          send(ws, { type: 'room_state', peers });
+
+          // Broadcast peer_joined to others already in the room
+          const others = rooms.getOthersInRoom(ws);
+          for (const peer of others) {
+            send(peer.ws, { type: 'peer_joined', name });
+          }
+          break;
         }
 
-        const { peers, evicted } = rooms.join(room, name, ws, team);
-
-        if (evicted && evicted.ws !== ws) {
-          console.log('[ws] takeover: "' + name + '" in room ' + room + ' moved to a newer connection');
-          evict(evicted.ws);
-          // No peer_left for the evicted socket: the name is still in the room,
-          // and telling peers it left would make them tear down the connection
-          // to the client that just took it over.
+        case 'signal': {
+          const info = rooms.getClientInfo(ws);
+          if (!info) {
+            sendError(ws, 'Not in a room');
+            return;
+          }
+          if (!msg.to) {
+            sendError(ws, 'signal requires "to" field');
+            return;
+          }
+          const target = rooms.findInRoom(info.roomId, msg.to);
+          if (!target) {
+            sendError(ws, `Peer "${msg.to}" not found in room`);
+            return;
+          }
+          if (!send(target.ws, { type: 'signal', from: info.name, payload: msg.payload })) {
+            // Tell the sender rather than letting the handshake stall silently.
+            sendError(ws, `Peer "${msg.to}" is not reachable`);
+          }
+          break;
         }
 
-        // Send room_state to the joiner
-        send(ws, { type: 'room_state', peers });
-
-        // Broadcast peer_joined to others already in the room
-        const others = rooms.getOthersInRoom(ws);
-        for (const peer of others) {
-          send(peer.ws, { type: 'peer_joined', name });
+        case 'position': {
+          // Peer-presence metadata broadcast (name/champion/mute/dead state).
+          // NOT the XY coordinates — those use 'coords' since v0.2.
+          const info = rooms.getClientInfo(ws);
+          if (!info) {
+            sendError(ws, 'Not in a room');
+            return;
+          }
+          const others = rooms.getOthersInRoom(ws);
+          for (const peer of others) {
+            send(peer.ws, { type: 'position', from: info.name, blob: msg.blob });
+          }
+          break;
         }
-        break;
+
+        case 'coords': {
+          // v0.2 server-side proximity: client reports its XY directly to the
+          // server (replaces the v0.1 encrypted-blob exchange over WebRTC data
+          // channels). Server stores in room state; the next /compute-volumes
+          // request reads it for pairwise distance.
+          const info = rooms.getClientInfo(ws);
+          if (!info) {
+            sendError(ws, 'Not in a room');
+            return;
+          }
+          if (typeof msg.x !== 'number' || typeof msg.y !== 'number' ||
+              !isFinite(msg.x) || !isFinite(msg.y)) {
+            sendError(ws, 'coords requires finite x and y');
+            return;
+          }
+          rooms.setPosition(ws, msg.x, msg.y);
+          break;
+        }
+
+        default:
+          sendError(ws, `Unknown message type: ${(msg as any).type}`);
       }
-
-      case 'signal': {
-        const info = rooms.getClientInfo(ws);
-        if (!info) {
-          sendError(ws, 'Not in a room');
-          return;
-        }
-        if (!msg.to) {
-          sendError(ws, 'signal requires "to" field');
-          return;
-        }
-        const target = rooms.findInRoom(info.roomId, msg.to);
-        if (!target) {
-          sendError(ws, `Peer "${msg.to}" not found in room`);
-          return;
-        }
-        if (!send(target.ws, { type: 'signal', from: info.name, payload: msg.payload })) {
-          // Tell the sender rather than letting the handshake stall silently.
-          sendError(ws, `Peer "${msg.to}" is not reachable`);
-        }
-        break;
-      }
-
-      case 'position': {
-        // Peer-presence metadata broadcast (name/champion/mute/dead state).
-        // NOT the XY coordinates — those use 'coords' since v0.2.
-        const info = rooms.getClientInfo(ws);
-        if (!info) {
-          sendError(ws, 'Not in a room');
-          return;
-        }
-        const others = rooms.getOthersInRoom(ws);
-        for (const peer of others) {
-          send(peer.ws, { type: 'position', from: info.name, blob: msg.blob });
-        }
-        break;
-      }
-
-      case 'coords': {
-        // v0.2 server-side proximity: client reports its XY directly to the
-        // server (replaces the v0.1 encrypted-blob exchange over WebRTC data
-        // channels). Server stores in room state; the next /compute-volumes
-        // request reads it for pairwise distance.
-        const info = rooms.getClientInfo(ws);
-        if (!info) {
-          sendError(ws, 'Not in a room');
-          return;
-        }
-        if (typeof msg.x !== 'number' || typeof msg.y !== 'number' ||
-            !isFinite(msg.x) || !isFinite(msg.y)) {
-          sendError(ws, 'coords requires finite x and y');
-          return;
-        }
-        rooms.setPosition(ws, msg.x, msg.y);
-        break;
-      }
-
-      default:
-        sendError(ws, `Unknown message type: ${(msg as any).type}`);
+    } catch (err) {
+      // Reached only by a bug on this path — but the alternative is process
+      // death, so degrade to one dropped message instead.
+      console.error('[ws] message handler threw:', (err as Error)?.message ?? err);
+      sendError(ws, 'Internal error');
     }
   });
 

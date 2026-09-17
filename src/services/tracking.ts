@@ -32,6 +32,12 @@ export enum TrackingState {
   DEAD = 'dead',
 }
 
+// The panel is a ~240px column, so these stay short; the full geometry goes to
+// the log instead. They are the only signal a user without Debug on ever sees
+// for a capture geometry we refused, and the refusal never clears itself.
+export const WARN_MINIMAP_TOO_LARGE = "Minimap too large to capture — lower MinimapScale in League's HUD.";
+export const WARN_CALIBRATION_OUTSIDE_CAPTURE = 'Calibrated minimap is outside the capture area — recalibrate.';
+
 import type { Blob } from './blob-types';
 
 export class TrackingService {
@@ -47,6 +53,8 @@ export class TrackingService {
 
   // Minimap region (detected or set by calibration/config)
   private minimapRegion: { x: number; y: number; width: number; height: number } | null = null;
+  /** Panel-facing reason the minimap region was refused, or null. */
+  private geometryRefusal: string | null = null;
   private userMinimapRegion: { x: number; y: number; width: number; height: number } | null = null;
   private configMinimapScale: number | null = null;
 
@@ -215,6 +223,12 @@ export class TrackingService {
   getGameRect(): ScreenRect { return this.gameRect; }
 
   /**
+   * Why the current minimap region was refused, in words short enough for the
+   * overlay panel — or null when there is nothing to say.
+   */
+  getGeometryRefusal(): string | null { return this.geometryRefusal; }
+
+  /**
    * Set the minimap region from League's MinimapScale config value.
    * The size formula and its calibration live in core/map-calibration.ts.
    */
@@ -224,14 +238,17 @@ export class TrackingService {
     const region = getMinimapRegionForRect(this.gameRect, scale, this.captureBounds);
 
     if (!minimapRegionFitsCapture(region, this.captureBounds)) {
-      // Scanning a region we can only see part of would report systematically
-      // shifted game coordinates — and those get broadcast. Refuse instead.
+      // Scanning a region we can only see part of would index the frame out of
+      // bounds in createMask, which wraps into the previous scanline rather
+      // than failing. Refuse instead.
       console.error('[Tracking] MinimapScale ' + scale + ' needs a ' + region.width +
         'px minimap but the capture square is only ' + this.captureBounds.width + 'px' +
         ' (gameRect=' + JSON.stringify(this.gameRect) + ') — tracking cannot run');
+      this.geometryRefusal = WARN_MINIMAP_TOO_LARGE;
       this.minimapRegion = null;
       this.expectedIconDiam = 0;
     } else {
+      this.geometryRefusal = null;
       this.minimapRegion = region;
       this.expectedIconDiam = Math.round(region.width * 0.087);
       console.log('[Tracking] Minimap from config: scale=' + scale +
@@ -258,12 +275,25 @@ export class TrackingService {
    * too, or the stored region will point at the wrong pixels.
    */
   setMinimapRegion(region: { x: number; y: number; width: number; height: number } | null): void {
-    this.userMinimapRegion = region;
-    if (region) {
+    // A hand-drawn region gets the same fit check as a config-derived one: the
+    // out-of-bounds indexing in createMask does not care which produced it.
+    if (region && !minimapRegionFitsCapture(region, this.captureBounds)) {
+      console.error('[Tracking] Calibrated region ' + JSON.stringify(region) +
+        ' does not fit the ' + this.captureBounds.width + 'px capture square' +
+        ' (gameRect=' + JSON.stringify(this.gameRect) + ') — tracking cannot run');
+      this.geometryRefusal = WARN_CALIBRATION_OUTSIDE_CAPTURE;
+      this.userMinimapRegion = null;
+      this.minimapRegion = null;
+      this.expectedIconDiam = 0;
+    } else if (region) {
+      this.geometryRefusal = null;
+      this.userMinimapRegion = region;
       this.minimapRegion = region;
       this.expectedIconDiam = Math.round(region.width * 0.087);
       console.log('[Tracking] Minimap set by calibration:', JSON.stringify(region), 'iconDiam:', this.expectedIconDiam);
     } else {
+      this.geometryRefusal = null;
+      this.userMinimapRegion = null;
       this.minimapRegion = null;
     }
     this.state = TrackingState.SCANNING;

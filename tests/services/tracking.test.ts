@@ -1,4 +1,9 @@
-import { TrackingState, TrackingService } from '../../src/services/tracking';
+import {
+  TrackingState,
+  TrackingService,
+  WARN_MINIMAP_TOO_LARGE,
+  WARN_CALIBRATION_OUTSIDE_CAPTURE,
+} from '../../src/services/tracking';
 import type { Blob } from '../../src/services/blob-types';
 
 /** A borderless 1080p game window on the primary monitor. */
@@ -310,21 +315,76 @@ describe('TrackingService game-window geometry', () => {
 
     expect((offLeft as any).minimapRegion).toEqual((onPrimary as any).minimapRegion);
     // ...and the absolute capture bounds do.
-    expect(offLeft.captureBounds.x).toBe(-378);
-    expect(onPrimary.captureBounds.x).toBe(1542);
+    expect(offLeft.captureBounds.x).toBe(-432);
+    expect(onPrimary.captureBounds.x).toBe(1488);
+  });
+
+  // The top of League's own MinimapScale slider. It used to be refused, which
+  // disabled tracking outright for anyone running a large minimap (#13).
+  test('accepts the largest MinimapScale League exposes', () => {
+    const svc = new TrackingService(FULL_HD, 'summoners_rift');
+    svc.setMinimapScaleFromConfig(3); // 420px minimap vs a 432px capture square
+
+    expect((svc as any).minimapRegion).toEqual({ x: 12, y: 12, width: 420, height: 420 });
+    expect(svc.getGeometryRefusal()).toBeNull();
+    expect(svc.getDetectedMinimapScreenBounds()).toEqual({
+      screenX: 1500, screenY: 660, screenWidth: 420, screenHeight: 420,
+    });
   });
 
   // A minimap larger than the capture square gives the region a negative
   // origin, and createMask indexes the frame unclamped — the reads would wrap
   // into the previous scanline. Without the guard this leaves a usable-looking
-  // region of {x: -42, y: -42, width: 420, height: 420}.
+  // region of {x: -25, y: -25, width: 457, height: 457}.
   test('refuses a MinimapScale whose minimap exceeds the capture square', () => {
     const svc = new TrackingService(FULL_HD, 'summoners_rift');
-    svc.setMinimapScaleFromConfig(3); // 420px minimap vs a 378px capture square
+    svc.setMinimapScaleFromConfig(3.5); // 457px minimap vs a 432px capture square
 
     expect((svc as any).minimapRegion).toBeNull();
     expect(svc.getDetectedMinimapScreenBounds()).toBeNull();
     expect(errSpy.mock.calls.map((c) => c.join(' ')).join('\n')).toContain('capture square');
+  });
+
+  // console.error alone reaches the log file only when Debug is already on, so
+  // it cannot be the only trace of a refusal: the panel needs the reason too.
+  test('a refusal is reported in words the overlay panel can show', () => {
+    const svc = new TrackingService(FULL_HD, 'summoners_rift');
+    svc.setMinimapScaleFromConfig(3.5);
+
+    expect(svc.getGeometryRefusal()).toBe(WARN_MINIMAP_TOO_LARGE);
+    expect(WARN_MINIMAP_TOO_LARGE).toMatch(/MinimapScale/);
+  });
+
+  test('a refusal clears once a fitting scale arrives', () => {
+    const svc = new TrackingService(FULL_HD, 'summoners_rift');
+    svc.setMinimapScaleFromConfig(3.5);
+    svc.setMinimapScaleFromConfig(1);
+
+    expect(svc.getGeometryRefusal()).toBeNull();
+    expect((svc as any).minimapRegion).not.toBeNull();
+  });
+
+  // Manual calibration reaches the same unclamped indexing as the config path,
+  // so it needs the same refusal — including clearing userMinimapRegion, which
+  // processFrame would otherwise reinstate behind the guard's back.
+  test('refuses a hand-calibrated region that overflows the capture square', () => {
+    const svc = new TrackingService(FULL_HD, 'summoners_rift');
+    svc.setMinimapRegion({ x: -25, y: -25, width: 457, height: 457 });
+
+    expect((svc as any).minimapRegion).toBeNull();
+    expect((svc as any).userMinimapRegion).toBeNull();
+    expect(svc.getDetectedMinimapScreenBounds()).toBeNull();
+    expect(svc.getGeometryRefusal()).toBe(WARN_CALIBRATION_OUTSIDE_CAPTURE);
+  });
+
+  test('accepts a hand-calibrated region that fits', () => {
+    const svc = new TrackingService(FULL_HD, 'summoners_rift');
+    const region = { x: 12, y: 12, width: 420, height: 420 };
+    svc.setMinimapRegion(region);
+
+    expect((svc as any).minimapRegion).toEqual(region);
+    expect((svc as any).userMinimapRegion).toEqual(region);
+    expect(svc.getGeometryRefusal()).toBeNull();
   });
 
   test('getGameRect reports the rect the service was built from', () => {

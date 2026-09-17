@@ -5,7 +5,12 @@ import {
   clientIp,
   isTrustedPeer,
   normalizeIp,
+  parseCidr,
+  ipInNet,
+  parseTrustedProxies,
   parseTrustProxyHops,
+  resolveProxyTrust,
+  describeProxyTrust,
   playerKey,
   RejectionCounters,
 } from '../src/rate-limit.js';
@@ -163,6 +168,19 @@ describe('clientIp', () => {
       socket: { remoteAddress: '127.0.0.1' },
     }, 3);
     expect(ip).toBe('203.0.113.9');
+  });
+
+  it('lets a list padded to exactly hops choose the bucket — why the count is deprecated', () => {
+    // Pins the weakness TRUSTED_PROXIES exists to fix, so it cannot come back
+    // silently on the path existing deployments still run. With hops=2 the
+    // requester sends one junk entry, the proxy appends the real address, and
+    // entries[len - 2] is the entry the requester wrote. Nothing validates it
+    // as a proxy, so each rotation of that value mints a fresh bucket.
+    const ip = clientIp({
+      headers: { 'x-forwarded-for': '1.2.3.4, 203.0.113.9' },
+      socket: { remoteAddress: '127.0.0.1' },
+    }, 2);
+    expect(ip).toBe('1.2.3.4');
   });
 
   it('rejects non-IP forwarded values and signals that it did', () => {
@@ -387,5 +405,228 @@ describe('RejectionCounters', () => {
     expect(c.drainDeltas()).toEqual({});
     c.bump('xff_invalid');
     expect(c.drainDeltas()).toEqual({ xff_invalid: 1 });
+  });
+});
+
+describe('parseCidr and ipInNet', () => {
+  it('treats a bare address as a full-length prefix', () => {
+    const net = parseCidr('203.0.113.9')!;
+    expect(net.prefix).toBe(32);
+    expect(ipInNet('203.0.113.9', net)).toBe(true);
+    expect(ipInNet('203.0.113.10', net)).toBe(false);
+  });
+
+  it('matches on the prefix boundary, including inside an octet', () => {
+    const net = parseCidr('172.16.0.0/12')!;
+    expect(ipInNet('172.16.0.1', net)).toBe(true);
+    expect(ipInNet('172.31.255.254', net)).toBe(true);
+    expect(ipInNet('172.15.255.255', net)).toBe(false);
+    expect(ipInNet('172.32.0.1', net)).toBe(false);
+  });
+
+  it('matches IPv6 on a hextet-straddling prefix', () => {
+    const net = parseCidr('fc00::/7')!;
+    expect(ipInNet('fc00::1', net)).toBe(true);
+    expect(ipInNet('fd12:3456::1', net)).toBe(true);
+    expect(ipInNet('fe00::1', net)).toBe(false);
+  });
+
+  it('never matches across families', () => {
+    expect(ipInNet('10.0.0.1', parseCidr('::/8')!)).toBe(false);
+    expect(ipInNet('fc00::1', parseCidr('10.0.0.0/8')!)).toBe(false);
+  });
+
+  it('returns null for anything that is not a network', () => {
+    // A typo has to shrink the trusted set, never widen it.
+    for (const junk of ['', 'private', 'not-an-ip', '10.0.0.0/33', '10.0.0.0/-1',
+                        '10.0.0.0/x', 'fc00::/129', '999.1.1.1/8']) {
+      expect(parseCidr(junk), junk).toBeNull();
+    }
+  });
+});
+
+describe('parseTrustedProxies', () => {
+  it('expands the private keyword to the peer-gate ranges', () => {
+    const nets = parseTrustedProxies('private');
+    for (const addr of ['127.0.0.1', '10.0.0.5', '172.17.0.1', '192.168.1.1',
+                        '169.254.1.1', '::1', 'fc00::1', 'fe80::1']) {
+      expect(nets.some((n) => ipInNet(addr, n)), addr).toBe(true);
+    }
+    expect(nets.some((n) => ipInNet('203.0.113.9', n))).toBe(false);
+  });
+
+  it('accepts a mixed comma or space separated list', () => {
+    const nets = parseTrustedProxies('private, 198.51.100.0/24  2001:db8::/32');
+    expect(nets.some((n) => ipInNet('198.51.100.7', n))).toBe(true);
+    expect(nets.some((n) => ipInNet('2001:db8:1::5', n))).toBe(true);
+  });
+
+  it('drops unusable entries instead of widening the list', () => {
+    const nets = parseTrustedProxies('banana, 10.0.0.0/8, 10.0.0.0/99');
+    expect(nets).toHaveLength(1);
+    expect(ipInNet('10.1.2.3', nets[0])).toBe(true);
+  });
+
+  it('drops a /0, which would trust every address on the internet', () => {
+    // Trusting everything makes the walk stop nowhere and hands the bucket key
+    // straight back to the requester — the bypass the list exists to close.
+    expect(parseTrustedProxies('0.0.0.0/0')).toHaveLength(0);
+    expect(parseTrustedProxies('::/0')).toHaveLength(0);
+    expect(parseTrustedProxies('0.0.0.0/0, 10.0.0.0/8')).toHaveLength(1);
+  });
+});
+
+describe('clientIp with a trusted-proxy list', () => {
+  const PRIVATE = { nets: parseTrustedProxies('private'), hops: 1 };
+
+  it('ignores padding and keys on the real client (the hop-count bypass, closed)', () => {
+    // THE regression guard for this group. The requester sends '1.2.3.4', the
+    // proxy appends the address it saw, and the walk stops at the rightmost
+    // entry because it is not a listed proxy. No hop count to shift.
+    const ip = clientIp({
+      headers: { 'x-forwarded-for': '1.2.3.4, 203.0.113.9' },
+      socket: { remoteAddress: '127.0.0.1' },
+    }, PRIVATE);
+    expect(ip).toBe('203.0.113.9');
+  });
+
+  it('is unmoved by any amount of padding', () => {
+    const padded = ['9.9.9.9', '8.8.8.8', '1.1.1.1', '1.2.3.4'].join(', ');
+    const ip = clientIp({
+      headers: { 'x-forwarded-for': `${padded}, 203.0.113.9` },
+      socket: { remoteAddress: '172.17.0.1' },
+    }, PRIVATE);
+    expect(ip).toBe('203.0.113.9');
+  });
+
+  it('walks past a listed CDN edge to the client behind it', () => {
+    // Cloudflare → Caddy: the operator lists the CDN range alongside their own
+    // proxy, and the walk passes the edge and stops at the player. The hop
+    // count this replaces needed TRUST_PROXY=2 and a correct proxy config to
+    // reach the same answer.
+    const trust = { nets: parseTrustedProxies('private, 198.51.100.0/24'), hops: 1 };
+    const ip = clientIp({
+      headers: { 'x-forwarded-for': '1.2.3.4, 203.0.113.9, 198.51.100.7' },
+      socket: { remoteAddress: '127.0.0.1' },
+    }, trust);
+    expect(ip).toBe('203.0.113.9');
+  });
+
+  it('ignores headers from a peer that is not a listed proxy', () => {
+    const ip = clientIp({
+      headers: { 'x-forwarded-for': '1.2.3.4', 'x-real-ip': '5.6.7.8' },
+      socket: { remoteAddress: '203.0.113.9' },
+    }, PRIVATE);
+    expect(ip).toBe('203.0.113.9');
+  });
+
+  it('narrows trust to the listed networks, not to private ones generally', () => {
+    // A list of one proxy must not accidentally re-admit every private peer,
+    // which is what the LAN deployment in docs/self-hosting.md depends on.
+    const trust = { nets: parseTrustedProxies('10.8.0.1'), hops: 1 };
+    const ip = clientIp({
+      headers: { 'x-forwarded-for': '1.2.3.4' },
+      socket: { remoteAddress: '192.168.1.50' },
+    }, trust);
+    expect(ip).toBe('192.168.1.50');
+  });
+
+  it('keys on the proxy when every entry is one of ours', () => {
+    // Nothing in the list identifies a client, so there is no client address to
+    // take — a shared bucket beats a requester-chosen one.
+    const onInvalid = vi.fn();
+    const ip = clientIp({
+      headers: { 'x-forwarded-for': '10.0.0.9, 172.17.0.1' },
+      socket: { remoteAddress: '172.17.0.1' },
+    }, PRIVATE, onInvalid);
+    expect(ip).toBe('172.17.0.1');
+    expect(onInvalid).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops at an unparseable entry rather than stepping over it', () => {
+    // Stepping over it would attribute the entry to its left to whoever wrote
+    // the junk. The rightmost entry here is unusable, so nothing is believed.
+    const onInvalid = vi.fn();
+    const ip = clientIp({
+      headers: { 'x-forwarded-for': '203.0.113.9, not-an-ip' },
+      socket: { remoteAddress: '127.0.0.1' },
+    }, PRIVATE, onInvalid);
+    expect(ip).toBe('127.0.0.1');
+    expect(onInvalid).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses x-real-ip only when there is no list to walk', () => {
+    const ip = clientIp({
+      headers: { 'x-real-ip': '203.0.113.9' },
+      socket: { remoteAddress: '127.0.0.1' },
+    }, PRIVATE);
+    expect(ip).toBe('203.0.113.9');
+  });
+
+  it('never lets x-real-ip override the walk', () => {
+    // Caddy writes X-Forwarded-For and passes a client's X-Real-IP through
+    // untouched, so the walk's answer has to win outright.
+    const ip = clientIp({
+      headers: { 'x-real-ip': '1.2.3.4', 'x-forwarded-for': '203.0.113.9' },
+      socket: { remoteAddress: '127.0.0.1' },
+    }, PRIVATE);
+    expect(ip).toBe('203.0.113.9');
+  });
+
+  it('still buckets IPv6 clients by /64', () => {
+    const ip = clientIp({
+      headers: { 'x-forwarded-for': '2001:db8::dead:beef' },
+      socket: { remoteAddress: '::1' },
+    }, PRIVATE);
+    expect(ip).toBe('2001:db8:0:0::/64');
+  });
+
+  it('honours the kill switch shape with an empty list', () => {
+    const ip = clientIp({
+      headers: { 'x-forwarded-for': '1.2.3.4' },
+      socket: { remoteAddress: '127.0.0.1' },
+    }, { nets: [], hops: 0 });
+    expect(ip).toBe('127.0.0.1');
+  });
+});
+
+describe('resolveProxyTrust', () => {
+  it('defaults to the deprecated one-hop behaviour when neither var is set', () => {
+    // Every existing deployment upgrades without editing its compose file.
+    expect(resolveProxyTrust(undefined, undefined)).toEqual({ nets: [], hops: 1 });
+  });
+
+  it('keeps TRUST_PROXY working as a deprecated alias', () => {
+    expect(resolveProxyTrust(undefined, '2')).toEqual({ nets: [], hops: 2 });
+    expect(resolveProxyTrust(undefined, 'off')).toEqual({ nets: [], hops: 0 });
+    expect(resolveProxyTrust('', 'off')).toEqual({ nets: [], hops: 0 });
+  });
+
+  it('prefers the list over the hop count when both are set', () => {
+    const t = resolveProxyTrust('private', '2');
+    expect(t.nets.length).toBeGreaterThan(0);
+  });
+
+  it('accepts the off spellings in TRUSTED_PROXIES too', () => {
+    for (const v of ['off', 'OFF', 'false', '0', 'no']) {
+      expect(resolveProxyTrust(v, undefined), v).toEqual({ nets: [], hops: 0 });
+    }
+  });
+
+  it('falls back to the hop count when the list parses to nothing', () => {
+    // Dropping to 0 here would collapse a proxied deployment into one bucket —
+    // a typo in the new variable must not take the server down.
+    expect(resolveProxyTrust('banana', '2')).toEqual({ nets: [], hops: 2 });
+    expect(resolveProxyTrust('banana', undefined)).toEqual({ nets: [], hops: 1 });
+  });
+});
+
+describe('describeProxyTrust', () => {
+  it('names the mode the process actually resolved', () => {
+    // The startup line is how an operator confirms which path is live without
+    // inferring it from 429s.
+    expect(describeProxyTrust(resolveProxyTrust('private', undefined))).toContain('right-to-left');
+    expect(describeProxyTrust(resolveProxyTrust(undefined, '2'))).toContain('2 hop(s)');
+    expect(describeProxyTrust(resolveProxyTrust(undefined, 'off'))).toContain('disabled');
   });
 });

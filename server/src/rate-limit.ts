@@ -153,25 +153,38 @@ export const LIMITS = {
 //
 // Every limiter above is keyed by what `clientIp()` returns, so that string is
 // the security boundary: whoever gets to choose it can mint an unlimited supply
-// of fresh buckets and none of the limits above mean anything. Two rules keep
+// of fresh buckets and none of the limits above mean anything. Three rules keep
 // the choice away from the requester:
 //
-//   1. Forwarding headers are read only when the immediate TCP peer is
-//      loopback / private / link-local — i.e. the connection came from a
-//      reverse proxy on the operator's own host or Docker bridge. A client that
-//      reaches the published port directly arrives with a public address and
-//      its headers are ignored outright. Caddy (`trusted_proxies
-//      private_ranges`) and Express (`trust proxy: 'uniquelocal'`) draw the
-//      same line.
-//   2. A header-derived value has to parse as an IP address before it can
+//   1. Forwarding headers are read only when the immediate TCP peer is one of
+//      the operator's own proxies — an address in TRUSTED_PROXIES, or (in the
+//      deprecated hop-count mode) loopback / private / link-local. A client
+//      that reaches the published port directly arrives from somewhere else
+//      and its headers are ignored outright.
+//   2. `X-Forwarded-For` is walked RIGHT to LEFT and stops at the first entry
+//      that isn't a listed proxy. Each entry was written by the hop to its
+//      right, so the rightmost is the only one our own proxy vouches for and
+//      everything left of the first stranger was appended by something we do
+//      not control. This is the model `proxy-addr` (Express) uses.
+//   3. A header-derived value has to parse as an IP address before it can
 //      become a map key, so header text never lands in a `Map`.
 //
-// The gate assumes the container runtime hands the server the real source
+// Rule 2 is why a list beats a hop count: counting hops assumes every entry is
+// genuine, so a requester who pads the header with `hops - 1` junk entries
+// moves the counted index onto a value they wrote. Walking until a stranger
+// appears never lands left of the real client no matter how much padding
+// precedes it. TRUST_PROXY (the count) is kept as a deprecated alias so
+// existing deployments keep running across the upgrade.
+//
+// All of this assumes the container runtime hands the server the real source
 // address. Rootless Docker / Podman rewrite it to the bridge gateway, which is
 // private — see docs/self-hosting.md § "Client IP and rate limits".
 
 /** Upper bound on TRUST_PROXY; a chain deeper than this is a typo, not a topology. */
 const MAX_TRUST_PROXY_HOPS = 8;
+
+/** Upper bound on TRUSTED_PROXIES entries; more than this is a paste error, not a fleet. */
+const MAX_TRUSTED_PROXY_NETS = 64;
 
 /** Longest name fragment kept in a per-player bucket key. */
 const MAX_PLAYER_KEY_NAME = 64;
@@ -244,6 +257,77 @@ function bucketKeyForIp(ip: string): string {
   return h.slice(0, 4).map((v) => v.toString(16)).join(':') + '::/64';
 }
 
+// ---------- Trusted-proxy networks ----------
+
+/** An IP network. `parts` are address groups, `prefix` the significant bit count. */
+export interface CidrNet {
+  readonly v: 4 | 6;
+  readonly parts: readonly number[];
+  readonly prefix: number;
+}
+
+/** Bits per address group: octets for IPv4, hextets for IPv6. */
+const GROUP_BITS = { 4: 8, 6: 16 } as const;
+
+/** Split an already-validated address into its groups. */
+function addressGroups(ip: string): { v: 4 | 6; parts: number[] } | null {
+  const fam = isIP(ip);
+  if (fam === 4) return { v: 4, parts: ip.split('.').map(Number) };
+  if (fam !== 6) return null;
+  const h = expandV6(ip);
+  return h ? { v: 6, parts: h } : null;
+}
+
+/**
+ * Parse one `address` or `address/length` entry. Returns null for anything that
+ * isn't a network, which is what keeps a typo in TRUSTED_PROXIES from widening
+ * trust instead of narrowing it. A `::ffff:` form normalizes to its IPv4
+ * address first, so its prefix length must be an IPv4 one.
+ */
+export function parseCidr(raw: string): CidrNet | null {
+  const s = raw.trim().toLowerCase();
+  if (!s) return null;
+  const slash = s.lastIndexOf('/');
+  const addr = normalizeIp(slash === -1 ? s : s.slice(0, slash));
+  if (!addr) return null;
+  const groups = addressGroups(addr);
+  if (!groups) return null;
+  const full = groups.parts.length * GROUP_BITS[groups.v];
+  if (slash === -1) return { v: groups.v, parts: groups.parts, prefix: full };
+  const n = Number(s.slice(slash + 1));
+  if (!Number.isInteger(n) || n < 0 || n > full) return null;
+  return { v: groups.v, parts: groups.parts, prefix: n };
+}
+
+/** True when `ip` falls inside `net`. Families never match across each other. */
+export function ipInNet(ip: string, net: CidrNet): boolean {
+  const a = addressGroups(ip);
+  if (!a || a.v !== net.v) return false;
+  const width = GROUP_BITS[net.v];
+  let remaining = net.prefix;
+  for (let i = 0; remaining > 0; i++) {
+    const shift = width - Math.min(width, remaining);
+    if (a.parts[i] >>> shift !== net.parts[i] >>> shift) return false;
+    remaining -= width;
+  }
+  return true;
+}
+
+function inAnyNet(ip: string, nets: readonly CidrNet[]): boolean {
+  return nets.some((n) => ipInNet(ip, n));
+}
+
+/**
+ * The ranges a reverse proxy on the operator's own host or Docker network can
+ * appear from. Spelled `private` in TRUSTED_PROXIES, and the whole definition
+ * of a trusted peer in the deprecated hop-count mode. Matches what Caddy calls
+ * `private_ranges` and Express calls `uniquelocal`.
+ */
+const PRIVATE_NETS: readonly CidrNet[] = [
+  '127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16',
+  '::1/128', 'fc00::/7', 'fe80::/10',
+].map((c) => parseCidr(c) as CidrNet);
+
 /**
  * Bucket key for the immediate TCP peer. The kernel supplies this, not the
  * request, so a form `isIP()` doesn't recognise (an unusual zone id, say) keeps
@@ -271,21 +355,7 @@ export function isTrustedPeer(addr: string | undefined): boolean {
   // headers would reopen the bypass in the one path nobody looks at again.
   if (!addr) return false;
   const ip = normalizeIp(stripZone(addr));
-  if (!ip) return false;
-  if (isIP(ip) === 4) {
-    const o = ip.split('.').map(Number);
-    if (o[0] === 127) return true;                               // 127.0.0.0/8
-    if (o[0] === 10) return true;                                // 10.0.0.0/8
-    if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return true;   // 172.16.0.0/12
-    if (o[0] === 192 && o[1] === 168) return true;               // 192.168.0.0/16
-    if (o[0] === 169 && o[1] === 254) return true;               // 169.254.0.0/16
-    return false;
-  }
-  const h = expandV6(ip);
-  if (!h) return false;
-  if ((h[0] & 0xfe00) === 0xfc00) return true;                   // fc00::/7 unique-local
-  if ((h[0] & 0xffc0) === 0xfe80) return true;                   // fe80::/10 link-local
-  return h.every((v, i) => (i === 7 ? v === 1 : v === 0));       // ::1
+  return ip !== null && inAnyNet(ip, PRIVATE_NETS);
 }
 
 /**
@@ -305,15 +375,175 @@ export function parseTrustProxyHops(raw: string | undefined): number {
   return 1;
 }
 
+/** The `off` spellings shared by TRUST_PROXY and TRUSTED_PROXIES. */
+function isOff(v: string): boolean {
+  const s = v.trim().toLowerCase();
+  return s === 'off' || s === 'false' || s === 'no' || s === '0';
+}
+
+/**
+ * Read TRUSTED_PROXIES: a comma- or space-separated list of the addresses and
+ * CIDRs the operator's own proxies connect from, plus the keyword `private`
+ * for the loopback/RFC1918/link-local set. Unusable entries are dropped with a
+ * warning rather than widening the list.
+ */
+export function parseTrustedProxies(raw: string | undefined): CidrNet[] {
+  const nets: CidrNet[] = [];
+  for (const token of (raw ?? '').split(/[,\s]+/).filter((t) => t.length > 0)) {
+    if (token.toLowerCase() === 'private') {
+      nets.push(...PRIVATE_NETS);
+      continue;
+    }
+    const net = parseCidr(token);
+    if (!net) {
+      console.warn(`[rate-limit] TRUSTED_PROXIES entry "${token}" is not an address or CIDR — ignoring it`);
+      continue;
+    }
+    if (net.prefix === 0) {
+      // A /0 claims every address on the internet is one of your proxies, which
+      // makes the walk stop nowhere and hands the bucket key back to whoever
+      // wrote the header — the exact bypass this list exists to close.
+      console.warn(`[rate-limit] TRUSTED_PROXIES entry "${token}" covers every address — ignoring it`);
+      continue;
+    }
+    nets.push(net);
+  }
+  if (nets.length > MAX_TRUSTED_PROXY_NETS) {
+    console.warn(`[rate-limit] TRUSTED_PROXIES has ${nets.length} entries — using the first ${MAX_TRUSTED_PROXY_NETS}`);
+    return nets.slice(0, MAX_TRUSTED_PROXY_NETS);
+  }
+  return nets;
+}
+
+/**
+ * How much of a request's forwarding headers to believe. A non-empty `nets`
+ * selects the right-to-left walk; otherwise `hops` drives the deprecated
+ * count-based path (0 = ignore forwarding headers entirely).
+ */
+export interface ProxyTrust {
+  readonly nets: readonly CidrNet[];
+  readonly hops: number;
+}
+
+/**
+ * Resolve the two environment variables into one trust decision. TRUSTED_PROXIES
+ * wins where it is usable; TRUST_PROXY remains as a deprecated alias so a
+ * deployment that upgrades without editing its compose file keeps the behaviour
+ * it had. A TRUSTED_PROXIES that parses to nothing falls back to the hop count
+ * rather than to 0, for the same reason parseTrustProxyHops does: dropping a
+ * proxied deployment to 0 collapses every user into the proxy's bucket.
+ */
+export function resolveProxyTrust(
+  trustedProxies: string | undefined,
+  trustProxy: string | undefined,
+): ProxyTrust {
+  const listed = (trustedProxies ?? '').trim();
+  if (listed && isOff(listed)) return { nets: [], hops: 0 };
+  if (listed) {
+    const nets = parseTrustedProxies(listed);
+    if (nets.length > 0) {
+      if ((trustProxy ?? '').trim()) {
+        console.warn('[rate-limit] TRUST_PROXY is ignored while TRUSTED_PROXIES is set');
+      }
+      return { nets, hops: 1 };
+    }
+    console.warn('[rate-limit] TRUSTED_PROXIES had no usable entries — falling back to TRUST_PROXY');
+  }
+  const hops = parseTrustProxyHops(trustProxy);
+  if ((trustProxy ?? '').trim() && hops > 0) {
+    console.warn(
+      '[rate-limit] TRUST_PROXY counts hops, which a padded X-Forwarded-For can shift — ' +
+      'list your proxies in TRUSTED_PROXIES instead (docs/self-hosting.md § "Client IP and rate limits")',
+    );
+  }
+  return { nets: [], hops };
+}
+
+/** One line for the startup log, so an operator can see what the process resolved. */
+export function describeProxyTrust(trust: ProxyTrust): string {
+  if (trust.nets.length > 0) {
+    return `${trust.nets.length} trusted proxy network(s), X-Forwarded-For walked right-to-left`;
+  }
+  return trust.hops > 0
+    ? `${trust.hops} hop(s), private peers only (TRUST_PROXY, deprecated)`
+    : 'disabled (forwarding headers ignored)';
+}
+
 /**
  * Resolve the client address to key rate limits on. See the section comment
  * above for the trust rules. `onUntrustedForward` fires when a forwarding
  * header was present but unusable, which is the only signal that buckets are
  * being merged onto the proxy.
+ *
+ * `trust` accepts a bare hop count so the deprecated path stays callable and
+ * directly testable.
  */
 export function clientIp(
   req: { headers: Record<string, string | string[] | undefined>, socket: { remoteAddress?: string } },
-  hops: number = 1,
+  trust: number | ProxyTrust = 1,
+  onUntrustedForward?: () => void,
+): string {
+  if (typeof trust !== 'number' && trust.nets.length > 0) {
+    return clientIpByProxyList(req, trust.nets, onUntrustedForward);
+  }
+  return clientIpByHopCount(req, typeof trust === 'number' ? trust : trust.hops, onUntrustedForward);
+}
+
+/**
+ * Walk X-Forwarded-For right to left and stop at the first entry that is not a
+ * listed proxy. Padding the header cannot move that stop point: extra entries
+ * only ever sit LEFT of the real client, which the walk has already passed.
+ */
+function clientIpByProxyList(
+  req: { headers: Record<string, string | string[] | undefined>, socket: { remoteAddress?: string } },
+  nets: readonly CidrNet[],
+  onUntrustedForward?: () => void,
+): string {
+  const rawPeer = req.socket.remoteAddress;
+  const fallback = socketKey(rawPeer);
+  const peer = rawPeer ? normalizeIp(stripZone(rawPeer)) : null;
+  // The peer address comes from the kernel. If it is not one of the operator's
+  // proxies, nothing the request claims about who sent it can be believed.
+  if (!peer || !inAnyNet(peer, nets)) return fallback;
+
+  const entries = headerValue(req.headers['x-forwarded-for'])
+    .split(',').map((e) => e.trim()).filter((e) => e.length > 0);
+
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const ip = normalizeIp(entries[i]);
+    // An unparseable entry hides whose address it was, so the entries further
+    // left can no longer be attributed either. Stop rather than step over it.
+    if (!ip) break;
+    if (!inAnyNet(ip, nets)) return bucketKeyForIp(ip);
+  }
+
+  if (entries.length === 0) {
+    // nginx configs that set only `X-Real-IP` leave no list to walk. Caddy is
+    // the other way round — it writes X-Forwarded-For and passes a client's
+    // X-Real-IP through untouched — so this header is read only when the walk
+    // found nothing, never as a tiebreaker against it.
+    const rawReal = headerValue(req.headers['x-real-ip']);
+    const realIp = rawReal ? normalizeIp(rawReal) : null;
+    if (realIp) return bucketKeyForIp(realIp);
+    if (rawReal) onUntrustedForward?.();
+    return fallback;
+  }
+  // Either an entry was unusable or every entry is one of our own proxies.
+  // Neither identifies a client, so key on the proxy: a shared bucket beats a
+  // requester-chosen one.
+  onUntrustedForward?.();
+  return fallback;
+}
+
+/**
+ * Deprecated hop-count path, kept so TRUST_PROXY deployments survive the
+ * upgrade. Retained weakness: it trusts the entry at a counted index, so a
+ * requester who pads the header to exactly `hops` entries picks that index's
+ * value themselves. TRUSTED_PROXIES is the fix; this is the compatibility path.
+ */
+function clientIpByHopCount(
+  req: { headers: Record<string, string | string[] | undefined>, socket: { remoteAddress?: string } },
+  hops: number,
   onUntrustedForward?: () => void,
 ): string {
   const fallback = socketKey(req.socket.remoteAddress);
