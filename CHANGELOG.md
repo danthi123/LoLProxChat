@@ -4,6 +4,24 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.5.8] — 2026-09-17
+
+### Fixed
+- **Tracking no longer freezes in place when the champion classifier can't recognise your champion (#13).** The tracker would lock onto your icon and then reject that same icon on the very next frame — one tick after locking, sitting in exactly the same spot — because the classifier scored it below the follow threshold. The result was a permanent lock → hold → re-acquire → lock cycle in which the broadcast position never moved off the lock point. Frame-to-frame continuity now wins inside roughly one icon-diameter of where the icon was predicted to be; the classifier still has to vouch for candidates further out, which is what keeps the marker off minion waves and turrets.
+- **Enemies are audible again for affected players.** Downstream of the above: a frozen position meant the coordinates being broadcast were stale (often still at the fountain), so every enemy landed outside the 1350-unit hearing range and was dropped from the volume response. Teammates were unaffected, because ally voice is full-volume and skips the staleness check — which is exactly the "allies are perfect, enemies are way too quiet" report.
+- **The overlay no longer resizes its own window ~30 times a second.** The panel pushed a new window height to the backend on every frame in which its DOM was rewritten — which is every tracking tick — without checking whether the height had actually changed. It now only resizes on a real change. This was the bulk of the CPU cost of running with Debug on, and it was flooding debug logs at roughly 2 MB per minute, truncating the parts of the log that mattered.
+- **Fixed an audio-meter leak across games.** Each session started a level-monitoring loop that was never stopped, so a second game left two running, a third left three, and so on for the lifetime of the process — each still logging against a closed audio context.
+- **Output-device selection now reliably applies to peer audio.** The sink was being set on a peer's audio element before that peer's stream had any track, which the browser rejects; it is now applied (and retried) once the track arrives. Symptom was a peer playing on the system default device instead of the one picked in Settings. Switching **back** to "Default" also works now — it previously did nothing, leaving peers on the device you had picked before.
+- **Dragging the Scan Rate slider no longer restarts tracking on every pixel of the drag** — the backend hears the value you settle on.
+
+### Added
+- **Voice on camera** toggle (Settings): hear the map from wherever your in-game camera is looking instead of from your champion, so you can pan across a fight and listen in. Listen-only — it changes what you hear and never what other players hear from you — and it falls back to your champion's position whenever the camera rectangle isn't readable on the minimap. **Off by default.** (#36)
+
+  This one is a deliberate exception to the "no fog-of-war reveals" line in the compliance doc: a free camera can be pointed at ground you have no vision of. [`docs/compliance.md`](docs/compliance.md) spells out the reasoning, and the setting is a single self-contained toggle. Leave it off for ranked play.
+
+### Notes for self-hosters
+- Needs the matching server build, which accepts an optional `listenPosition` on `/compute-volumes`. Back-compat both ways: older clients simply omit it and are scored from their champion as before, and an older server ignores it, so deploy order does not matter.
+
 ## [v0.5.7] — 2026-07-09
 
 ### Fixed
