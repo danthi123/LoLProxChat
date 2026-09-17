@@ -15,14 +15,22 @@ use std::time::Duration;
 use tauri::Manager;
 
 /// Holds the open log file. Written to only when the frontend's Debug toggle
-/// is on (the TS logging layer forwards each console call into append_log).
+/// is on (the TS logging layer batches console calls into append_log_lines).
 struct LogFile {
     file: Mutex<Option<File>>,
 }
 
+/// Single-line write. The frontend batches through append_log_lines; this stays
+/// registered so a bundle/binary version skew still produces a log file.
 #[tauri::command]
 fn append_log(state: tauri::State<LogFile>, line: String) {
-    write_log_line(&state, line);
+    write_log_lines(&state, std::slice::from_ref(&line));
+}
+
+/// Batched write: one lock and one flush for a whole batch of console lines.
+#[tauri::command]
+fn append_log_lines(state: tauri::State<LogFile>, lines: Vec<String>) {
+    write_log_lines(&state, &lines);
 }
 
 /// Open the directory that holds the rolling debug log in Explorer so the
@@ -41,10 +49,14 @@ fn open_log_folder(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn write_log_line(state: &tauri::State<LogFile>, line: String) {
+fn write_log_lines(state: &tauri::State<LogFile>, lines: &[String]) {
     if let Ok(mut guard) = state.file.lock() {
         if let Some(f) = guard.as_mut() {
-            let _ = writeln!(f, "{}", line);
+            for line in lines {
+                let _ = writeln!(f, "{}", line);
+            }
+            // One flush per batch — a crash loses at most the batch the
+            // frontend had already handed over.
             let _ = f.flush();
         }
     }
@@ -256,6 +268,7 @@ fn main() {
             set_panel_size,
             resize_overlay,
             append_log,
+            append_log_lines,
             open_log_folder,
             updater::check_for_update,
             updater::download_and_apply_update,

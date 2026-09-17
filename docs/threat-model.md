@@ -86,6 +86,8 @@ The 1350-game-unit hearing range was chosen to roughly match the radius at which
 
 If this range is increased, the side-channel value to a modified client grows. If decreased, the proximity-audio experience loses utility (you can only hear teammates in melee range of each other). The current value is the result of those competing pressures.
 
+The calibration argument is map-specific: it compares a distance in Summoner's Rift game units against Summoner's Rift champion vision range. Until v0.5.9 an unrecognised map was silently treated as Summoner's Rift, so on Arena or Swarm the coordinates being compared were scaled against the wrong map and the range-equals-vision property did not hold in either direction. Proximity is now disabled outright on any map whose coordinate system we do not have (voice continues, with every peer at full volume), so the calibration only ever applies where it is meaningful.
+
 ## Mitigations applied vs. mitigations possible
 
 | Mitigation | Status | Notes |
@@ -94,6 +96,7 @@ If this range is increased, the side-channel value to a modified client grows. I
 | Stale-position window (5 s) | **Applied** | Stored coords older than `STALE_POSITION_MS` are skipped, so a disconnected or lost *cross-team* peer stops affecting audio within ~5 s. Allies are exempt by design — see the heartbeat row below. |
 | WebSocket heartbeat (30 s ping, one missed pong) | **Applied** | Terminates a half-open connection within ~60 s, removing that player from room state. This is the liveness guarantee for allies, who skip the stale-position window because ally voice is global. |
 | Hearing range ≈ champion vision range | **Applied** | `MAX_HEARING_RANGE` is sized so audio only reveals enemies a stock client would roughly already sense. |
+| Proximity disabled on maps with no known coordinate system | **Applied** | Unrecognised maps used to fall back to Summoner's Rift dimensions, producing hearing distances unrelated to in-game distance. No coordinates are broadcast on such a map at all. |
 | Line-of-sight gate on cross-team audio | Possible (benched) | Only channel an enemy a teammate can actually see, checked server-side against a static map vision mesh. See "Calibration of `MAX_HEARING_RANGE`" above. |
 | Drop volumes below a noise floor | Not applied | Would prevent "barely audible = exactly N units away" signaling |
 | Snap positions to a coarse grid client-side | Not applied | Lossy at source; slightly degrades volume accuracy for legitimate users. Would also reduce what a compromised server can see. |
@@ -221,7 +224,7 @@ All limits return `429` / `413` / WS close `1008` cleanly — legitimate clients
 
 That is a smaller capability than the behaviour it replaced, not a larger one: previously a second entry under a name silently absorbed *every* signal addressed to it while the real player stayed connected and un-notified, which is a strictly better position for an attacker (a black hole nobody can see) than an eviction the victim is told about. The two available designs were takeover and reject-on-duplicate; reject is worse on both counts, because it hands the attacker a permanent name-squat and, in the overwhelmingly more common non-malicious case, locks a legitimately reconnecting player out of their own match until their previous socket times out.
 
-Collisions between two *honest* players are not a practical concern: the name is the Riot ID (`gameName#tagLine`, `active.riotId` in `src/services/orchestrator.ts`), which is globally unique. The one path where that is not true is the `|| active.summonerName` fallback for a client that cannot read a Riot ID; an empty or missing name there is rejected outright by `validateJoin` rather than being allowed to collide.
+Collisions between two *honest* players are not a practical concern: the name is the Riot ID (`gameName#tagLine`), which is globally unique. The client sends the most qualified spelling League gave it — `readIdentity` in `src/core/identity.ts` reads the split `riotIdGameName` / `riotIdTagLine` pair first, then `riotId`, then `summonerName`, and reconstructs `gameName#tagLine` from whichever of those the patch provides — and deliberately does **not** fall back to the (possibly tag-less) scoreboard spelling of the same player, because the tag is what makes the name unique. A client that can produce no name at all never joins: the session is refused and logged rather than joining with an empty name, and `validateJoin` rejects an empty name server-side regardless.
 
 **What this doesn't cover:** an attacker who repeatedly re-claims a name can keep a player out of voice chat for as long as they keep doing it. The client makes this diagnosable rather than mysterious — close code 4000 is terminal, so it stops reconnecting and logs why instead of trading the name back and forth — but there is no authentication in the signaling protocol to prevent it, and adding one would mean an account system the project deliberately does not have.
 

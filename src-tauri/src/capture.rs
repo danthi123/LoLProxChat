@@ -1,5 +1,5 @@
-use base64::Engine;
 use std::sync::Mutex;
+use tauri::ipc::Response;
 use tauri::State;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::*;
@@ -19,27 +19,59 @@ pub struct CaptureBounds {
     pub height: i32,
 }
 
-#[derive(serde::Serialize)]
-pub struct CaptureResult {
-    pub data_url: String,
-    pub width: i32,
-    pub height: i32,
-}
+/// Length of the frame header `capture_minimap` prefixes to its pixel data.
+///
+/// Wire format, shared with src/core/capture-frame.ts and only valid if both
+/// sides change together: 4-byte little-endian width, 4-byte little-endian
+/// height, then width * height * 4 bytes of top-down, row-major RGBA with no
+/// row padding.
+///
+/// The dimensions travel with the pixels even though the frontend is the side
+/// that set them (via `set_capture_bounds`): every CV read is indexed against
+/// the frontend's own capture bounds, so a divergence has to be detectable
+/// there rather than silently reinterpreted as a different row stride.
+const HEADER_LEN: usize = 8;
 
 #[tauri::command]
 pub fn set_capture_bounds(state: State<CaptureState>, bounds: CaptureBounds) {
-    *state.bounds.lock().unwrap() = Some(bounds);
+    *lock_bounds(&state.bounds) = Some(bounds);
 }
 
-/// Capture a region of the screen using Win32 GDI BitBlt.
-/// Returns a base64-encoded BMP data URL that can be loaded as an Image in the webview.
+/// Capture the configured screen region with Win32 GDI BitBlt.
+/// Returns the raw frame described by HEADER_LEN.
 #[tauri::command]
-pub fn capture_minimap(state: State<CaptureState>) -> Result<CaptureResult, String> {
-    let bounds = state.bounds.lock().unwrap();
-    let bounds = bounds
-        .as_ref()
-        .ok_or("Capture bounds not set. Call set_capture_bounds first.")?;
+pub async fn capture_minimap(state: State<'_, CaptureState>) -> Result<Response, String> {
+    let bounds = bounds_snapshot(&state.bounds)?;
 
+    // The GDI work is blocking and runs 30x/second. On the shared async runtime
+    // it would compete with the overlay's click-through hit-test loop (main.rs),
+    // which has to answer every 33ms to keep the panel clickable.
+    let frame = tauri::async_runtime::spawn_blocking(move || capture_frame(&bounds))
+        .await
+        .map_err(|e| format!("Capture task failed: {}", e))??;
+
+    Ok(Response::new(frame))
+}
+
+/// Poisoning can only mean a previous holder panicked; the bounds are a plain
+/// value with no invariant to uphold, so recovering beats taking the process
+/// down from inside a command.
+fn lock_bounds(
+    bounds: &Mutex<Option<CaptureBounds>>,
+) -> std::sync::MutexGuard<'_, Option<CaptureBounds>> {
+    bounds.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Copy the bounds out of the mutex. Kept out of the async command so the
+/// guard can never be held across an await point.
+fn bounds_snapshot(bounds: &Mutex<Option<CaptureBounds>>) -> Result<CaptureBounds, String> {
+    lock_bounds(bounds)
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "Capture bounds not set. Call set_capture_bounds first.".to_string())
+}
+
+fn capture_frame(bounds: &CaptureBounds) -> Result<Vec<u8>, String> {
     let width = bounds.width;
     let height = bounds.height;
 
@@ -57,57 +89,38 @@ pub fn capture_minimap(state: State<CaptureState>) -> Result<CaptureResult, Stri
         ));
     }
 
-    let pixels = capture_screen_region(bounds.x, bounds.y, width, height)
+    let pixel_len = (width as usize) * (height as usize) * 4;
+    let mut out = vec![0u8; HEADER_LEN + pixel_len];
+    out[0..4].copy_from_slice(&(width as u32).to_le_bytes());
+    out[4..8].copy_from_slice(&(height as u32).to_le_bytes());
+
+    capture_screen_region_into(bounds.x, bounds.y, width, height, &mut out[HEADER_LEN..])
         .map_err(|e| format!("Screen capture failed: {}", e))?;
 
-    // Build a BMP file in memory (BGR24, bottom-up)
-    let row_stride = ((width * 3 + 3) / 4) * 4;
-    let pixel_data_size = row_stride * height;
-    let file_size = 54 + pixel_data_size;
+    bgra_to_rgba_in_place(&mut out[HEADER_LEN..]);
 
-    let mut bmp = Vec::with_capacity(file_size as usize);
-
-    // BMP File Header (14 bytes)
-    bmp.extend_from_slice(b"BM");
-    bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
-    bmp.extend_from_slice(&[0u8; 4]); // reserved
-    bmp.extend_from_slice(&54u32.to_le_bytes()); // pixel data offset
-
-    // DIB Header (BITMAPINFOHEADER, 40 bytes)
-    bmp.extend_from_slice(&40u32.to_le_bytes());
-    bmp.extend_from_slice(&(width as u32).to_le_bytes());
-    bmp.extend_from_slice(&(height as u32).to_le_bytes()); // positive = bottom-up
-    bmp.extend_from_slice(&1u16.to_le_bytes()); // planes
-    bmp.extend_from_slice(&24u16.to_le_bytes()); // bpp
-    bmp.extend_from_slice(&0u32.to_le_bytes()); // compression
-    bmp.extend_from_slice(&(pixel_data_size as u32).to_le_bytes());
-    bmp.extend_from_slice(&[0u8; 16]); // ppm + colors
-
-    // Pixel data: BGRA from capture → BGR rows, bottom-up, padded
-    for y in (0..height).rev() {
-        let src_row = (y * width * 4) as usize;
-        for x in 0..width {
-            let i = src_row + (x * 4) as usize;
-            bmp.push(pixels[i]);     // B
-            bmp.push(pixels[i + 1]); // G
-            bmp.push(pixels[i + 2]); // R
-        }
-        let padding = (row_stride - width * 3) as usize;
-        bmp.extend(std::iter::repeat(0u8).take(padding));
-    }
-
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bmp);
-
-    Ok(CaptureResult {
-        data_url: format!("data:image/bmp;base64,{}", b64),
-        width,
-        height,
-    })
+    Ok(out)
 }
 
-/// Capture a region of the screen using Win32 GDI.
-/// Returns BGRA pixel data (top-down, 4 bytes per pixel).
-fn capture_screen_region(x: i32, y: i32, width: i32, height: i32) -> Result<Vec<u8>, String> {
+/// GDI hands back BGRA with an undefined 4th byte. ImageData wants RGBA, and
+/// the classifier's putImageData -> drawImage round trip premultiplies, so an
+/// alpha of 0 would zero out every channel it reads.
+fn bgra_to_rgba_in_place(px: &mut [u8]) {
+    for p in px.chunks_exact_mut(4) {
+        p.swap(0, 2);
+        p[3] = 255;
+    }
+}
+
+/// Capture a region of the screen using Win32 GDI into `dst`, which must hold
+/// exactly width * height * 4 bytes. Writes top-down BGRA.
+fn capture_screen_region_into(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    dst: &mut [u8],
+) -> Result<(), String> {
     unsafe {
         // GetDC(NULL) is the DC for the whole VIRTUAL screen. The desktop
         // window's DC is clipped to the primary monitor, so a game on a second
@@ -158,15 +171,12 @@ fn capture_screen_region(x: i32, y: i32, width: i32, height: i32) -> Result<Vec<
             ..Default::default()
         };
 
-        let buf_size = (width * height * 4) as usize;
-        let mut pixels = vec![0u8; buf_size];
-
         let lines = GetDIBits(
             hdc_mem,
             hbmp,
             0,
             height as u32,
-            Some(pixels.as_mut_ptr() as *mut _),
+            Some(dst.as_mut_ptr() as *mut _),
             &mut bmi,
             DIB_RGB_COLORS,
         );
@@ -181,7 +191,7 @@ fn capture_screen_region(x: i32, y: i32, width: i32, height: i32) -> Result<Vec<
             return Err("GetDIBits failed".into());
         }
 
-        Ok(pixels)
+        Ok(())
     }
 }
 
@@ -205,7 +215,7 @@ fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::rects_overlap;
+    use super::{bgra_to_rgba_in_place, rects_overlap};
 
     // A capture square on a monitor left of the primary one has a negative
     // origin and must still count as on-screen — rejecting it would break the
@@ -232,5 +242,41 @@ mod tests {
         let virt = (0, 0, 1920, 1080);
         assert!(!rects_overlap((-378, 0, 378, 100), virt));
         assert!(rects_overlap((-377, 0, 378, 100), virt));
+    }
+
+    // The teal ally border the CV keys on (r<100, g>120, b>120) reads as red
+    // if the channels are left in GDI's order, so every icon blob disappears
+    // and tracking never leaves SCANNING.
+    #[test]
+    fn bgra_becomes_rgba_with_opaque_alpha() {
+        // Teal (30,200,190) and red (200,60,60) as GDI delivers them.
+        let mut px = vec![190, 200, 30, 0, 60, 60, 200, 7];
+        bgra_to_rgba_in_place(&mut px);
+        assert_eq!(px, vec![30, 200, 190, 255, 200, 60, 60, 255]);
+    }
+
+    // Applied twice the swap is its own inverse — the failure mode of "fix it
+    // on both sides of the wire".
+    #[test]
+    fn swapping_twice_restores_the_original_channel_order() {
+        let mut px = vec![190, 200, 30, 255];
+        bgra_to_rgba_in_place(&mut px);
+        bgra_to_rgba_in_place(&mut px);
+        assert_eq!(&px[0..3], &[190, 200, 30]);
+    }
+
+    // A truncated tail must not panic: chunks_exact_mut leaves it alone.
+    #[test]
+    fn a_trailing_partial_pixel_is_ignored() {
+        let mut px = vec![190, 200, 30, 0, 1, 2];
+        bgra_to_rgba_in_place(&mut px);
+        assert_eq!(px, vec![30, 200, 190, 255, 1, 2]);
+    }
+
+    #[test]
+    fn an_empty_buffer_is_a_no_op() {
+        let mut px: Vec<u8> = Vec::new();
+        bgra_to_rgba_in_place(&mut px);
+        assert!(px.is_empty());
     }
 }

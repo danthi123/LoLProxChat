@@ -1,6 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
-import { GameStateService, GameSession, TauriGameState } from './game-state';
+import {
+  GameStateService,
+  GameSession,
+  SessionFailureReason,
+  TauriGameState,
+} from './game-state';
 import { SignalingService, SignalMessage, PositionBroadcast } from './signaling';
 import { AudioService } from './audio';
 import { TrackingService, TrackingState } from './tracking';
@@ -14,9 +19,15 @@ import {
   resolveGameRect,
   WARN_QUERY_FAILED,
 } from '../core/game-window';
-import { PeerState } from '../core/types';
+import { PeerState, Player } from '../core/types';
 import '../core/window-globals';
 import { isStreamerMode } from '../core/streamer-detect';
+import {
+  Identity,
+  identityEquals,
+  presentIdentityFields,
+  readIdentity,
+} from '../core/identity';
 
 
 function rectStr(r: ScreenRect): string {
@@ -32,6 +43,14 @@ export class Orchestrator {
   private session: GameSession | null = null;
 
   private localSummonerName = '';
+  /** Local player's Riot ID as League spelled it this game, read once. */
+  private localIdentity: Identity | null = null;
+  /** Roster identities, resolved once per session — handlePeerPosition runs on
+   *  every incoming position broadcast. */
+  private rosterIdentities: { player: Player; identity: Identity }[] = [];
+  /** Why the last session attempt was refused, throttled for the 3s poll. */
+  private lastSessionFailure:
+    { sig: string; reason: SessionFailureReason; detail: string; at: number } | null = null;
   private peerStates: Map<string, PeerState> = new Map();
   private volumeTickId: number | null = null;
   private configPollId: number | null = null;
@@ -85,6 +104,7 @@ export class Orchestrator {
           console.log('[LoLProxChat] LoL closed, ending session');
           this.endSession();
         }
+        this.clearSessionAttemptState();
         // Fire an overlay refresh so the empty-state text reflects "Waiting for LoL"
         this.broadcastOverlayState();
         return;
@@ -104,6 +124,13 @@ export class Orchestrator {
           this.session.localPlayer.isDead = false;
           this.tracking?.onRespawn();
         }
+      }
+
+      if (!state.isInGame) {
+        // A refused attempt never creates `this.session`, so endSession() below
+        // can never clear the refusal — it would otherwise follow the user
+        // through the post-game client, the next lobby and champ select.
+        this.clearSessionAttemptState();
       }
 
       if (!state.isInGame && this.session) {
@@ -140,40 +167,106 @@ export class Orchestrator {
     if (this.session) return;
 
     try {
-      if (lcd.activePlayer && !this.localSummonerName) {
-        const active = typeof lcd.activePlayer === 'string'
+      let active: any = null;
+      if (lcd.activePlayer) {
+        active = typeof lcd.activePlayer === 'string'
           ? JSON.parse(lcd.activePlayer)
           : lcd.activePlayer;
-        this.localSummonerName = active.riotId || active.summonerName || '';
-        console.log('[LoLProxChat] Local summoner:', this.localSummonerName);
-      }
-
-      if (lcd.allPlayers && this.localSummonerName) {
-        const playersData = typeof lcd.allPlayers === 'string'
-          ? JSON.parse(lcd.allPlayers)
-          : lcd.allPlayers;
-        const players = this.gameState.parsePlayerList({ players: playersData });
-        console.log('[LoLProxChat] Parsed players:', players.length);
-
-        const gameMode = lcd.gameData
-          ? (typeof lcd.gameData === 'string' ? JSON.parse(lcd.gameData) : lcd.gameData).gameMode || 'CLASSIC'
-          : 'CLASSIC';
-
-        const session = this.gameState.createSession(
-          players,
-          this.localSummonerName,
-          gameMode,
-        );
-
-        if (session) {
-          this.session = session;
-          console.log('[LoLProxChat] Session created! Room:', session.roomId);
-          this.startSession(session);
+        if (!this.localIdentity) {
+          // Every identity field League has ever used is read here, not just
+          // riotId/summonerName: when a patch moves the spelling, collapsing to
+          // one field yields '' and every diagnostic below becomes unreachable.
+          this.localIdentity = readIdentity(active);
+          if (this.localIdentity) {
+            console.log('[LoLProxChat] Local summoner: ' + this.localIdentity.display +
+              ' (key=' + this.localIdentity.key + ')');
+          }
         }
       }
+
+      if (!lcd.allPlayers) return;
+
+      const playersData = typeof lcd.allPlayers === 'string'
+        ? JSON.parse(lcd.allPlayers)
+        : lcd.allPlayers;
+      const players = this.gameState.parsePlayerList({ players: playersData });
+      console.log('[LoLProxChat] Parsed players:', players.length);
+
+      if (!this.localIdentity) {
+        this.reportSessionFailure('identity-unreadable',
+          'activePlayer carried no usable name; identity fields present=[' +
+          presentIdentityFields(active).join(',') + '] keys=[' +
+          (active && typeof active === 'object' ? Object.keys(active).join(',') : '') + ']');
+        return;
+      }
+
+      const gameData = lcd.gameData
+        ? (typeof lcd.gameData === 'string' ? JSON.parse(lcd.gameData) : lcd.gameData)
+        : null;
+
+      const result = this.gameState.createSession(players, this.localIdentity, gameData);
+      if (!result.ok) {
+        this.reportSessionFailure(result.reason, result.detail);
+        return;
+      }
+
+      const session = result.session;
+      this.lastSessionFailure = null;
+      // The wire name stays the most qualified spelling League gave us — the
+      // full Riot ID where there is one. Peers resolve it against their own
+      // roster through identityEquals, so it does not have to match the
+      // roster's spelling, and keeping the tag is what makes the name globally
+      // unique for the server's one-entry-per-name rule.
+      this.localSummonerName = this.localIdentity.display;
+      if (this.localSummonerName !== session.localPlayer.summonerName) {
+        console.log('[LoLProxChat] activePlayer and allPlayers spell this player' +
+          ' differently: "' + this.localSummonerName + '" vs "' +
+          session.localPlayer.summonerName + '"');
+      }
+      this.rosterIdentities = session.allPlayers.flatMap((player) => {
+        const identity = readIdentity(player);
+        return identity ? [{ player, identity }] : [];
+      });
+      this.session = session;
+      console.log('[LoLProxChat] Session created! Room:', session.roomId);
+      this.startSession(session);
     } catch (e) {
       console.error('[LoLProxChat] Failed to process live client data:', e);
     }
+  }
+
+  /**
+   * Record and log why no session was created. The 3s poll retries forever, so
+   * an unthrottled line here would be the rolling log file's whole content.
+   */
+  private reportSessionFailure(reason: SessionFailureReason, detail: string): void {
+    const sig = reason + '|' + detail;
+    const now = Date.now();
+    const previous = this.lastSessionFailure;
+    const quiet = previous !== null && previous.sig === sig && now - previous.at < 30000;
+    this.lastSessionFailure = { sig, reason, detail, at: quiet ? previous!.at : now };
+    if (quiet) return;
+
+    const line = '[LoLProxChat] Not joining proximity chat (' + reason + '): ' + detail;
+    if (reason === 'streamer-mode') console.warn(line);
+    else console.error(line);
+  }
+
+  private sessionFailureText(reason: SessionFailureReason): string {
+    switch (reason) {
+      case 'identity-unreadable':
+        return "Couldn't read your Riot ID from League — see log";
+      case 'identity-unmatched':
+        return "Couldn't match your Riot ID to the player list — see log";
+      case 'streamer-mode':
+        return 'Streamer mode detected — not joining proximity chat';
+    }
+  }
+
+  /** Reset everything a refused session attempt left behind. */
+  private clearSessionAttemptState(): void {
+    this.lastSessionFailure = null;
+    this.localIdentity = null;
   }
 
   private async startSession(session: GameSession): Promise<void> {
@@ -206,6 +299,18 @@ export class Orchestrator {
     );
 
     this.sessionActive = true;
+
+    if (session.mapType === null) {
+      // Unsupported map: keep voice, drop proximity. Tracking is never started,
+      // so no coordinates leave this client and positionTick applies 1.0 to
+      // everyone — which is both closer to Riot's line than broadcasting
+      // Summoner's Rift-scaled coordinates for a map that isn't Summoner's
+      // Rift, and better for the user than losing voice chat outright.
+      console.warn('[LoLProxChat] ' + session.proximityDisabledReason);
+      this.volumeTickId = window.setInterval(() => this.positionTick(), 100) as unknown as number;
+      this.broadcastOverlayState();
+      return;
+    }
 
     // Start tracking service
     try {
@@ -298,7 +403,7 @@ export class Orchestrator {
 
   private async positionTick(): Promise<void> {
     if (this.positionTickRunning) return;
-    if (!this.audio || !this.session || !this.tracking || !this.volumeClient) return;
+    if (!this.audio || !this.session) return;
     this.positionTickRunning = true;
     try {
       await this.positionTickInner();
@@ -308,12 +413,12 @@ export class Orchestrator {
   }
 
   private async positionTickInner(): Promise<void> {
-    if (!this.audio || !this.session || !this.tracking || !this.volumeClient) return;
+    if (!this.audio || !this.session) return;
 
     // Keep camera-viewport detection in step with the toggle. Set before the
     // early returns below so the 30 FPS tracking loop is already producing
     // camera positions by the time we need one, rather than a tick behind.
-    this.tracking.setCameraTracking(getCameraListen());
+    this.tracking?.setCameraTracking(getCameraListen());
 
     // Broadcast presence over signaling so peers can discover us.
     // Coordinates go separately via sendCoords() — kept off this message so
@@ -326,6 +431,16 @@ export class Orchestrator {
       isMuted: this.audio.isSelfMuted(),
       isDead: this.session.localPlayer.isDead ?? false,
     });
+
+    // Proximity off (unsupported map): everyone in the room stays audible at
+    // full volume and no coordinates are sent.
+    if (!this.tracking || !this.volumeClient) {
+      const flat: Record<string, number> = {};
+      for (const name of this.peerStates.keys()) flat[name] = 1.0;
+      this.audio.applyPeerVolumes(flat);
+      this.broadcastOverlayState();
+      return;
+    }
 
     // Before CV locks on (SCANNING), pass through all ally audio at full volume (fountain)
     if (this.tracking.getState() === TrackingState.SCANNING) {
@@ -413,11 +528,14 @@ export class Orchestrator {
   private async handlePeerPosition(peer: PositionBroadcast): Promise<void> {
     if (!this.session || !this.audio) return;
 
-    // Skip streamer mode players
-    const player = this.session.allPlayers.find(
-      (p) => p.summonerName === peer.summonerName,
-    );
-    if (player && isStreamerMode(player)) return;
+    // Skip streamer mode players. The roster lookup goes through the same
+    // identity rules as the local match, so the two can't drift apart and
+    // leave this one silently matching nobody.
+    const peerIdentity = readIdentity({ summonerName: peer.summonerName });
+    const entry = peerIdentity
+      ? this.rosterIdentities.find((r) => identityEquals(r.identity, peerIdentity))
+      : undefined;
+    if (entry && isStreamerMode(entry.player, this.session.hasTagLines)) return;
 
     const existing = this.peerStates.get(peer.summonerName);
     if (!existing) {
@@ -461,6 +579,9 @@ export class Orchestrator {
     const gs = this.lastGameState;
     if (!gs || !gs.isLeagueRunning) return 'Waiting for League of Legends';
     if (this.session) {
+      // Proximity being off is the whole story for this session, and unlike a
+      // geometry warning it never resolves itself.
+      if (this.session.proximityDisabledReason) return this.session.proximityDisabledReason;
       const ts = this.tracking?.getState();
       // A geometry problem is the most useful thing to say while nothing is
       // locked — including when tracking never started at all, which is what a
@@ -471,6 +592,10 @@ export class Orchestrator {
       // LOCKED with no peers in the room — empty waiting state handled elsewhere
       return '';
     }
+    // A refusal beats the phase text: without it the panel sits on
+    // "Joining game..." forever with no hint that we decided not to join.
+    if (this.lastSessionFailure) return this.sessionFailureText(this.lastSessionFailure.reason);
+
     const phase = gs.gameFlowPhase || 'None';
     switch (phase) {
       case 'None':         return 'In client';
@@ -617,7 +742,9 @@ export class Orchestrator {
 
   /**
    * Read MinimapScale from League's game.cfg. The file is an INI-style config
-   * with [Section] headers. MinimapScale is under [HUD] and ranges from 0.0 to 1.0.
+   * with [Section] headers. MinimapScale is under [HUD] and ranges from 0.0 to
+   * 3.0 — the calibration in `TrackingService.setMinimapScaleFromConfig` is
+   * fitted at scale 0 and scale 3.
    * The Rust side computes the install dir and reads only `Config/game.cfg`;
    * the frontend never handles arbitrary paths.
    */
@@ -644,6 +771,13 @@ export class Orchestrator {
         const val = parseFloat(rawVal);
         if (!isNaN(val)) {
           console.log('[LoLProxChat] MinimapScale raw="' + rawVal + '" parsed=' + val);
+          // Applied anyway: a Riot range change should show up in the log as a
+          // wrong-looking minimap region we can explain, not be clamped into a
+          // wrong region silently.
+          if (val < 0 || val > 3) {
+            console.warn('[LoLProxChat] MinimapScale ' + val +
+              ' is outside the expected 0.0-3.0 range — minimap region may be wrong');
+          }
           callback(val);
           return;
         }
@@ -722,6 +856,8 @@ export class Orchestrator {
     this.session = null;
     this.peerStates.clear();
     this.localSummonerName = '';
+    this.rosterIdentities = [];
+    this.clearSessionAttemptState();
     // Allow re-positioning on the next session
     this.lastOverlayBounds = null;
     this.lastOverlayRepositionTime = 0;

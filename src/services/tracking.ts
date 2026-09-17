@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { Position, MapType, MAP_DIMENSIONS } from '../core/types';
+import { CaptureFrame, decodeCaptureFrame } from '../core/capture-frame';
+import '../core/window-globals';
 import {
   getCaptureBoundsForRect,
   getMinimapRegionForRect,
@@ -33,8 +35,6 @@ import type { Blob } from './blob-types';
 
 export class TrackingService {
   private state: TrackingState = TrackingState.SCANNING;
-  private canvas: HTMLCanvasElement;
-  private ctx: CanvasRenderingContext2D;
   readonly captureBounds: MinimapBounds;
   private gameRect: ScreenRect;
   private mapType: MapType;
@@ -92,9 +92,11 @@ export class TrackingService {
   private static readonly TUNED_FPS = 8;
 
   // Repeated capture failures are logged at most once per distinct message
-  // per 5s — see the tick's catch handler.
+  // per 5s — see logCaptureError.
   private lastCaptureError = '';
   private lastCaptureErrorMs = 0;
+  // Frame size we last tried to recover from by re-pushing the capture bounds.
+  private lastFrameSizeResync = '';
 
   // Diagnostics
   private lockedTickCount = 0;
@@ -105,10 +107,6 @@ export class TrackingService {
     this.gameRect = gameRect;
     this.captureBounds = getCaptureBoundsForRect(gameRect);
     this.mapType = mapType;
-    this.canvas = document.createElement('canvas');
-    this.canvas.width = this.captureBounds.width;
-    this.canvas.height = this.captureBounds.height;
-    this.ctx = this.canvas.getContext('2d', { willReadFrequently: true })!;
   }
 
   /** Send capture bounds to the Tauri backend for screen capture cropping */
@@ -287,10 +285,14 @@ export class TrackingService {
    */
   private async updateClassifierScores(
     tealBlobs: Blob[],
-    imageData: ImageData,
+    frame: CaptureFrame,
     region: { x: number; y: number; width: number; height: number },
   ): Promise<void> {
     if (!this.classifier || !this.classifier.isLoaded()) return;
+
+    // The classifier crops through a canvas, which is the only consumer in the
+    // pipeline that needs a real ImageData rather than the raw frame.
+    const imageData = new ImageData(frame.data, frame.width, frame.height);
 
     const crops = tealBlobs.map(b => ({
       cropX: region.x + b.minX - 1,
@@ -448,8 +450,8 @@ export class TrackingService {
 
   // --- Binary mask creation from minimap region ---
 
-  private createMask(imageData: ImageData, region: { x: number; y: number; width: number; height: number }): Uint8Array {
-    const { data, width } = imageData;
+  private createMask(frame: CaptureFrame, region: { x: number; y: number; width: number; height: number }): Uint8Array {
+    const { data, width } = frame;
     const w = region.width;
     const h = region.height;
     const mask = new Uint8Array(w * h);
@@ -581,10 +583,10 @@ export class TrackingService {
    * Viewport edges are long straight lines (15+ pixels); the movement path line is short/diagonal.
    */
   private buildWhiteMasks(
-    imageData: ImageData,
+    frame: CaptureFrame,
     region: { x: number; y: number; width: number; height: number },
   ): { whiteMask: Uint8Array; viewportMask: Uint8Array } {
-    const { data, width: imgW } = imageData;
+    const { data, width: imgW } = frame;
     const w = region.width;
     const h = region.height;
     const whiteMask = new Uint8Array(w * h);
@@ -700,7 +702,7 @@ export class TrackingService {
 
   private generateFilteredImage(
     mask: Uint8Array, w: number, h: number, blobs: Blob[],
-    imageData?: ImageData, region?: { x: number; y: number; width: number; height: number },
+    frame?: CaptureFrame, region?: { x: number; y: number; width: number; height: number },
   ): string {
     if (!this.debugCanvas || this.debugCanvas.width !== w || this.debugCanvas.height !== h) {
       this.debugCanvas = document.createElement('canvas');
@@ -719,12 +721,12 @@ export class TrackingService {
         img.data[pi] = 0; img.data[pi + 1] = 220; img.data[pi + 2] = 180; img.data[pi + 3] = 200;
       } else if (mask[i] === 2) {
         img.data[pi] = 255; img.data[pi + 1] = 50; img.data[pi + 2] = 50; img.data[pi + 3] = 200;
-      } else if (imageData && region) {
+      } else if (frame && region) {
         // Show non-viewport white pixels as yellow (movement path line)
-        const srcIdx = ((region.y + Math.floor(i / w)) * imageData.width + (region.x + (i % w))) * 4;
-        const r = imageData.data[srcIdx];
-        const g = imageData.data[srcIdx + 1];
-        const b = imageData.data[srcIdx + 2];
+        const srcIdx = ((region.y + Math.floor(i / w)) * frame.width + (region.x + (i % w))) * 4;
+        const r = frame.data[srcIdx];
+        const g = frame.data[srcIdx + 1];
+        const b = frame.data[srcIdx + 2];
         if (r > 200 && g > 200 && b > 200 && this.viewportMask && this.viewportMask[i] === 0) {
           img.data[pi] = 255; img.data[pi + 1] = 255; img.data[pi + 2] = 0; img.data[pi + 3] = 220;
         }
@@ -780,90 +782,130 @@ export class TrackingService {
     this.lastDtSec = (tickNow - this.lastTickMs) / 1000;
     this.lastTickMs = tickNow;
 
-    invoke<{ data_url: string; width: number; height: number }>('capture_minimap')
-      .then((result) => {
-        const img = new Image();
-        img.onload = () => {
-          try {
-            this.ctx.drawImage(img, 0, 0);
-            const imageData = this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
-
-            // Minimap region is set from game.cfg config (or manual calibration).
-            // No CV-based auto-detection needed.
-            if (!this.minimapRegion && this.userMinimapRegion) {
-              this.minimapRegion = this.userMinimapRegion;
-              this.expectedIconDiam = Math.round(this.minimapRegion.width * 0.087);
-            }
-
-            if (!this.minimapRegion) return;
-
-            // Create filtered mask and find blobs
-            const region = this.minimapRegion;
-            let mask = this.createMask(imageData, region);
-            mask = this.dilate(mask, region.width, region.height);
-            const allBlobs = this.findBlobs(mask, region.width, region.height);
-            const iconBlobs = this.filterIconBlobs(allBlobs);
-
-            // Regenerate the debug-mode filtered image at 5Hz (scan-rate independent).
-            // This is what makes the debug overlay feel "live" without paying the
-            // canvas-encode cost on every tick.
-            const nowMs = performance.now();
-            if (nowMs - this.lastDebugImageMs >= 200) {
-              this.lastDebugImageMs = nowMs;
-              this.filteredImageUrl = this.generateFilteredImage(mask, region.width, region.height, iconBlobs, imageData, region);
-            }
-
-            this.diagCounter++;
-
-            // Build white pixel masks (separating movement path from viewport rectangle)
-            const { whiteMask, viewportMask } = this.buildWhiteMasks(imageData, region);
-
-            // Camera viewport centre → game coords, for "voice on camera" (#36).
-            // Cheap (two counting passes over a mask we already built) and
-            // independent of lock state, so it keeps working while the tracker
-            // is SCANNING.
-            this.updateCameraPosition(viewportMask, region);
-
-            // Run classifier at most every 500ms (scan-rate independent)
-            const tealBlobs = iconBlobs.filter(b => b.color === 'teal');
-            if (
-              this.classifier &&
-              tealBlobs.length > 0 &&
-              !this.classifierRunning &&
-              nowMs - this.lastClassifierRunMs >= 500
-            ) {
-              this.classifierRunning = true;
-              this.lastClassifierRunMs = nowMs;
-              this.updateClassifierScores(tealBlobs, imageData, region).finally(() => {
-                this.classifierRunning = false;
-              });
-            }
-
-            if (this.state === TrackingState.SCANNING) {
-              this.handleScanning(iconBlobs, whiteMask, viewportMask, region);
-            } else if (this.state === TrackingState.LOCKED) {
-              this.handleLocked(iconBlobs, whiteMask, viewportMask, region);
-            }
-          } finally {
-            this.tickRunning = false;
-          }
-        };
-        img.onerror = () => { this.tickRunning = false; };
-        img.src = result.data_url;
+    invoke<ArrayBuffer>('capture_minimap')
+      .then((buffer) => {
+        try {
+          this.processFrame(buffer);
+        } catch (err) {
+          // Kept separate from the capture failure below: "the backend couldn't
+          // grab the screen" and "the frame it grabbed isn't one we can use"
+          // have nothing in common except the symptom.
+          this.logCaptureError('[Tracking] frame decode failed:', err);
+        } finally {
+          this.tickRunning = false;
+        }
       })
       .catch((err) => {
-        // The tick runs at up to 60 Hz and core/logging.ts turns every
-        // console.error into a flushed file write, so a persistent failure
-        // (bounds off-screen, game gone) must not be logged per frame.
-        const msg = String(err);
-        const now = performance.now();
-        if (msg !== this.lastCaptureError || now - this.lastCaptureErrorMs >= 5000) {
-          this.lastCaptureError = msg;
-          this.lastCaptureErrorMs = now;
-          console.error('[Tracking] capture_minimap failed:', err);
-        }
+        this.logCaptureError('[Tracking] capture_minimap failed:', err);
         this.tickRunning = false;
       });
+  }
+
+  /**
+   * The tick runs at up to 60 Hz and core/logging.ts turns every console.error
+   * into a flushed file write, so a persistent failure (bounds off-screen, game
+   * gone, a frame we can't use) must not be logged per frame.
+   */
+  private logCaptureError(label: string, err: unknown): void {
+    const msg = label + ' ' + String(err);
+    const now = performance.now();
+    if (msg === this.lastCaptureError && now - this.lastCaptureErrorMs < 5000) return;
+    this.lastCaptureError = msg;
+    this.lastCaptureErrorMs = now;
+    console.error(label, err);
+  }
+
+  /** Debug toggle lives on `window` — see core/window-globals.ts. */
+  private debugOn(): boolean {
+    return typeof window !== 'undefined' && window.__lolproxchat_debug_enabled === true;
+  }
+
+  private processFrame(buffer: ArrayBuffer): void {
+    const frame = decodeCaptureFrame(buffer);
+
+    // Every CV read is indexed against captureBounds, not against the frame, so
+    // a frame of a different size would shear createMask's row stride: reads
+    // run off the end of each row, the mask comes back all zeros, and tracking
+    // sits in SCANNING with nothing to show for it. Refuse it instead, and
+    // re-push the bounds once per distinct bad size — that is the only recovery
+    // available from here, and doing it unconditionally would be a 30 Hz IPC loop.
+    if (frame.width !== this.captureBounds.width || frame.height !== this.captureBounds.height) {
+      const size = frame.width + 'x' + frame.height;
+      if (this.lastFrameSizeResync !== size) {
+        this.lastFrameSizeResync = size;
+        this.initCaptureBounds().catch((err) => {
+          this.logCaptureError('[Tracking] capture bounds resync failed:', err);
+        });
+      }
+      throw new Error('capture frame is ' + size + ' but capture bounds are ' +
+        this.captureBounds.width + 'x' + this.captureBounds.height);
+    }
+    this.lastFrameSizeResync = '';
+
+    // Minimap region is set from game.cfg config (or manual calibration).
+    // No CV-based auto-detection needed.
+    if (!this.minimapRegion && this.userMinimapRegion) {
+      this.minimapRegion = this.userMinimapRegion;
+      this.expectedIconDiam = Math.round(this.minimapRegion.width * 0.087);
+    }
+
+    if (!this.minimapRegion) return;
+
+    // Create filtered mask and find blobs
+    const region = this.minimapRegion;
+    let mask = this.createMask(frame, region);
+    mask = this.dilate(mask, region.width, region.height);
+    const allBlobs = this.findBlobs(mask, region.width, region.height);
+    const iconBlobs = this.filterIconBlobs(allBlobs);
+
+    // Regenerate the debug-mode filtered image at 5Hz (scan-rate independent).
+    // This is what makes the debug overlay feel "live" without paying the
+    // canvas-encode cost on every tick.
+    //
+    // Only while Debug is on: generateFilteredImage ends in a PNG encode, and
+    // the orchestrator re-serialises whatever it produced over the Tauri event
+    // bus at the scan rate, where overlay.ts drops it unless Debug is on.
+    const nowMs = performance.now();
+    if (this.debugOn()) {
+      if (nowMs - this.lastDebugImageMs >= 200) {
+        this.lastDebugImageMs = nowMs;
+        this.filteredImageUrl = this.generateFilteredImage(mask, region.width, region.height, iconBlobs, frame, region);
+      }
+    } else if (this.filteredImageUrl !== null) {
+      this.filteredImageUrl = null;
+    }
+
+    this.diagCounter++;
+
+    // Build white pixel masks (separating movement path from viewport rectangle)
+    const { whiteMask, viewportMask } = this.buildWhiteMasks(frame, region);
+
+    // Camera viewport centre → game coords, for "voice on camera" (#36).
+    // Cheap (two counting passes over a mask we already built) and
+    // independent of lock state, so it keeps working while the tracker
+    // is SCANNING.
+    this.updateCameraPosition(viewportMask, region);
+
+    // Run classifier at most every 500ms (scan-rate independent)
+    const tealBlobs = iconBlobs.filter(b => b.color === 'teal');
+    if (
+      this.classifier &&
+      tealBlobs.length > 0 &&
+      !this.classifierRunning &&
+      nowMs - this.lastClassifierRunMs >= 500
+    ) {
+      this.classifierRunning = true;
+      this.lastClassifierRunMs = nowMs;
+      this.updateClassifierScores(tealBlobs, frame, region).finally(() => {
+        this.classifierRunning = false;
+      });
+    }
+
+    if (this.state === TrackingState.SCANNING) {
+      this.handleScanning(iconBlobs, whiteMask, viewportMask, region);
+    } else if (this.state === TrackingState.LOCKED) {
+      this.handleLocked(iconBlobs, whiteMask, viewportMask, region);
+    }
   }
 
   /**
