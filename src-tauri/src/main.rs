@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod capture;
+mod game_window;
 mod global_keys;
+mod key_decision;
 mod lcu;
 mod updater;
 
@@ -50,15 +52,14 @@ fn write_log_line(state: &tauri::State<LogFile>, line: String) {
 
 /// Write a `[rust]`-tagged line to the log file from non-frontend code paths
 /// (the global-shortcut handler, setup hooks, etc).
-fn rust_log<S: AsRef<str>>(app: &tauri::AppHandle, msg: S) {
+pub(crate) fn rust_log<S: AsRef<str>>(app: &tauri::AppHandle, msg: S) {
     let Some(state) = app.try_state::<LogFile>() else { return };
     let Ok(mut guard) = state.file.lock() else { return };
     let Some(f) = guard.as_mut() else { return };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let _ = writeln!(f, "{} [rust] {}", now, msg.as_ref());
+    // Same ISO-8601 UTC shape core/logging.ts writes, so `[rust]` lines and
+    // console lines interleave in file order and read as one timeline.
+    let now = chrono::Utc::now();
+    let _ = writeln!(f, "{} [rust] {}", now.format("%Y-%m-%dT%H:%M:%S%.3fZ"), msg.as_ref());
     let _ = f.flush();
 }
 
@@ -120,17 +121,6 @@ fn hide_scanner(app: tauri::AppHandle) {
     }
 }
 
-/// Get screen dimensions for the primary monitor.
-#[tauri::command]
-fn get_screen_size() -> (u32, u32) {
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-    unsafe {
-        let w = GetSystemMetrics(SM_CXSCREEN) as u32;
-        let h = GetSystemMetrics(SM_CYSCREEN) as u32;
-        (w, h)
-    }
-}
-
 fn main() {
     // Handle the "--complete-update <old-path>" handoff before Tauri starts.
     // If we were launched by an in-flight self-update, this deletes the old
@@ -177,9 +167,10 @@ fn main() {
             // Replaces the old RegisterHotKey-based plugin which LoL's
             // DirectInput layer was eating. Default PTT = Caps Lock (v0.5.6
             // unbound it, which stranded push-to-talk users; v0.5.7 restored the
-            // default — see #27). The overlay pushes any stored user bind on startup.
+            // default — see #27). The overlay pushes any stored user bind on
+            // startup. setup_hook logs the install result from the hook thread,
+            // where the outcome is actually known.
             global_keys::setup_hook(app.handle().clone());
-            rust_log(&app.handle(), "global_keys: WH_KEYBOARD_LL hook installed (PTT=CapsLock)".to_string());
 
             let Some(window) = app.get_webview_window("overlay") else {
                 return Ok(());
@@ -261,7 +252,7 @@ fn main() {
             lcu::get_league_install_dir,
             position_scanner,
             hide_scanner,
-            get_screen_size,
+            game_window::get_game_window_info,
             set_panel_size,
             resize_overlay,
             append_log,

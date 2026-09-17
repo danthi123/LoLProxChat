@@ -1,19 +1,65 @@
 import type { WebSocket } from 'ws';
 import type { ClientMessage, ServerMessage } from './types.js';
 import type { RoomManager } from './rooms.js';
-import { TokenBucket, LIMITS } from './rate-limit.js';
+import type { LivenessTracker } from './heartbeat.js';
+import { validateJoin } from './validate.js';
+import { TokenBucket, LIMITS, type RejectReason } from './rate-limit.js';
 
-function send(ws: WebSocket, msg: ServerMessage): void {
-  if (ws.readyState === ws.OPEN) {
-    ws.send(JSON.stringify(msg));
+/**
+ * Close code sent to a socket whose room+name has been taken over by a newer
+ * connection. The client treats it as terminal instead of reconnecting — see
+ * `src/services/signaling.ts`.
+ */
+export const TAKEOVER_CLOSE_CODE = 4000;
+
+// How long an evicted socket gets to acknowledge the close frame before it is
+// torn down. The socket being evicted is usually half-open (that is why it was
+// replaced), so the close handshake would never complete and ws's 30 s close
+// timeout would keep it in `wss.clients` — and holding one of the 20 per-IP
+// connection slots shared by a whole household — for that whole window.
+const EVICT_TERMINATE_MS = 1000;
+
+/** Returns false when the message was dropped because the socket isn't open. */
+function send(ws: WebSocket, msg: ServerMessage): boolean {
+  if (ws.readyState !== ws.OPEN) {
+    // A silent drop here is how a stale room entry black-holes signaling, so
+    // make it greppable. `position` is excluded: it relays at 10 Hz per peer
+    // and would flood the log from a single dead socket.
+    if (msg.type !== 'position') {
+      console.warn('[ws] dropped', msg.type, 'to a non-OPEN socket (readyState=' + ws.readyState + ')');
+    }
+    return false;
   }
+  ws.send(JSON.stringify(msg));
+  return true;
 }
 
 function sendError(ws: WebSocket, message: string): void {
   send(ws, { type: 'error', message });
 }
 
-export function handleConnection(ws: WebSocket, rooms: RoomManager): void {
+/** Hand a name over to a newer connection, without waiting on the old one. */
+function evict(ws: WebSocket): void {
+  try {
+    ws.close(TAKEOVER_CLOSE_CODE, 'replaced by a newer connection');
+  } catch {
+    // Already closing or closed — the terminate below is the backstop.
+  }
+  setTimeout(() => {
+    try {
+      ws.terminate();
+    } catch {
+      /* already gone */
+    }
+  }, EVICT_TERMINATE_MS).unref();
+}
+
+export function handleConnection(
+  ws: WebSocket,
+  rooms: RoomManager,
+  heartbeat: LivenessTracker,
+  onReject?: (reason: RejectReason) => void,
+): void {
   // Per-connection message rate limiter. Each WebSocket gets its own bucket
   // so a single noisy client can't block a normal one. Capacity matches the
   // ~10 Hz position-broadcast cadence plus signaling bursts at game start.
@@ -21,7 +67,12 @@ export function handleConnection(ws: WebSocket, rooms: RoomManager): void {
   const limitKey = 'self'; // single bucket per connection — key is irrelevant
 
   ws.on('message', (data) => {
+    // Before the rate limit: a client that is being throttled is still alive,
+    // and reaping it would tear down working audio for every peer.
+    heartbeat.markAlive(ws);
+
     if (!msgLimiter.tryConsume(limitKey)) {
+      onReject?.('ws_messages');
       sendError(ws, 'message rate limit exceeded — slow down');
       return;
     }
@@ -35,25 +86,49 @@ export function handleConnection(ws: WebSocket, rooms: RoomManager): void {
 
     switch (msg.type) {
       case 'join': {
-        if (!msg.room || !msg.name) {
-          sendError(ws, 'join requires room and name');
+        const valid = validateJoin(msg.room, msg.name);
+        if (!valid.ok) {
+          // The socket stays open: a retry with the same values can't succeed,
+          // and closing would send the client's reconnect loop around forever.
+          sendError(ws, valid.error);
           return;
         }
-
-        // If already in a room, leave first
-        const existing = rooms.getClientInfo(ws);
-        if (existing) {
-          rooms.leave(ws);
-          const others = rooms.getOthersInRoom(ws);
-          for (const peer of others) {
-            send(peer.ws, { type: 'peer_left', name: existing.name });
-          }
-        }
+        const { room, name } = valid;
 
         // v0.3: optional team field. v0.2.x clients omit it; we pass undefined
         // and computeTieredVolumes falls back to legacy team-blind behavior.
         const team = msg.team === 'ORDER' || msg.team === 'CHAOS' ? msg.team : undefined;
-        const peers = rooms.join(msg.room, msg.name, ws, team);
+
+        const existing = rooms.getClientInfo(ws);
+        if (existing) {
+          if (existing.roomId === room && existing.name === name) {
+            // Repeat join on a live socket. Returning here is load-bearing:
+            // falling through would have `join` find this socket's OWN entry as
+            // the duplicate and evict the connection that just spoke.
+            if (team) rooms.setTeam(ws, team);
+            send(ws, { type: 'room_state', peers: rooms.getOthersInRoom(ws).map(c => c.name) });
+            return;
+          }
+          // Moving rooms: the old room has to be told, and it has to be told
+          // from `remaining` — after `leave`, `getOthersInRoom` has no entry to
+          // resolve the room from and returns nothing.
+          const gone = rooms.leave(ws);
+          if (gone) {
+            for (const peer of gone.remaining) {
+              send(peer.ws, { type: 'peer_left', name: gone.name });
+            }
+          }
+        }
+
+        const { peers, evicted } = rooms.join(room, name, ws, team);
+
+        if (evicted && evicted.ws !== ws) {
+          console.log('[ws] takeover: "' + name + '" in room ' + room + ' moved to a newer connection');
+          evict(evicted.ws);
+          // No peer_left for the evicted socket: the name is still in the room,
+          // and telling peers it left would make them tear down the connection
+          // to the client that just took it over.
+        }
 
         // Send room_state to the joiner
         send(ws, { type: 'room_state', peers });
@@ -61,7 +136,7 @@ export function handleConnection(ws: WebSocket, rooms: RoomManager): void {
         // Broadcast peer_joined to others already in the room
         const others = rooms.getOthersInRoom(ws);
         for (const peer of others) {
-          send(peer.ws, { type: 'peer_joined', name: msg.name });
+          send(peer.ws, { type: 'peer_joined', name });
         }
         break;
       }
@@ -81,7 +156,10 @@ export function handleConnection(ws: WebSocket, rooms: RoomManager): void {
           sendError(ws, `Peer "${msg.to}" not found in room`);
           return;
         }
-        send(target.ws, { type: 'signal', from: info.name, payload: msg.payload });
+        if (!send(target.ws, { type: 'signal', from: info.name, payload: msg.payload })) {
+          // Tell the sender rather than letting the handshake stall silently.
+          sendError(ws, `Peer "${msg.to}" is not reachable`);
+        }
         break;
       }
 
@@ -125,21 +203,12 @@ export function handleConnection(ws: WebSocket, rooms: RoomManager): void {
   });
 
   ws.on('close', () => {
-    const info = rooms.leave(ws);
-    if (info) {
-      // Need to get others AFTER leave — they're still in the room
-      // Since we already removed this ws, getOthersInRoom won't work.
-      // We need to broadcast to remaining peers in the room.
-      // Use getPeers approach via findInRoom instead.
-      // Actually, after leave the room still has remaining clients.
-      // We can iterate getPeers and findInRoom for each.
-      const peerNames = rooms.getPeers(info.roomId);
-      for (const name of peerNames) {
-        const peer = rooms.findInRoom(info.roomId, name);
-        if (peer) {
-          send(peer.ws, { type: 'peer_left', name: info.name });
-        }
-      }
+    // Undefined for a socket that was evicted by a later join — its name is
+    // still live under a different socket, so nothing is broadcast.
+    const gone = rooms.leave(ws);
+    if (!gone) return;
+    for (const peer of gone.remaining) {
+      send(peer.ws, { type: 'peer_left', name: gone.name });
     }
   });
 }

@@ -60,22 +60,64 @@ describe('computeReacquireThreshold', () => {
 });
 
 describe('computeBlobScore', () => {
-  test('with classifier: pos + cls dominate, weights sum ~1.0', () => {
-    const s = computeBlobScore({ posScore: 1, clsScore: 1, whiteScore: 1, peerScore: 1 }, true);
-    expect(s).toBeCloseTo(1.0, 5);
+  test('with classifier: an all-1 candidate scores exactly 1 (weights are normalized)', () => {
+    const s = computeBlobScore({ posScore: 1, clsScore: 1, whiteScore: 1 }, true);
+    expect(s).toBeCloseTo(1.0, 12);
+  });
+
+  test('without classifier: an all-1 candidate scores exactly 1', () => {
+    const s = computeBlobScore({ posScore: 1, clsScore: 1, whiteScore: 1 }, false);
+    expect(s).toBeCloseTo(1.0, 12);
   });
 
   test('without classifier: clsScore is ignored entirely', () => {
     // cls=0 (modified) and cls=1 should both produce the same score when no classifier
-    const a = computeBlobScore({ posScore: 0.5, clsScore: 0, whiteScore: 0.5, peerScore: 0.5 }, false);
-    const b = computeBlobScore({ posScore: 0.5, clsScore: 1, whiteScore: 0.5, peerScore: 0.5 }, false);
+    const a = computeBlobScore({ posScore: 0.5, clsScore: 0, whiteScore: 0.5 }, false);
+    const b = computeBlobScore({ posScore: 0.5, clsScore: 1, whiteScore: 0.5 }, false);
     expect(a).toBe(b);
   });
 
   test('higher posScore strictly wins (ceteris paribus)', () => {
-    const lo = computeBlobScore({ posScore: 0.2, clsScore: 0.5, whiteScore: 0.5, peerScore: 0.5 }, true);
-    const hi = computeBlobScore({ posScore: 0.8, clsScore: 0.5, whiteScore: 0.5, peerScore: 0.5 }, true);
+    const lo = computeBlobScore({ posScore: 0.2, clsScore: 0.5, whiteScore: 0.5 }, true);
+    const hi = computeBlobScore({ posScore: 0.8, clsScore: 0.5, whiteScore: 0.5 }, true);
     expect(hi).toBeGreaterThan(lo);
+  });
+
+  // Single-term probes pin each renormalized weight to a literal value. A
+  // ranking-equivalence test cannot do this: dividing every surviving term by
+  // ANY single constant preserves ordering, so only the absolute values catch
+  // a wrong (or missing) divisor after the dead peer term was dropped.
+  describe('renormalized weights (peer term removed)', () => {
+    test('with classifier: pos 0.35/0.85, cls 0.30/0.85, white 0.20/0.85', () => {
+      expect(computeBlobScore({ posScore: 1, clsScore: 0, whiteScore: 0 }, true))
+        .toBeCloseTo(0.4117647, 6);
+      expect(computeBlobScore({ posScore: 0, clsScore: 1, whiteScore: 0 }, true))
+        .toBeCloseTo(0.3529412, 6);
+      expect(computeBlobScore({ posScore: 0, clsScore: 0, whiteScore: 1 }, true))
+        .toBeCloseTo(0.2352941, 6);
+    });
+
+    test('without classifier: pos 0.45/0.70, white 0.25/0.70', () => {
+      expect(computeBlobScore({ posScore: 1, clsScore: 0, whiteScore: 0 }, false))
+        .toBeCloseTo(0.6428571, 6);
+      expect(computeBlobScore({ posScore: 0, clsScore: 0, whiteScore: 1 }, false))
+        .toBeCloseTo(0.3571429, 6);
+    });
+
+    test('the surviving terms keep their pre-removal ratios exactly', () => {
+      // pos:cls:white was 0.35:0.30:0.20 with the classifier and 0.45:-:0.25
+      // without it. Renormalizing must not re-rank anything, so the ratios —
+      // not just the ordering — have to survive.
+      const pos = computeBlobScore({ posScore: 1, clsScore: 0, whiteScore: 0 }, true);
+      const cls = computeBlobScore({ posScore: 0, clsScore: 1, whiteScore: 0 }, true);
+      const white = computeBlobScore({ posScore: 0, clsScore: 0, whiteScore: 1 }, true);
+      expect(pos / cls).toBeCloseTo(0.35 / 0.30, 10);
+      expect(cls / white).toBeCloseTo(0.30 / 0.20, 10);
+
+      const posNo = computeBlobScore({ posScore: 1, clsScore: 0, whiteScore: 0 }, false);
+      const whiteNo = computeBlobScore({ posScore: 0, clsScore: 0, whiteScore: 1 }, false);
+      expect(posNo / whiteNo).toBeCloseTo(0.45 / 0.25, 10);
+    });
   });
 });
 
@@ -83,7 +125,6 @@ describe('pickBestBlobInRange', () => {
   const noScores = {
     cls: () => 0.5,
     white: () => 0.5,
-    peer: () => 0.5,
   };
 
   test('picks the blob closest to the predicted position', () => {
@@ -174,7 +215,7 @@ describe('pickBestBlobInRange', () => {
     const lastReg = { x: 28, y: 308 };
     const predicted = { x: 28, y: 308 };
     const maxJumpPx = computeMaxJumpPx(30, /*holdStartMs*/ 0, /*now*/ 1000);
-    const deadClassifier = { cls: () => 0.0, white: () => 0.8, peer: () => 1.0 };
+    const deadClassifier = { cls: () => 0.0, white: () => 0.8 };
 
     const phase1 = pickBestBlobInRange(
       [blob], lastReg, predicted, maxJumpPx, /*hasClassifier*/ true, deadClassifier,

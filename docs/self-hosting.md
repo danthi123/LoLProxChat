@@ -53,7 +53,7 @@ TURN_KEY_API_TOKEN=<token from Cloudflare>
 
 The compose file is at [`docker-compose.proxchat.yml`](../docker-compose.proxchat.yml) in the repo root. `.env` is already in `.gitignore`.
 
-Those two lines are the whole file for a Cloudflare-TURN deployment. (You'll spot an `ENCRYPTION_KEY` in the compose — it's a leftover from the old pre-v0.3 position-encryption path that the current server ignores. Leave it unset.)
+Those two lines are the whole file for a Cloudflare-TURN deployment — unless a CDN sits in front of your reverse proxy, in which case add `TRUST_PROXY=2` and read § "Client IP and rate limits" under Operational notes first, because the server-side half alone isn't enough. (You'll spot an `ENCRYPTION_KEY` in the compose — it's a leftover from the old pre-v0.3 position-encryption path that the current server ignores. Leave it unset.)
 
 ## Step 3 — Deploy via Docker
 
@@ -69,12 +69,19 @@ proxchat.your-domain.com {
 }
 ```
 
-Caddy upgrades WebSockets automatically. For nginx, ensure:
+Caddy upgrades WebSockets automatically, and it strips incoming `X-Forwarded-*` headers unless you set `trusted_proxies`, so the value the server sees is the one Caddy observed. Nothing else to configure — unless a CDN sits in front, in which case read § "Client IP and rate limits" below before you add `trusted_proxies`.
+
+For nginx, ensure **all five** of these:
 
 ```nginx
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 proxy_set_header Upgrade $http_upgrade;
 proxy_set_header Connection "upgrade";
 ```
+
+The two address headers are not optional. nginx sends neither unless you tell it to, so without them every one of your users is rate-limited as if they were a single client at the proxy's address: the 20-connection WebSocket cap becomes a *global* 20-connection cap and your server goes quietly dead at user 21. Set both rather than one — the server cross-checks them, and a mismatch (which is what a client supplying its own `X-Forwarded-For` produces) makes it discard both and fall back to the proxy's address.
 
 ### Or deploy directly (no Docker)
 
@@ -84,6 +91,8 @@ npm install
 npm run build
 PORT=3100 TURN_KEY_ID=<id> TURN_KEY_API_TOKEN=<token> npm start
 ```
+
+Put a reverse proxy in front of this too. If you deliberately run it without one — a LAN-only deployment, say — add `TRUST_PROXY=off` so the rate limits key on the real connection rather than on a header the client can choose.
 
 ## Step 4 — Verify
 
@@ -196,7 +205,18 @@ PROXCHAT_DEPLOY_PATH=/path/to/proxchat-server \
 - **Health checks.** Docker Compose includes a built-in healthcheck that hits `/health` every 30 s. The README's status badge also pulls from this endpoint via Shields.io.
 - **TLS termination is your responsibility.** Caddy is the recommended default since it handles cert renewal end-to-end. nginx + certbot also works but renewal is a separate concern.
 - **WebSocket upgrades.** Any reverse proxy you use must support and forward the WebSocket upgrade headers, or `/ws` will fail even if `/health` returns 200.
-- **Rate limiting.** The server ships with rate limits, a body-size cap, and WebSocket connection/message limits built in (`server/src/rate-limit.ts::LIMITS`). Defaults: `/turn-credentials` 60/min per IP; `/compute-volumes` keyed per player (IP + name) and sized for the max scan rate, plus a generous per-IP backstop and a 256 KB body cap; WebSocket 20 connections per IP + 64 KB per message. Legitimate clients never trigger them. If you serve an unusual environment (e.g. a CG-NAT'd ISP where many subscribers share one public IP), the constants in `LIMITS` are the single place to adjust + rebuild. No env-var knobs by design — keeps the server config trivially auditable.
+- **Rate limiting.** The server ships with rate limits, a body-size cap, and WebSocket connection/message limits built in (`server/src/rate-limit.ts::LIMITS`). Defaults: `/turn-credentials` 60/min per IP; `/compute-volumes` keyed per player (IP + name) and sized for the max scan rate, plus a generous per-IP backstop and a 256 KB body cap; WebSocket 20 connections per IP + 64 KB per message. Legitimate clients never trigger them. If you serve an unusual environment (e.g. a CG-NAT'd ISP where many subscribers share one public IP), the constants in `LIMITS` are the single place to adjust + rebuild. The limits themselves have no env-var knobs by design — that keeps the server config trivially auditable. `TRUST_PROXY` (below) is the one exception, and it isn't limit tuning: it describes your deployment's topology, which the build can't know.
+
+- **Client IP and rate limits.** Every per-IP limit keys off the address the server resolves for the request, so getting that address right is the difference between working limits and either a bypass or a dead server.
+
+  - **A CDN in front is the case to get right.** With Cloudflare (or any CDN) → your proxy → the server, the address your proxy appends is the *CDN edge*, not the player. Left alone, every user on the planet collapses into one bucket and the 20-connection WebSocket cap becomes a global one. Fix it with both halves of a single instruction: set `TRUST_PROXY=2` on the server **and**, in the same change, configure your proxy to trust the CDN (Caddy: `trusted_proxies` covering Cloudflare's published ranges inside the `reverse_proxy` block; nginx: `set_real_ip_from` + `real_ip_header CF-Connecting-IP`). `TRUST_PROXY=2` without the proxy-side half is worse than doing nothing — your proxy discards the CDN's header, the server counts a hop that isn't in the list, and you land right back in the one-bucket failure.
+  - **`TRUST_PROXY` values.** Unset (or `1`) means one reverse proxy of yours in front — the setup in Step 3, and what you want. A number means that many of your own proxies append to `X-Forwarded-For`. `off` ignores forwarding headers entirely and keys on the TCP peer.
+  - **Forwarding headers are only read from a private peer.** `X-Forwarded-For` / `X-Real-IP` are honoured only when the connection arrives from loopback, a private range, or link-local — i.e. from a reverse proxy on your own host or Docker network. A client that reaches the server directly arrives with a public address and its headers are ignored, so publishing `:3100` doesn't hand it a way to pick its own bucket. Header values that aren't IP addresses are discarded the same way.
+  - **Publishing the port bypasses your proxy.** `docker-compose.proxchat.yml` publishes `3100:3100` on all interfaces so a containerised Caddy can reach it. If your proxy runs on the host, change it to `127.0.0.1:3100:3100` and nothing outside can reach the server except through TLS.
+  - **Rootless Docker, Podman and Docker Desktop break the peer gate.** Their port forwarding rewrites the source address to the bridge gateway, so *every* inbound connection looks private and forwarding headers are trusted from anyone. On those runtimes, either bind the published port to `127.0.0.1` as above or set `TRUST_PROXY=off`. Rootful Docker (the normal Linux install, including Unraid) preserves the real source address and is unaffected.
+  - **No proxy at all — LAN or plain `http://` on a port.** Every client then connects from a private address, which the gate treats as trusted, so any of them could supply its own `X-Forwarded-For`. Set `TRUST_PROXY=off` for that deployment; the limits then key on the real TCP peer.
+  - **Confirm what the process resolved.** The server prints `proxchat-server trust-proxy: …` next to its listen line at startup, so `docker logs proxchat-server | head` settles it without guessing. When requests are being rejected it also logs one aggregate line a minute — counts by reason plus how many distinct buckets each limiter holds, with no addresses or player names in it. Bucket counts stuck at ~1 while `/health` reports many rooms is the signature of everyone collapsing into a single bucket.
+  - **Setting it on an existing deployment.** [`scripts/deploy-server.sh`](../scripts/deploy-server.sh) deliberately never touches the remote `docker-compose.yml`, so adding `TRUST_PROXY` to the compose file in this repo does **not** reach a running host. Add the line to the compose file on the box (or its `.env`) and `docker compose up -d` there.
 
 ## Pointing the client at your server
 

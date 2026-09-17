@@ -327,8 +327,12 @@ export function computeTieredVolumes(
     if (!legacy && peer.team === me.team && !body.allyProximity) {
       // Global ally voice (default): always full volume, no proximity. We even
       // skip the staleness check — an ally in SCANNING / long-hold hasn't
-      // reported coords recently but is still actively transmitting audio, and a
-      // truly-gone peer is removed by RoomManager.leave on socket close.
+      // reported coords recently but is still actively transmitting audio. What
+      // makes that safe is that a truly-gone peer is removed from room state:
+      // RoomManager.leave on a clean close, and the WebSocket heartbeat
+      // (server/src/heartbeat.ts) for a half-open socket that never fires one.
+      // Without the heartbeat this branch holds a vanished ally at 1.0 for as
+      // long as the OS takes to time the TCP connection out.
       // (When the requester opts into allyProximity, allies fall through to the
       // distance falloff below, exactly like cross-team peers.)
       peerVolumes[peer.name] = 1.0;

@@ -44,18 +44,25 @@ export interface BlobScoreInputs {
   clsScore: number;
   /** 0..1 heuristic on how many "white" (champion-mark) pixels surround the blob. */
   whiteScore: number;
-  /** 0..1, lower if the blob is suspiciously close to a known ally peer. */
-  peerScore: number;
 }
 
 /**
  * Composite score for a candidate blob. When the classifier is loaded we
  * weight its confidence heavily; without it, position dominates.
+ *
+ * The trailing division renormalizes away a fourth term — a peer-avoidance
+ * penalty against known ally positions — that scored a constant 1.0 for every
+ * candidate from the v0.2 server-side-positions refactor onward, because no
+ * peer coordinates have reached a client since. They are not coming back:
+ * docs/threat-model.md, "Why clients are not told ally positions", records why
+ * the server must not hand them out. Spelled as a division rather than
+ * pre-divided decimals so the surviving weights keep their ratios to each
+ * other exactly, which is what makes the removal leave every ranking alone.
  */
 export function computeBlobScore(s: BlobScoreInputs, hasClassifier: boolean): number {
   return hasClassifier
-    ? s.posScore * 0.35 + s.clsScore * 0.30 + s.whiteScore * 0.20 + s.peerScore * 0.15
-    : s.posScore * 0.45 + s.peerScore * 0.30 + s.whiteScore * 0.25;
+    ? (s.posScore * 0.35 + s.clsScore * 0.30 + s.whiteScore * 0.20) / 0.85
+    : (s.posScore * 0.45 + s.whiteScore * 0.25) / 0.70;
 }
 
 /** Minimum classifier confidence to follow a blob during Phase 1 tracking. */
@@ -91,7 +98,6 @@ export function computeNearFieldPx(expectedIconDiam: number): number {
 export interface ScoreFns {
   cls: (b: Blob) => number;
   white: (b: Blob) => number;
-  peer: (b: Blob) => number;
 }
 
 export interface ScoredBlob {
@@ -147,7 +153,7 @@ export function pickBestBlobInRange(
     if (hasClassifier && !isNearField && clsScore < CLS_FOLLOW_THRESHOLD) continue;
 
     const score = computeBlobScore(
-      { posScore, clsScore, whiteScore: scoreFns.white(b), peerScore: scoreFns.peer(b) },
+      { posScore, clsScore, whiteScore: scoreFns.white(b) },
       hasClassifier,
     );
     if (!best || score > best.score) best = { blob: b, score };

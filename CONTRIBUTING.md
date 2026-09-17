@@ -37,6 +37,11 @@ npm test
 # Run server tests
 cd server && npm test
 
+# Run Rust tests (Windows only — the crate links Win32 bindings). Needs a
+# frontend build first, because tauri::generate_context!() resolves ../dist
+# at compile time.
+npm run build:prod && cargo test --manifest-path src-tauri/Cargo.toml
+
 # Re-scrape champion icons + retrain the tracking classifier (needs Python —
 # see "Refreshing the champion classifier" below)
 npm run refresh-model
@@ -78,8 +83,9 @@ docs/                  — User guide, architecture, self-hosting, threat model,
 
 ## Testing
 
-- **Client tests** live under `tests/` (separate root from `src/`). Run with `npm test`. The 100 tests cover core logic, tracking state machine, audio gain math (slider×proximity, plus `resolveProximityTargets` which silences peers the server drops from range), device list filtering, tracking-helper scoring math (composite/jump/hold-cap), the position-jump warning gates, the session-flow integration, the champion-classifier label resolver, the dynamic overlay resize helpers, and the PTT-rebind keymap.
-- **Server tests** live under `server/tests/`. Run with `cd server && npm test`. 74 tests cover room management (team + coords storage), TURN credential generation (both coturn-HMAC and Cloudflare paths), the tiered proximity-volume math, and rate-limiting (`TokenBucket`, `ConcurrencyLimiter`, `clientIp`, plus an end-to-end per-player isolation test).
+- **Client tests** live under `tests/` (separate root from `src/`). Run with `npm test`. The 198 tests cover core logic, tracking state machine, audio gain math (slider×proximity, plus `resolveProximityTargets` which silences peers the server drops from range), device list filtering, tracking-helper scoring math (composite/jump/hold-cap), the position-jump warning gates, the session-flow integration, the champion-classifier label resolver, the dynamic overlay resize helpers, the game-window geometry resolver and capture-bounds math, and the PTT-rebind keymap.
+- **Server tests** live under `server/tests/`. Run with `cd server && npm test`. 165 tests cover room management (team + coords storage), `join` argument validation, WebSocket heartbeat/reaping, TURN credential generation (both coturn-HMAC and Cloudflare paths), the tiered proximity-volume math, and rate-limiting (`TokenBucket`, `ConcurrencyLimiter`, `clientIp`'s proxy-trust rules, plus end-to-end per-player isolation and forwarding-header tests against a real spawned server).
+- **Rust tests** live beside the code they cover (`#[cfg(test)] mod tests`). 27 tests across `capture.rs`, `game_window.rs`, `key_decision.rs` and `lcu.rs` cover the pure helpers — lockfile parsing, install-dir caching, capture-bounds validation, game-rect handling and the PTT key decision. They only build on Windows; see "Common commands" for the invocation.
 - New features should land with tests where the logic is testable (pure functions, state machines). DOM-heavy or Tauri-IPC-heavy code can skip tests; mock surfaces are too brittle to be worth maintaining.
 
 ## Refreshing the champion classifier
@@ -130,6 +136,7 @@ A release is triggered by a **version bump landing on `main`** — [`.github/wor
 So a manual release is:
 
 1. `node scripts/bump-version.mjs --type patch --changelog "### Fixed\n- …"` — bumps `Cargo.toml` + `Cargo.lock` and adds the dated `CHANGELOG.md` section + footnote (use `--type minor` for notable/behavior changes).
+   `src-tauri/Cargo.toml`'s version is the single source of truth: the exe's Windows file-properties version comes from it too, because `tauri.conf.json` deliberately has no `version` field. Don't re-add one — it would override `Cargo.toml` and drift the moment someone bumps by hand.
 2. Commit (`release:`) and push to `main`.
 3. Wait for the draft release to appear, then review and publish it.
 

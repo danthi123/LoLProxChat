@@ -108,7 +108,7 @@ Voice is the only thing on the WebRTC connection — there is no data channel.
 - Each client publishes a single mic stream through a WebAudio graph: `mic → GainNode → MediaStreamDestination → RTCPeerConnection`.
 - Each peer's incoming stream goes through the inverse: `RTCPeerConnection → MediaStreamSource → GainNode → AudioContext.destination`.
 - The per-peer gain is driven by the server-returned volume, smoothed (`nextSmoothedVolume`, ~1-second ramp) so distance changes ease in instead of snapping, and tracking jitter is damped.
-- ICE candidates flow through the signaling server's `/ws` endpoint. Direct P2P (host or srflx) is preferred; TURN relay kicks in if the user opted into "Hide IP" or if direct paths fail. TURN credentials come from Cloudflare's Realtime TURN API, proxied through the signaling server's `/turn-credentials`.
+- ICE candidates flow through the signaling server's `/ws` endpoint. Direct P2P (host or srflx) is preferred; TURN relay kicks in if the user opted into "Hide IP" or if direct paths fail. TURN credentials come from Cloudflare's Realtime TURN API, proxied through the signaling server's `/turn-credentials`. The client caches the response in memory for 60 seconds and de-duplicates concurrent requests, so a lobby's worth of peer setups makes one call rather than one per peer. Failed or empty responses are not cached — an ICE server list is frozen into each `RTCPeerConnection` at construction, so caching a STUN-only fallback would strand every peer of that game without a relay.
 - ICE failure auto-recovers: initiator side calls `pc.restartIce()` + re-issues an offer, capped at 2 attempts per peer, counter resets on successful re-connect.
 
 ## Signaling server (`server/`)
@@ -128,13 +128,15 @@ Source files:
 |---|---|
 | `src/index.ts` | HTTP/WebSocket bootstrap, route dispatch, rate limits (per-player + per-IP backstop) + body cap + WS connection cap |
 | `src/ws-handler.ts` | Per-connection lifecycle, room messages, per-connection message rate limit |
-| `src/rooms.ts` | In-memory room table, presence tracking |
+| `src/rooms.ts` | In-memory room table, presence tracking, one-entry-per-name-per-room invariant |
+| `src/validate.ts` | `join` argument validation (types, length caps, room-id charset, control characters) |
+| `src/heartbeat.ts` | WebSocket liveness: ping sweep + termination of half-open connections |
 | `src/volumes.ts` | Team-aware distance→volume falloff math (`computeTieredVolumes`), reading coords from room state. Older entry points remain for backward compatibility. |
 | `src/turn.ts` | Cloudflare TURN credential fetcher + cache + coturn HMAC fallback |
 | `src/rate-limit.ts` | Token-bucket and concurrency limiters used across endpoints. No external dep. |
 | `src/types.ts` | Shared request/response types |
 
-74 tests under `server/tests/` (tiered-proximity + team room-state, TURN credentials, and rate-limiting incl. an end-to-end per-player isolation test).
+165 tests under `server/tests/` (tiered-proximity + team room-state, `join` validation, heartbeat reaping, TURN credentials, and rate-limiting incl. client-IP trust resolution and an end-to-end per-player isolation test).
 
 **Rate-limit defaults** (all in `src/rate-limit.ts::LIMITS`):
 - `/turn-credentials`: 60 req/min per IP
@@ -162,10 +164,10 @@ Manual checks (Settings → Updates → CHECK) skip the launch delay and the Aut
 | Service | Responsibility |
 |---|---|
 | `Orchestrator` | Game-state polling, session lifecycle, broadcast cadence, scanning-mode passthrough, peer state registry. The wiring layer between everything else. |
-| `TrackingService` | Minimap CV pipeline. State machine described above. |
+| `TrackingService` | Minimap CV pipeline. State machine described above. Constructed with the League game window's client rect (a `ScreenRect`), not a width/height pair — the capture square is derived from that rect's origin and height. |
 | `ChampionClassifier` | Champion classifier (a small CNN run via ONNX Runtime Web) — the champion-identity signal for tracking. |
 | `AudioService` | WebRTC audio + per-peer volume control. Input mode toggle (Always Open / PTT). Mic acquisition with selected device. Output via shared `AudioContext`. Noise suppression handled natively by Chromium. |
-| `SignalingService` | WebSocket presence + signal relay. Auto-reconnect with exponential backoff. |
+| `SignalingService` | WebSocket presence + signal relay. Auto-reconnect with exponential backoff, except on close code 4000 (the room+name was taken over by another connection), which is terminal. |
 | `PeerConnection` | Single peer's `RTCPeerConnection` wrapper. EMA-smoothed gain, periodic `getStats()` logging, ICE-restart on failure, ICE-transport-policy reading from privacy settings. |
 | `VolumeClient` | Calls `/compute-volumes` with `{ myPosition, roomId, name }` and applies the returned per-peer volumes. |
 | `GameStateService` | Wraps Tauri commands for LCU + Live Client Data into a TypeScript surface. |
@@ -187,11 +189,11 @@ Not services in their own right — small support modules consumed by the servic
 
 | Command (file) | Responsibility |
 |---|---|
-| `capture::set_capture_bounds`, `capture::capture_minimap` | Win32 GDI BitBlt of a bounded screen rect into an RGBA data URL. |
+| `capture::set_capture_bounds`, `capture::capture_minimap` | Win32 GDI BitBlt of a bounded screen rect into an RGBA data URL. The source is `GetDC(NULL)` — the device context for the whole **virtual** screen — so bounds on a monitor left of or above the primary one (negative coordinates) read back real pixels rather than black. Bounds that do not intersect the virtual screen are rejected with a descriptive error. |
 | `lcu::check_league_running`, `lcu::get_game_state`, `lcu::get_live_client_data`, `lcu::read_league_config_file`, `lcu::get_league_install_dir` | LCU + Live Client Data polling. Install-dir resolution via the LCU lockfile path. `read_league_config_file` takes no arguments and reads only `Config/game.cfg` — Rust computes the path so the frontend can't supply arbitrary file paths. |
 | `updater::check_for_update`, `updater::download_and_apply_update` | GitHub Releases check + in-place exe swap. Handles the `--complete-update <old-path>` startup arg. |
 | `main::position_scanner`, `main::hide_scanner` | Auto-pin the scanner window over the detected minimap region. |
-| `main::get_screen_size` | Primary monitor resolution for DPI math. |
+| `game_window::get_game_window_info` | Locates the League **game** window (`FindWindowW("RiotWindowClass")`, rejecting invisible/minimized handles) and returns its client rect in screen coordinates plus the virtual- and primary-screen rects, the matched window's title and owning process, and any Win32 error. All capture geometry derives from this. Plausibility is judged in `src/core/game-window.ts`, not here, so jest can cover it. |
 | `main::set_panel_size` | Reports the panel's current hit-rect size to the click-through polling loop. |
 | `main::append_log` | Writes a single line to the rolling debug log file. |
 | `main::open_log_folder` | Launches Explorer at the log directory. |

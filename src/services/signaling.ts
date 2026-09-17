@@ -2,6 +2,15 @@ import { WS_URL } from '../core/config';
 
 export type SignalType = 'offer' | 'answer' | 'ice-candidate';
 
+/**
+ * Close code the server sends when this room+name has been handed to a newer
+ * connection (see `server/src/ws-handler.ts`). Terminal for us: reconnecting
+ * would evict whoever took the name, they would reconnect and evict us back,
+ * and the two would trade the room forever without either ever completing a
+ * WebRTC handshake.
+ */
+const TAKEOVER_CLOSE_CODE = 4000;
+
 export interface SignalMessage {
   type: SignalType;
   from: string;
@@ -73,7 +82,11 @@ export class SignalingService {
 
     const team = this.currentTeam;
 
+    // Every listener below is scoped to the socket it was attached to: `this.ws`
+    // is reassigned on reconnect, and a superseded socket must not be able to
+    // send a second `join` or drive the reconnect backoff.
     ws.addEventListener('open', () => {
+      if (this.ws !== ws) return;
       console.log('[Signaling] WebSocket connected');
       this.reconnectAttempt = 0;
       // v0.3: include team in join. Older servers ignore the extra field.
@@ -81,6 +94,7 @@ export class SignalingService {
     });
 
     ws.addEventListener('message', (event) => {
+      if (this.ws !== ws) return;
       let msg: any;
       try {
         msg = JSON.parse(event.data as string);
@@ -94,6 +108,10 @@ export class SignalingService {
           // Existing peers already in the room
           const peers: string[] = msg.peers || [];
           for (const name of peers) {
+            // Filter self out, as `peer_joined` already does — a server that
+            // still had a stale entry under our own name would otherwise have
+            // us open a peer connection to ourselves.
+            if (name === this.localName) continue;
             onPeerJoined?.(name);
           }
           break;
@@ -144,9 +162,21 @@ export class SignalingService {
       }
     });
 
-    ws.addEventListener('close', () => {
-      console.log('[Signaling] WebSocket disconnected');
+    ws.addEventListener('close', (event) => {
+      if (this.ws !== ws) return;
+      console.log('[Signaling] WebSocket disconnected (code ' + event.code +
+        (event.reason ? ', ' + event.reason : '') + ')');
       if (this.intentionallyClosed) return;
+      if (event.code === TAKEOVER_CLOSE_CODE) {
+        console.error('[Signaling] Another connection took over this room as "' +
+          this.localName + '" — not reconnecting. Is LoLProxChat already running?');
+        this.intentionallyClosed = true;
+        if (this.reconnectTimer !== null) {
+          clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = null;
+        }
+        return;
+      }
       // Exponential backoff capped at 30s
       this.reconnectAttempt++;
       const delayMs = Math.min(30000, 500 * Math.pow(2, this.reconnectAttempt - 1));

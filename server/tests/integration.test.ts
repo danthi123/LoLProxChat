@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { WebSocket } from 'ws';
+import { WebSocket, type ClientOptions } from 'ws';
 
 // End-to-end integration test: spawns the ACTUAL built server (dist/index.js)
 // as a subprocess and drives it with real WebSocket + HTTP clients. Unit
@@ -34,9 +34,15 @@ function waitForListening(proc: ChildProcess): Promise<void> {
 }
 
 /** Open a WS, join a room with a team, resolve once room_state is received. */
-function joinRoom(room: string, name: string, team: 'ORDER' | 'CHAOS'): Promise<WebSocket> {
+function joinRoomAt(
+  url: string,
+  room: string,
+  name: string,
+  team: 'ORDER' | 'CHAOS',
+  opts?: ClientOptions,
+): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(WS_URL);
+    const ws = new WebSocket(url, opts);
     const timer = setTimeout(() => reject(new Error(`${name} join timed out`)), 5000);
     ws.on('open', () => {
       ws.send(JSON.stringify({ type: 'join', room, name, team }));
@@ -52,17 +58,46 @@ function joinRoom(room: string, name: string, team: 'ORDER' | 'CHAOS'): Promise<
   });
 }
 
+function joinRoom(room: string, name: string, team: 'ORDER' | 'CHAOS'): Promise<WebSocket> {
+  return joinRoomAt(WS_URL, room, name, team);
+}
+
+/** Collect every message of one type that arrives on an already-open socket. */
+function collect(ws: WebSocket, type: string): string[] {
+  const seen: string[] = [];
+  ws.on('message', (data) => {
+    const msg = JSON.parse(data.toString());
+    if (msg.type === type) seen.push(JSON.stringify(msg));
+  });
+  return seen;
+}
+
+/** Resolve with the first message of `type` to arrive, or reject on timeout. */
+function nextMessage(ws: WebSocket, type: string, timeoutMs: number, label: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(label)), timeoutMs);
+    ws.on('message', (data) => {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === type) {
+        clearTimeout(timer);
+        resolve(msg);
+      }
+    });
+  });
+}
+
 function sendCoords(ws: WebSocket, x: number, y: number): void {
   ws.send(JSON.stringify({ type: 'coords', x, y }));
 }
 
-async function computeVolumes(
+async function computeVolumesAt(
+  base: string,
   myPosition: { x: number; y: number },
   roomId: string,
   name: string,
   listenPosition?: { x: number; y: number },
 ) {
-  const resp = await fetch(`${BASE}/compute-volumes`, {
+  const resp = await fetch(`${base}/compute-volumes`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ myPosition, roomId, name, ...(listenPosition ? { listenPosition } : {}) }),
@@ -71,11 +106,43 @@ async function computeVolumes(
   return resp.json() as Promise<{ myBlob: string; peerVolumes: Record<string, number> }>;
 }
 
+function computeVolumes(
+  myPosition: { x: number; y: number },
+  roomId: string,
+  name: string,
+  listenPosition?: { x: number; y: number },
+) {
+  return computeVolumesAt(BASE, myPosition, roomId, name, listenPosition);
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Blank TURN config so /turn-credentials answers from memory. Inherited creds
+// from a developer's shell would turn these into network-dependent tests.
+const NO_TURN = {
+  TURN_KEY_ID: '',
+  TURN_KEY_API_TOKEN: '',
+  TURN_SERVER: '',
+  TURN_SECRET: '',
+};
+
+/** Fire `count` /turn-credentials requests in parallel and return the statuses. */
+async function floodTurnCreds(
+  base: string,
+  count: number,
+  headers: (i: number) => Record<string, string>,
+): Promise<number[]> {
+  const responses = await Promise.all(
+    Array.from({ length: count }, (_, i) => fetch(`${base}/turn-credentials`, { headers: headers(i) })),
+  );
+  // Drain the bodies so the sockets are released before the next case.
+  await Promise.all(responses.map((r) => r.text()));
+  return responses.map((r) => r.status);
+}
 
 beforeAll(async () => {
   server = spawn('node', ['dist/index.js'], {
-    env: { ...process.env, PORT: String(PORT), ENCRYPTION_KEY: TEST_KEY },
+    env: { ...process.env, ...NO_TURN, PORT: String(PORT), ENCRYPTION_KEY: TEST_KEY },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   await waitForListening(server);
@@ -195,4 +262,167 @@ describe('tiered proximity — end-to-end against the real server', () => {
     const housemate = await post('Housemate');
     expect(housemate.status).toBe(200);
   });
+
+  it('a reconnect under the same name takes over signaling', async () => {
+    const room = 'r-takeover';
+    const alice = await joinRoom(room, 'Alice', 'ORDER');
+    const bob1 = await joinRoom(room, 'Bob', 'CHAOS');
+
+    const bob1Closed = new Promise<number>((resolve) => bob1.on('close', resolve));
+    const alicePeerLeft = collect(alice, 'peer_left');
+    const bob1Signals = collect(bob1, 'signal');
+
+    // Bob reconnects on a NEW socket without the old one having closed —
+    // exactly the zombie the client's backoff loop leaves behind when the old
+    // connection is half-open.
+    const bob2 = await joinRoom(room, 'Bob', 'CHAOS');
+    const bob2Signal = nextMessage(bob2, 'signal', 3000, 'Bob2 never received the signal');
+
+    // The server hands the old socket a distinct close code so the client can
+    // tell a takeover from an ordinary drop and stop reconnecting.
+    expect(await bob1Closed).toBe(4000);
+
+    alice.send(JSON.stringify({ type: 'signal', to: 'Bob', payload: { sdp: 'offer' } }));
+    expect((await bob2Signal).from).toBe('Alice');
+    // Before the fix the signal is routed to the stale entry and lands nowhere.
+    expect(bob1Signals).toEqual([]);
+
+    await sleep(300);
+    // ...and no peer_left for a name that is still in the room, which would
+    // make Alice tear down the connection she just established.
+    expect(alicePeerLeft).toEqual([]);
+
+    alice.close();
+    bob2.close();
+  }, 15_000);
+
+  it('keys the rate limit on the entry the proxy wrote, not the one the client sent', async () => {
+    // The end-to-end proof that the bypass is closed on the DEFAULT config
+    // (loopback peer, one hop). The rightmost entry is what a real proxy
+    // appends; rotating everything to its left used to mint a fresh bucket per
+    // request, so all 90 returned 200. TURN_CREDS holds 60 and refills at 1/s.
+    const statuses = await floodTurnCreds(BASE, 90, (i) => ({
+      'x-forwarded-for': `198.51.100.${i}, 203.0.113.77`,
+    }));
+    expect(statuses.filter((s) => s === 429).length).toBeGreaterThanOrEqual(20);
+  });
+
+  it('never lets non-IP header text become a bucket key', async () => {
+    // Rotating garbage falls back to the socket peer — one bucket, not 90.
+    const statuses = await floodTurnCreds(BASE, 90, (i) => ({
+      'x-forwarded-for': `not-an-ip-${i}`,
+    }));
+    expect(statuses.filter((s) => s === 429).length).toBeGreaterThanOrEqual(20);
+  });
+
+  it('still gives proxied clients their own buckets', async () => {
+    // The availability guard: a genuine one-hop proxy forwards one entry per
+    // client, and each of those must keep its own budget. If this ever starts
+    // 429ing, the fix has collapsed a whole server onto the proxy's address.
+    const statuses = await floodTurnCreds(BASE, 90, (i) => ({
+      'x-forwarded-for': `198.51.100.${i}`,
+    }));
+    expect(statuses.filter((s) => s === 429).length).toBe(0);
+  });
+});
+
+// TRUST_PROXY=off has to be set at startup, so the kill switch needs its own
+// process. This instance ignores forwarding headers entirely.
+describe('TRUST_PROXY=off ignores forwarding headers', () => {
+  const OFF_PORT = 31997;
+  const OFF_BASE = `http://127.0.0.1:${OFF_PORT}`;
+  const OFF_WS_URL = `ws://127.0.0.1:${OFF_PORT}`;
+  let offServer: ChildProcess;
+  const openSockets: WebSocket[] = [];
+
+  beforeAll(async () => {
+    offServer = spawn('node', ['dist/index.js'], {
+      env: {
+        ...process.env,
+        ...NO_TURN,
+        PORT: String(OFF_PORT),
+        ENCRYPTION_KEY: TEST_KEY,
+        TRUST_PROXY: 'off',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    await waitForListening(offServer);
+  }, 15_000);
+
+  afterAll(() => {
+    for (const ws of openSockets) ws.close();
+    offServer?.kill('SIGKILL');
+  });
+
+  it('rate-limits /turn-credentials despite a distinct X-Forwarded-For per request', async () => {
+    const statuses = await floodTurnCreds(OFF_BASE, 90, (i) => ({
+      'x-forwarded-for': `198.51.100.${i}`,
+    }));
+    expect(statuses.filter((s) => s === 429).length).toBeGreaterThanOrEqual(20);
+  });
+
+  it('enforces the per-IP WebSocket cap despite a rotating X-Forwarded-For', async () => {
+    // The WS limiter is the one where a bypass is worth the most: it grants
+    // unbounded CONCURRENT connections rather than a throughput increment.
+    // WS_PER_IP is 20, so at least 5 of 25 must be refused with 1008.
+    const probe = (i: number) => new Promise<number | 'open'>((resolve) => {
+      const ws = new WebSocket(OFF_WS_URL, { headers: { 'x-forwarded-for': `198.51.100.${i}` } });
+      openSockets.push(ws);
+      const timer = setTimeout(() => resolve('open'), 2000);
+      ws.on('close', (code) => { clearTimeout(timer); resolve(code); });
+      ws.on('error', () => { clearTimeout(timer); resolve('open'); });
+    });
+
+    const results = await Promise.all(Array.from({ length: 25 }, (_, i) => probe(i)));
+    expect(results.filter((r) => r === 1008).length).toBeGreaterThanOrEqual(5);
+  }, 20_000);
+});
+
+// The heartbeat needs its own server: the sweep interval is fixed at startup,
+// and 30 s is far too long for a test.
+describe('half-open connections are reaped', () => {
+  const REAP_PORT = 31998;
+  const REAP_BASE = `http://127.0.0.1:${REAP_PORT}`;
+  const REAP_WS_URL = `ws://127.0.0.1:${REAP_PORT}`;
+  let reapServer: ChildProcess;
+
+  beforeAll(async () => {
+    reapServer = spawn('node', ['dist/index.js'], {
+      env: {
+        ...process.env,
+        ...NO_TURN,
+        PORT: String(REAP_PORT),
+        ENCRYPTION_KEY: TEST_KEY,
+        HEARTBEAT_MS: '250',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    await waitForListening(reapServer);
+  }, 15_000);
+
+  afterAll(() => {
+    reapServer?.kill('SIGKILL');
+  });
+
+  it('drops a silent client from the room and from its allies\' volumes', async () => {
+    const room = 'r-reap';
+    const watcher = await joinRoomAt(REAP_WS_URL, room, 'Watcher', 'ORDER');
+    // autoPong:false leaves the TCP connection up while the client never
+    // answers a ping — the application-level shape of a half-open socket.
+    // Without the heartbeat nothing ever removes it and this test times out.
+    const ghost = await joinRoomAt(REAP_WS_URL, room, 'Ghost', 'ORDER', { autoPong: false });
+
+    const left = await nextMessage(watcher, 'peer_left', 5000, 'Ghost was never reaped');
+    expect(left.name).toBe('Ghost');
+
+    // The assertion that ties the heartbeat to the harm it exists to prevent:
+    // computeTieredVolumes skips the staleness check for allies, so a zombie
+    // ally is only removed from the volume response by actually leaving room
+    // state. Watcher is on Ghost's team, so this is the ally branch.
+    const result = await computeVolumesAt(REAP_BASE, { x: 0, y: 0 }, room, 'Watcher');
+    expect(result.peerVolumes.Ghost).toBeUndefined();
+
+    ghost.close();
+    watcher.close();
+  }, 20_000);
 });

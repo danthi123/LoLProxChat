@@ -1,6 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
 import { Position, MapType, MAP_DIMENSIONS } from '../core/types';
-import { getMinimapBounds, MinimapBounds } from '../core/map-calibration';
+import {
+  getCaptureBoundsForRect,
+  getMinimapRegionForRect,
+  minimapRegionFitsCapture,
+  MinimapBounds,
+  ScreenRect,
+} from '../core/map-calibration';
 import { ChampionClassifier } from './champion-classifier';
 import {
   computeMaxJumpPx,
@@ -30,8 +36,7 @@ export class TrackingService {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
   readonly captureBounds: MinimapBounds;
-  private screenWidth: number;
-  private screenHeight: number;
+  private gameRect: ScreenRect;
   private mapType: MapType;
   private intervalId: number | null = null;
   private onPositionUpdate: ((pos: Position) => void) | null = null;
@@ -51,10 +56,6 @@ export class TrackingService {
   // Velocity prediction (smoothed over recent frames)
   private velocityX = 0;
   private velocityY = 0;
-
-  // Known peer positions in region-relative pixel coordinates (from signaling broadcasts)
-  // Used as soft penalty: blobs near a known peer are less likely to be "self"
-  private peerPixelPositions: { x: number; y: number }[] = [];
 
   // Frame counter during SCANNING (warmup before lock-on)
   private scanFrameCount = 0;
@@ -90,15 +91,19 @@ export class TrackingService {
   private lastMovementMs = 0;
   private static readonly TUNED_FPS = 8;
 
+  // Repeated capture failures are logged at most once per distinct message
+  // per 5s — see the tick's catch handler.
+  private lastCaptureError = '';
+  private lastCaptureErrorMs = 0;
+
   // Diagnostics
   private lockedTickCount = 0;
   private diagCounter = 0;
   private scanFps = 30;
 
-  constructor(screenWidth: number, screenHeight: number, mapType: MapType) {
-    this.screenWidth = screenWidth;
-    this.screenHeight = screenHeight;
-    this.captureBounds = getMinimapBounds(screenWidth, screenHeight);
+  constructor(gameRect: ScreenRect, mapType: MapType) {
+    this.gameRect = gameRect;
+    this.captureBounds = getCaptureBoundsForRect(gameRect);
     this.mapType = mapType;
     this.canvas = document.createElement('canvas');
     this.canvas.width = this.captureBounds.width;
@@ -203,38 +208,36 @@ export class TrackingService {
     };
   }
 
+  /** The game window's client rect that all capture geometry derives from. */
+  getGameRect(): ScreenRect { return this.gameRect; }
+
   /**
-   * Set the minimap region from League's MinimapScale config value (0.0 - 3.0).
-   * Calibrated from real measurements:
-   *   1080p: scale 0 → 200px, scale 3 → 420px
-   *   1440p: scale 0 → 280px, scale 3 → 560px
-   * Formula: minimapSize = (h*2/9 - 40) + scale * (h/18 + 40/3)
+   * Set the minimap region from League's MinimapScale config value.
+   * The size formula and its calibration live in core/map-calibration.ts.
    */
   setMinimapScaleFromConfig(scale: number): void {
     this.configMinimapScale = scale;
 
-    const h = this.screenHeight;
-    const base = h * 2 / 9 - 40;          // size at scale 0
-    const rate = h / 18 + 40 / 3;         // additional size per scale unit
-    const minimapSize = Math.round(base + scale * rate);
+    const region = getMinimapRegionForRect(this.gameRect, scale, this.captureBounds);
 
-    // The minimap is anchored to the bottom-right of the screen.
-    const screenMinimapX = this.screenWidth - minimapSize;
-    const screenMinimapY = this.screenHeight - minimapSize;
-    const region = {
-      x: screenMinimapX - this.captureBounds.x,
-      y: screenMinimapY - this.captureBounds.y,
-      width: minimapSize,
-      height: minimapSize,
-    };
-
-    this.minimapRegion = region;
-    this.expectedIconDiam = Math.round(minimapSize * 0.087);
-    console.log('[Tracking] Minimap from config: scale=' + scale +
-      ' size=' + minimapSize + 'px' +
-      ' screenPos=(' + screenMinimapX + ',' + screenMinimapY + ')' +
-      ' region=' + JSON.stringify(region) +
-      ' iconDiam=' + this.expectedIconDiam);
+    if (!minimapRegionFitsCapture(region, this.captureBounds)) {
+      // Scanning a region we can only see part of would report systematically
+      // shifted game coordinates — and those get broadcast. Refuse instead.
+      console.error('[Tracking] MinimapScale ' + scale + ' needs a ' + region.width +
+        'px minimap but the capture square is only ' + this.captureBounds.width + 'px' +
+        ' (gameRect=' + JSON.stringify(this.gameRect) + ') — tracking cannot run');
+      this.minimapRegion = null;
+      this.expectedIconDiam = 0;
+    } else {
+      this.minimapRegion = region;
+      this.expectedIconDiam = Math.round(region.width * 0.087);
+      console.log('[Tracking] Minimap from config: scale=' + scale +
+        ' size=' + region.width + 'px' +
+        ' screenPos=(' + (this.captureBounds.x + region.x) + ',' + (this.captureBounds.y + region.y) + ')' +
+        ' gameRect=' + JSON.stringify(this.gameRect) +
+        ' region=' + JSON.stringify(region) +
+        ' iconDiam=' + this.expectedIconDiam);
+    }
 
     this.state = TrackingState.SCANNING;
     this.lastPixelPos = null;
@@ -244,6 +247,13 @@ export class TrackingService {
     this.holdStartMs = 0;
   }
 
+  /**
+   * Manual calibration. `region` is CAPTURE-RELATIVE (the orchestrator subtracts
+   * `captureBounds` before calling), so it is only valid while captureBounds
+   * stays put — which it does today, being fixed at construction. Anything that
+   * later re-anchors captureBounds mid-session must clear `userMinimapRegion`
+   * too, or the stored region will point at the wrong pixels.
+   */
   setMinimapRegion(region: { x: number; y: number; width: number; height: number } | null): void {
     this.userMinimapRegion = region;
     if (region) {
@@ -268,47 +278,6 @@ export class TrackingService {
   setClassifier(classifier: ChampionClassifier): void {
     this.classifier = classifier;
     console.log('[Tracking] Champion classifier set');
-  }
-
-  /**
-   * Update known peer positions (from signaling broadcasts).
-   * Converts game-unit positions to region-relative minimap pixel coordinates.
-   * These are used as a soft penalty: blobs near a known peer are less likely to be "self".
-   */
-  setPeerGamePositions(positions: Position[]): void {
-    if (!this.minimapRegion) {
-      this.peerPixelPositions = [];
-      return;
-    }
-    const dims = MAP_DIMENSIONS[this.mapType];
-    const region = this.minimapRegion;
-    this.peerPixelPositions = positions
-      .filter(p => p.x > 0 && p.y > 0)
-      .map(p => ({
-        x: (p.x / dims.width) * region.width,
-        y: ((dims.height - p.y) / dims.height) * region.height,
-      }));
-  }
-
-  /**
-   * Score how close a blob is to any known peer position.
-   * Returns 0.0 if right on top of a peer, 1.0 if far from all peers.
-   * Used as a soft factor in blob scoring — NOT a hard exclusion.
-   */
-  private peerAvoidanceScore(blob: Blob): number {
-    if (this.peerPixelPositions.length === 0) return 1.0;
-    const threshold = this.expectedIconDiam * 1.5; // within 1.5 icon diameters
-    const thresholdSq = threshold * threshold;
-    let minDistSq = Infinity;
-    for (const pp of this.peerPixelPositions) {
-      const dx = blob.cx - pp.x;
-      const dy = blob.cy - pp.y;
-      const distSq = dx * dx + dy * dy;
-      if (distSq < minDistSq) minDistSq = distSq;
-    }
-    if (minDistSq >= thresholdSq) return 1.0;
-    // Linear falloff: 0 at distance 0, 1 at threshold
-    return Math.sqrt(minDistSq) / threshold;
   }
 
   /**
@@ -883,14 +852,23 @@ export class TrackingService {
         img.src = result.data_url;
       })
       .catch((err) => {
-        console.error('[Tracking] capture_minimap failed:', err);
+        // The tick runs at up to 60 Hz and core/logging.ts turns every
+        // console.error into a flushed file write, so a persistent failure
+        // (bounds off-screen, game gone) must not be logged per frame.
+        const msg = String(err);
+        const now = performance.now();
+        if (msg !== this.lastCaptureError || now - this.lastCaptureErrorMs >= 5000) {
+          this.lastCaptureError = msg;
+          this.lastCaptureErrorMs = now;
+          console.error('[Tracking] capture_minimap failed:', err);
+        }
         this.tickRunning = false;
       });
   }
 
   /**
    * Scan: initial identification of the local player's teal blob.
-   * Uses a unified composite score (classifier, peer avoidance, movement path, ring quality).
+   * Uses a unified composite score (classifier, movement path, ring quality).
    * Only used once at game start (or after respawn). Once locked, we never return to SCANNING —
    * instead we hold position and re-acquire via classifier.
    */
@@ -920,6 +898,10 @@ export class TrackingService {
 
     let bestBlob = tealBlobs[0];
     let bestScore = -Infinity;
+    // Per-term breakdown of the winner, for the lock-on log. Issue #13 is
+    // diagnosed from user logs, and a composite alone cannot tell us whether
+    // the classifier or the white-pixel heuristic chose the blob.
+    let bestTerms = '';
 
     // The classifier only earns its 0.45 weight if it actually discriminated
     // this frame. updateClassifierScores() zeroes every blob when no raw score
@@ -933,18 +915,27 @@ export class TrackingService {
 
     for (let i = 0; i < tealBlobs.length; i++) {
       const b = tealBlobs[i];
-      const peerScore = this.peerAvoidanceScore(b);
       const whiteScore = this.whitePixelScore(b, whiteMask, viewportMask, region.width, region.height);
       const clsScore = clsScores[i];
       const ringScore = Math.min(1, b.pixels * (1 - b.fillRatio) / 200);
 
+      // The divisions renormalize away a peer-avoidance term that held 0.20
+      // (resp. 0.40) here and scored a constant 1.0 for every candidate, since
+      // no peer coordinates have reached a client since the v0.2 server-side-
+      // positions refactor — see computeBlobScore and docs/threat-model.md,
+      // "Why clients are not told ally positions". Dividing rather than
+      // pre-computing the decimals keeps the surviving weights in exactly the
+      // ratios this scoring has always used.
       const score = classifierUsable
-        ? clsScore * 0.45 + whiteScore * 0.25 + peerScore * 0.20 + ringScore * 0.10
-        : peerScore * 0.40 + whiteScore * 0.35 + ringScore * 0.25;
+        ? (clsScore * 0.45 + whiteScore * 0.25 + ringScore * 0.10) / 0.80
+        : (whiteScore * 0.35 + ringScore * 0.25) / 0.60;
 
       if (score > bestScore) {
         bestScore = score;
         bestBlob = b;
+        bestTerms = 'cls=' + clsScore.toFixed(2) +
+          ' white=' + whiteScore.toFixed(2) +
+          ' ring=' + ringScore.toFixed(2);
       }
     }
 
@@ -955,7 +946,7 @@ export class TrackingService {
     // position. The classifier still contributes to the composite score above;
     // it's just no longer a veto. The whole classifier-confidence path is being
     // replaced by template matching in v0.4 (docs/plans/2026-06-03-cv-tracking-research.md).
-    this.lockOnBlob(bestBlob, 'composite(score=' + bestScore.toFixed(2) + ')');
+    this.lockOnBlob(bestBlob, 'composite(score=' + bestScore.toFixed(2) + ' ' + bestTerms + ')');
   }
 
   /** Lock onto a teal blob as the local player */
@@ -1045,7 +1036,6 @@ export class TrackingService {
     const scoreFns: ScoreFns = {
       cls: (b) => this.getClassifierScore(b),
       white: (b) => this.whitePixelScore(b, whiteMask, viewportMask, region.width, region.height),
-      peer: (b) => this.peerAvoidanceScore(b),
     };
 
     // Phase 1: nearest in-range blob with composite scoring. Blobs inside the

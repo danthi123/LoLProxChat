@@ -7,10 +7,21 @@ import { TrackingService, TrackingState } from './tracking';
 import { ChampionClassifier } from './champion-classifier';
 import { VolumeClient } from './volume-client';
 import { getAllyProximity, getCameraListen } from './audio-prefs';
+import { ScreenRect } from '../core/map-calibration';
+import {
+  GameWindowInfoDto,
+  decideGameRectUpdate,
+  resolveGameRect,
+  WARN_QUERY_FAILED,
+} from '../core/game-window';
 import { PeerState } from '../core/types';
 import '../core/window-globals';
 import { isStreamerMode } from '../core/streamer-detect';
 
+
+function rectStr(r: ScreenRect): string {
+  return r.width + 'x' + r.height + '@(' + r.x + ',' + r.y + ')';
+}
 
 export class Orchestrator {
   private gameState: GameStateService;
@@ -31,8 +42,13 @@ export class Orchestrator {
   private lastOverlayBounds: { x: number; y: number; w: number; h: number } | null = null;
   private lastLoggedPosition: { x: number; y: number } | null = null;
   private lastMinimapScale: number | null = null;
-  private dpiScale = 1;
   private lastGameState: TauriGameState | null = null;
+  private gameStatePollRunning = false;
+  private geometryPollRunning = false;
+  /** Panel-facing reason the capture geometry may be wrong, or null. */
+  private geometryWarning: string | null = null;
+  /** Last moved-window rect we logged, so a permanent move isn't logged every poll. */
+  private loggedMovedRect: string | null = null;
 
   // User mute prefs survive across session start/end so the panel's MIC / VOL
   // buttons stay sticky when toggled outside a game (audio is null between
@@ -56,6 +72,10 @@ export class Orchestrator {
   }
 
   private async pollGameState(): Promise<void> {
+    // The LCU round-trip can outrun the 3s timer on a busy machine; overlapping
+    // polls race startSession and endSession against each other.
+    if (this.gameStatePollRunning) return;
+    this.gameStatePollRunning = true;
     try {
       const state: TauriGameState = await this.gameState.pollGameState();
       this.lastGameState = state;
@@ -97,6 +117,8 @@ export class Orchestrator {
       }
     } catch (e) {
       console.error('[LoLProxChat] pollGameState failed:', e);
+    } finally {
+      this.gameStatePollRunning = false;
     }
   }
 
@@ -187,19 +209,29 @@ export class Orchestrator {
 
     // Start tracking service
     try {
-      // Get actual screen resolution from Tauri backend (Win32 GetSystemMetrics)
-      let gameW = window.screen.width;
-      let gameH = window.screen.height;
-      try {
-        const [w, h] = await invoke<[number, number]>('get_screen_size');
-        gameW = w;
-        gameH = h;
-      } catch (e) {
-        console.warn('[LoLProxChat] get_screen_size failed, using window.screen:', e);
-      }
-      this.dpiScale = window.devicePixelRatio || 1;
-      console.log('[LoLProxChat] Resolution: game=' + gameW + 'x' + gameH +
-        ' dpiScale=' + this.dpiScale);
+      // All capture geometry hangs off the League GAME window's client rect:
+      // the minimap is anchored to that corner, which is the primary monitor's
+      // corner only when League runs borderless at native resolution on the
+      // primary display.
+      //
+      // No fabricated fallback if the query fails — set_capture_bounds and
+      // capture_minimap travel the same channel, so a made-up rect would only
+      // buy a wrong-pixels session instead of a legible error.
+      const info = await invoke<GameWindowInfoDto>('get_game_window_info').catch((e) => {
+        this.geometryWarning = WARN_QUERY_FAILED;
+        throw new Error('get_game_window_info failed: ' + e);
+      });
+      const resolved = resolveGameRect(info);
+      this.geometryWarning = resolved.warning;
+      console.log('[LoLProxChat] Game geometry: source=' + resolved.source +
+        ' rect=' + rectStr(resolved.rect) +
+        ' matchedBy=' + (info.matchedBy ?? 'none') +
+        ' title="' + (info.windowTitle ?? '') + '"' +
+        ' process=' + (info.processName ?? 'unknown') +
+        ' virtual=' + rectStr(info.virtualScreen) +
+        ' primary=' + rectStr(info.primaryScreen) +
+        (info.error ? ' error=' + info.error : ''));
+      if (resolved.warning) console.warn('[LoLProxChat] ' + resolved.warning);
 
       // Note: League install dir is resolved Rust-side via the
       // read_league_config_file command (computes the path from the running
@@ -207,7 +239,7 @@ export class Orchestrator {
       // handles the path directly — closing an arbitrary-file-read attack
       // surface that v0.1.30 and earlier had via read_text_file.
 
-      this.tracking = new TrackingService(gameW, gameH, session.mapType);
+      this.tracking = new TrackingService(resolved.rect, session.mapType);
       this.tracking.loadChampionTemplate(session.localPlayer.championName);
 
       // Set capture bounds in Tauri backend
@@ -254,8 +286,8 @@ export class Orchestrator {
       // *target*, not how often the audio gain actually moves.
       this.volumeTickId = window.setInterval(() => this.positionTick(), 100) as unknown as number;
 
-      // Poll game.cfg every 5 seconds for minimap scale changes
-      this.configPollId = window.setInterval(() => this.pollMinimapScale(), 5000) as unknown as number;
+      // Re-check the game window and game.cfg every 5 seconds
+      this.configPollId = window.setInterval(() => this.pollGameGeometry(), 5000) as unknown as number;
 
     } catch (e) {
       console.error('[LoLProxChat] Tracking initialization failed:', e);
@@ -294,12 +326,6 @@ export class Orchestrator {
       isMuted: this.audio.isSelfMuted(),
       isDead: this.session.localPlayer.isDead ?? false,
     });
-
-    // Feed known ally peer positions to tracking for self-identification disambiguation
-    const allyPeerPositions = Array.from(this.peerStates.values())
-      .filter(p => p.team === this.session!.localPlayer.team && p.position.x > 0 && p.position.y > 0)
-      .map(p => p.position);
-    this.tracking.setPeerGamePositions(allyPeerPositions);
 
     // Before CV locks on (SCANNING), pass through all ally audio at full volume (fountain)
     if (this.tracking.getState() === TrackingState.SCANNING) {
@@ -403,7 +429,6 @@ export class Orchestrator {
       summonerName: peer.summonerName,
       championName: peer.championName,
       team: peer.team as 'ORDER' | 'CHAOS',
-      position: existing?.position ?? { x: 0, y: 0 },
       isMuted: peer.isMuted,
       isDead: peer.isDead,
     };
@@ -437,6 +462,11 @@ export class Orchestrator {
     if (!gs || !gs.isLeagueRunning) return 'Waiting for League of Legends';
     if (this.session) {
       const ts = this.tracking?.getState();
+      // A geometry problem is the most useful thing to say while nothing is
+      // locked — including when tracking never started at all, which is what a
+      // failed game-window query leaves behind. Once LOCKED it is moot, so a
+      // warning that was never explicitly cleared cannot pin itself to the panel.
+      if (this.geometryWarning && ts !== 'locked') return this.geometryWarning;
       if (ts === 'scanning') return 'Searching for your champion on the minimap';
       // LOCKED with no peers in the room — empty waiting state handled elsewhere
       return '';
@@ -624,17 +654,50 @@ export class Orchestrator {
   }
 
   /**
-   * Poll game.cfg for MinimapScale changes and update tracking bounds.
+   * 5s housekeeping: refresh the game-window warning the panel shows while
+   * scanning, then pick up MinimapScale changes from game.cfg.
+   *
+   * Re-anchoring capture bounds when the window actually moves is deliberately
+   * NOT wired up — it tears the in-flight capture frame against the canvas and
+   * invalidates any stored calibration, and a mid-game monitor move is rare
+   * enough to cost less than that risk. A moved window is logged and left alone.
    */
-  private pollMinimapScale(): void {
-    this.readMinimapScale((scale) => {
-      if (scale === null || !this.tracking) return;
-      if (scale !== this.lastMinimapScale) {
+  private async pollGameGeometry(): Promise<void> {
+    // The two awaits below can outrun the 5s timer; two overlapping polls would
+    // each be free to re-apply the minimap scale, which resets tracking to
+    // SCANNING and drops the lock.
+    if (this.geometryPollRunning) return;
+    this.geometryPollRunning = true;
+    try {
+      const current = this.tracking?.getGameRect() ?? null;
+      if (current) {
+        let info: GameWindowInfoDto | null = null;
+        try {
+          info = await invoke<GameWindowInfoDto>('get_game_window_info');
+        } catch (e) {
+          console.warn('[LoLProxChat] get_game_window_info failed:', e);
+        }
+        const decision = decideGameRectUpdate(current, info);
+        this.geometryWarning = decision.warning;
+        if (decision.action === 'apply' && decision.rect) {
+          const moved = rectStr(decision.rect);
+          if (moved !== this.loggedMovedRect) {
+            this.loggedMovedRect = moved;
+            console.warn('[LoLProxChat] League window moved to ' + moved +
+              ' — capture stays on ' + rectStr(current) + ' until the next game');
+          }
+        }
+      }
+
+      const scale = await new Promise<number | null>((resolve) => this.readMinimapScale(resolve));
+      if (scale !== null && this.tracking && scale !== this.lastMinimapScale) {
         console.log('[LoLProxChat] MinimapScale changed:', this.lastMinimapScale, '->', scale);
         this.lastMinimapScale = scale;
         this.tracking.setMinimapScaleFromConfig(scale);
       }
-    });
+    } finally {
+      this.geometryPollRunning = false;
+    }
   }
 
   private endSession(): void {
@@ -662,6 +725,8 @@ export class Orchestrator {
     // Allow re-positioning on the next session
     this.lastOverlayBounds = null;
     this.lastOverlayRepositionTime = 0;
+    this.geometryWarning = null;
+    this.loggedMovedRect = null;
 
     // Hide the scanner window so it doesn't float wherever the minimap last was
     invoke('hide_scanner').catch(() => { /* non-fatal */ });

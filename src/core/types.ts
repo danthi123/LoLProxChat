@@ -15,7 +15,6 @@ export interface PeerState {
   summonerName: string;
   championName: string;
   team: 'ORDER' | 'CHAOS';
-  position: Position;
   isMuted: boolean;
   isDead: boolean;
 }

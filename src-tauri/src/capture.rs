@@ -1,8 +1,11 @@
 use base64::Engine;
 use std::sync::Mutex;
 use tauri::State;
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
 
 pub struct CaptureState {
     pub bounds: Mutex<Option<CaptureBounds>>,
@@ -42,6 +45,16 @@ pub fn capture_minimap(state: State<CaptureState>) -> Result<CaptureResult, Stri
 
     if width <= 0 || height <= 0 {
         return Err("Invalid capture dimensions".into());
+    }
+
+    // Bounds off the virtual screen BitBlt to black rather than failing, which
+    // downstream is indistinguishable from "the minimap isn't on screen". Say so.
+    let virt = virtual_screen_bounds();
+    if !rects_overlap((bounds.x, bounds.y, width, height), virt) {
+        return Err(format!(
+            "Capture bounds ({},{} {}x{}) lie outside the virtual screen ({},{} {}x{})",
+            bounds.x, bounds.y, width, height, virt.0, virt.1, virt.2, virt.3
+        ));
     }
 
     let pixels = capture_screen_region(bounds.x, bounds.y, width, height)
@@ -96,7 +109,11 @@ pub fn capture_minimap(state: State<CaptureState>) -> Result<CaptureResult, Stri
 /// Returns BGRA pixel data (top-down, 4 bytes per pixel).
 fn capture_screen_region(x: i32, y: i32, width: i32, height: i32) -> Result<Vec<u8>, String> {
     unsafe {
-        let hwnd = GetDesktopWindow();
+        // GetDC(NULL) is the DC for the whole VIRTUAL screen. The desktop
+        // window's DC is clipped to the primary monitor, so a game on a second
+        // display — source coordinates that are negative or past the primary's
+        // width — cannot be read through it.
+        let hwnd = HWND(std::ptr::null_mut());
         let hdc_screen = GetDC(hwnd);
         if hdc_screen.is_invalid() {
             return Err("GetDC failed".into());
@@ -165,5 +182,55 @@ fn capture_screen_region(x: i32, y: i32, width: i32, height: i32) -> Result<Vec<
         }
 
         Ok(pixels)
+    }
+}
+
+/// (x, y, width, height) of the virtual screen — the union of every monitor.
+/// Origin is the primary monitor's top-left, so x/y are negative when a display
+/// sits left of / above it.
+fn virtual_screen_bounds() -> (i32, i32, i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
+}
+
+fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rects_overlap;
+
+    // A capture square on a monitor left of the primary one has a negative
+    // origin and must still count as on-screen — rejecting it would break the
+    // very case the virtual-screen DC exists to serve.
+    #[test]
+    fn negative_origin_inside_the_virtual_screen_overlaps() {
+        let virt = (-1920, 0, 3840, 1080);
+        assert!(rects_overlap((-378, 702, 378, 378), virt));
+    }
+
+    // A minimized window's (-32000, -32000) rect, and a rect past the right
+    // edge, are the two shapes that used to BitBlt silently to black.
+    #[test]
+    fn rects_fully_outside_do_not_overlap() {
+        let virt = (0, 0, 1920, 1080);
+        assert!(!rects_overlap((-32378, -32378, 378, 378), virt));
+        assert!(!rects_overlap((1920, 702, 378, 378), virt));
+        assert!(!rects_overlap((1542, 1080, 378, 378), virt));
+    }
+
+    // Touching edges share no pixels, one pixel of overlap does.
+    #[test]
+    fn overlap_is_exclusive_at_the_far_edge() {
+        let virt = (0, 0, 1920, 1080);
+        assert!(!rects_overlap((-378, 0, 378, 100), virt));
+        assert!(rects_overlap((-377, 0, 378, 100), virt));
     }
 }
