@@ -12,6 +12,8 @@
     "refresh-model": "node scripts/refresh-model.mjs",
     "train-model": "node scripts/refresh-model.mjs --skip-scrape",
     "test": "jest",
+    "test:e2e": "npm --prefix server run build && jest --config jest.e2e.config.js",
+    "test:all": "npm test && npm run test:e2e",
     "test:watch": "jest --watch"
   },
   "keywords": [],

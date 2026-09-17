@@ -9,7 +9,7 @@ import {
 import { SignalingService, SignalMessage, PositionBroadcast } from './signaling';
 import { AudioService } from './audio';
 import { TrackingService, TrackingState } from './tracking';
-import { ChampionClassifier } from './champion-classifier';
+import { BlobScorer, ChampionClassifier } from './champion-classifier';
 import { VolumeClient } from './volume-client';
 import { getAllyProximity, getCameraListen } from './audio-prefs';
 import { ScreenRect } from '../core/map-calibration';
@@ -19,7 +19,7 @@ import {
   resolveGameRect,
   WARN_QUERY_FAILED,
 } from '../core/game-window';
-import { PeerState, Player } from '../core/types';
+import { MapType, PeerState, Player } from '../core/types';
 import '../core/window-globals';
 import { isStreamerMode } from '../core/streamer-detect';
 import {
@@ -34,7 +34,60 @@ function rectStr(r: ScreenRect): string {
   return r.width + 'x' + r.height + '@(' + r.x + ',' + r.y + ')';
 }
 
+/** Interval periods the orchestrator drives its three loops at, in ms. */
+export interface OrchestratorTimings {
+  gameStatePollMs: number;
+  volumeTickMs: number;
+  configPollMs: number;
+}
+
+/**
+ * Everything the orchestrator builds that reaches outside this process — the
+ * Tauri commands behind game state and tracking, the microphone, the signaling
+ * socket, the ONNX model — named so a test can substitute it.
+ *
+ * Factories rather than instances because a session builds its audio, tracking
+ * and volume client fresh on every game start and drops them on game end; an
+ * injected instance could not survive that.
+ *
+ * Every default below is the exact expression `startSession` used inline
+ * before, so `new Orchestrator()` is unchanged for background.ts.
+ */
+export interface OrchestratorDeps {
+  createGameState(): GameStateService;
+  createSignaling(): SignalingService;
+  createAudio(signaling: SignalingService, localName: string): AudioService;
+  createTracking(gameRect: ScreenRect, mapType: MapType): TrackingService;
+  /** Resolves null when no scorer is available; tracking runs without one. */
+  createClassifier(championName: string): Promise<BlobScorer | null>;
+  createVolumeClient(): VolumeClient;
+  timings: OrchestratorTimings;
+}
+
+export function defaultDeps(): OrchestratorDeps {
+  return {
+    createGameState: () => new GameStateService(),
+    createSignaling: () => new SignalingService(),
+    createAudio: (signaling, localName) => new AudioService(signaling, localName),
+    createTracking: (gameRect, mapType) => new TrackingService(gameRect, mapType),
+    createClassifier: async (championName) => {
+      const classifier = new ChampionClassifier();
+      await classifier.load(
+        '../models/champion_classifier.onnx',
+        '../models/champion_labels.json',
+        championName,
+      );
+      return classifier;
+    },
+    createVolumeClient: () => new VolumeClient(),
+    // The volume tick is 10 Hz because GainNode smoothing turns those steps
+    // into a ramp; the other two are housekeeping.
+    timings: { gameStatePollMs: 3000, volumeTickMs: 100, configPollMs: 5000 },
+  };
+}
+
 export class Orchestrator {
+  private readonly deps: OrchestratorDeps;
   private gameState: GameStateService;
   private signaling: SignalingService;
   private audio: AudioService | null = null;
@@ -75,19 +128,38 @@ export class Orchestrator {
   private selfMutedPref = false;
   private muteAllPref = false;
 
-  constructor() {
-    this.gameState = new GameStateService();
-    this.signaling = new SignalingService();
+  constructor(deps: Partial<OrchestratorDeps> = {}) {
+    this.deps = { ...defaultDeps(), ...deps };
+    this.gameState = this.deps.createGameState();
+    this.signaling = this.deps.createSignaling();
   }
 
   start(): void {
     console.log('[LoLProxChat] Orchestrator.start() called');
 
-    // Poll Tauri backend for game state every 3 seconds
-    this.gameStatePollId = window.setInterval(() => this.pollGameState(), 3000) as unknown as number;
+    // Poll Tauri backend for game state (3s by default — see defaultDeps)
+    this.gameStatePollId = window.setInterval(
+      () => this.pollGameState(),
+      this.deps.timings.gameStatePollMs,
+    ) as unknown as number;
 
     // Also poll immediately on start
     this.pollGameState();
+  }
+
+  /**
+   * Counterpart to start(): drop the game-state poll and tear down any live
+   * session. The app itself never stops short of process exit, so this exists
+   * for anything that owns an orchestrator with a shorter life than the
+   * process — today that is the session e2e suite, which would otherwise leave
+   * a poll running against a server it has already shut down.
+   */
+  stop(): void {
+    if (this.gameStatePollId !== null) {
+      clearInterval(this.gameStatePollId);
+      this.gameStatePollId = null;
+    }
+    if (this.session) this.endSession();
   }
 
   private async pollGameState(): Promise<void> {
@@ -273,7 +345,7 @@ export class Orchestrator {
     console.log('[LoLProxChat] Starting session: room=' + session.roomId);
 
     // Initialize audio (mic + WebRTC)
-    this.audio = new AudioService(this.signaling, this.localSummonerName);
+    this.audio = this.deps.createAudio(this.signaling, this.localSummonerName);
     try {
       await this.audio.initMicrophone();
       console.log('[LoLProxChat] Microphone initialized');
@@ -307,7 +379,7 @@ export class Orchestrator {
       // Summoner's Rift-scaled coordinates for a map that isn't Summoner's
       // Rift, and better for the user than losing voice chat outright.
       console.warn('[LoLProxChat] ' + session.proximityDisabledReason);
-      this.volumeTickId = window.setInterval(() => this.positionTick(), 100) as unknown as number;
+      this.volumeTickId = this.startVolumeTick();
       this.broadcastOverlayState();
       return;
     }
@@ -344,20 +416,15 @@ export class Orchestrator {
       // handles the path directly — closing an arbitrary-file-read attack
       // surface that v0.1.30 and earlier had via read_text_file.
 
-      this.tracking = new TrackingService(resolved.rect, session.mapType);
+      this.tracking = this.deps.createTracking(resolved.rect, session.mapType);
       this.tracking.loadChampionTemplate(session.localPlayer.championName);
 
       // Set capture bounds in Tauri backend
       await this.tracking.initCaptureBounds();
 
       // Load champion classifier (async, non-blocking — tracking works without it)
-      const classifier = new ChampionClassifier();
-      classifier.load(
-        '../models/champion_classifier.onnx',
-        '../models/champion_labels.json',
-        session.localPlayer.championName,
-      ).then(() => {
-        if (this.tracking) {
+      this.deps.createClassifier(session.localPlayer.championName).then((classifier) => {
+        if (classifier && this.tracking) {
           this.tracking.setClassifier(classifier);
           console.log('[LoLProxChat] Champion classifier loaded');
         }
@@ -383,22 +450,32 @@ export class Orchestrator {
       // Volume client speaks the v0.2 /compute-volumes shape — peer positions
       // come from server-side room state populated by `coords` WSS messages,
       // not from peer-to-peer data channels.
-      this.volumeClient = new VolumeClient();
+      this.volumeClient = this.deps.createVolumeClient();
 
       // Start volume computation tick (~10 Hz). GainNode setTargetAtTime
       // smoothing on the peer connections turns the discrete steps into a
       // continuous ramp; the tick rate just sets how often we refresh the
       // *target*, not how often the audio gain actually moves.
-      this.volumeTickId = window.setInterval(() => this.positionTick(), 100) as unknown as number;
+      this.volumeTickId = this.startVolumeTick();
 
-      // Re-check the game window and game.cfg every 5 seconds
-      this.configPollId = window.setInterval(() => this.pollGameGeometry(), 5000) as unknown as number;
+      // Re-check the game window and game.cfg every few seconds
+      this.configPollId = window.setInterval(
+        () => this.pollGameGeometry(),
+        this.deps.timings.configPollMs,
+      ) as unknown as number;
 
     } catch (e) {
       console.error('[LoLProxChat] Tracking initialization failed:', e);
     }
 
     // Overlay is managed by Tauri window configuration — no manual window open needed
+  }
+
+  private startVolumeTick(): number {
+    return window.setInterval(
+      () => this.positionTick(),
+      this.deps.timings.volumeTickMs,
+    ) as unknown as number;
   }
 
   private async positionTick(): Promise<void> {

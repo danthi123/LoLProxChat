@@ -26,6 +26,11 @@ jobs:
       - run: npm ci
       - name: Type-check
         run: npx tsc --noEmit
+      - name: Type-check tests
+        # tsconfig.json covers only src/, so until this step existed not one
+        # test file was ever type-checked. tsconfig.test.json widens rootDir to
+        # the repo root, which is what stops TS6059 firing per test file.
+        run: npx tsc -p tsconfig.test.json --noEmit
       - name: Build
         run: npm run build:prod
       - name: Test
@@ -49,3 +54,41 @@ jobs:
         run: npm run build
       - name: Test
         run: npm test
+
+  # Two Orchestrator-level clients against the real built server. Separate from
+  # the two jobs above, and non-blocking, so a slow or flaky session test can
+  # never mask the fast signal — the lifecycle transitions it would otherwise be
+  # the only cover for are duplicated in the fast suite on purpose.
+  #
+  # node 24, unlike the 20 the other jobs use, because the suite drives the real
+  # SignalingService over the WebSocket client that only became a stable global
+  # in node 22 — which is what lets it run with no new dependency in
+  # package.json at all.
+  #
+  # There is deliberately no cargo job. src-tauri depends on the `windows` crate
+  # unconditionally with no cfg gating anywhere in src-tauri/src, so it cannot
+  # build on ubuntu; and `cargo test` on windows-latest would additionally need
+  # `npm ci && npm run build:prod` first, because tauri::generate_context!()
+  # resolves frontendDist: "../dist" at compile time. The Rust #[cfg(test)]
+  # modules therefore run locally on Windows only — see CONTRIBUTING.md.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Install server dependencies
+        run: npm ci
+        working-directory: server
+      - name: Build server
+        # global-setup hard-fails on a dist older than src rather than testing
+        # stale code, so this step is a prerequisite, not a convenience.
+        run: npm run build
+        working-directory: server
+      - name: End-to-end session tests
+        run: npx jest --config jest.e2e.config.js

@@ -1,4 +1,5 @@
 import * as ort from 'onnxruntime-web';
+import type { CaptureFrame } from '../core/capture-frame';
 
 // Threads stay at 1: onnxruntime-web needs SharedArrayBuffer, which needs the
 // page to be cross-origin isolated, and the WebView2 custom-protocol origin
@@ -115,7 +116,26 @@ export function localClassProbs(
   return scores;
 }
 
-export class ChampionClassifier {
+/** A blob's crop box in capture-frame pixels, padded by the caller. */
+export interface BlobCropBox {
+  cropX: number;
+  cropY: number;
+  cropW: number;
+  cropH: number;
+}
+
+/**
+ * What the tracker needs of a classifier. Taking a CaptureFrame rather than an
+ * ImageData keeps the whole CV pipeline free of DOM types: the crop path is the
+ * only stage that needs a canvas, so the conversion belongs on this side of the
+ * interface, not in the caller.
+ */
+export interface BlobScorer {
+  isLoaded(): boolean;
+  scoreBlobsForLocalChampion(frame: CaptureFrame, blobs: BlobCropBox[]): Promise<number[]>;
+}
+
+export class ChampionClassifier implements BlobScorer {
   private session: ort.InferenceSession | null = null;
   private labelMap: Record<string, string> = {};
   private localClassIndex = -1;
@@ -220,14 +240,19 @@ export class ChampionClassifier {
    * the local player's champion (0.0 = no match, 1.0 = perfect match).
    */
   async scoreBlobsForLocalChampion(
-    imageData: ImageData,
-    blobs: Array<{ cropX: number; cropY: number; cropW: number; cropH: number }>,
+    frame: CaptureFrame,
+    blobs: BlobCropBox[],
   ): Promise<number[]> {
     // Before any canvas work: an unloaded classifier must not pay for N crops.
     if (!this.session || this.localClassIndex < 0) {
       return blobs.map(() => 0);
     }
     if (blobs.length === 0) return [];
+
+    // The canvas will not take a raw RGBA buffer, and putImageData is how the
+    // frame gets in. CaptureFrame's data is backed by a plain ArrayBuffer for
+    // exactly this — see core/capture-frame.ts.
+    const imageData = new ImageData(frame.data, frame.width, frame.height);
 
     // Prepare source canvas (reuse, resize only if dimensions changed)
     if (!this.srcCanvas || this.srcCanvas.width !== imageData.width || this.srcCanvas.height !== imageData.height) {

@@ -33,6 +33,7 @@ The heartbeat is what makes the ally exemption safe. Without it, a player whose 
 
 - The `/compute-volumes` response is `{ "PeerName": volume, ... }` where each volume is a number between 0 and 1.
 - No coordinate data leaves the server in either direction of `/compute-volumes`.
+- This is asserted on every run of the end-to-end suite, over everything both clients receive rather than over the message shapes that exist today (`tests/e2e/compliance.e2e.test.ts`). The one channel it cannot police is `signal`, whose payload (`msg.blob` / `msg.payload`) the server relays between clients opaquely: the test can only see what our own client put in it, so what keeps that channel clean is the client code, not this assertion.
 
 ### Why clients are not told ally positions
 
@@ -45,7 +46,7 @@ Forwarding ally coordinates to same-team clients has been proposed as a fix for 
 - **The design is also unsound on its own terms.** The positions forwarded would be other clients' CV output, not ground truth. If an ally's tracker has locked onto *your* icon — the #13 failure itself — the server would tell your tracker "an ally is standing where you are", and your tracker would hop off your own blob. Two clients that have swapped identities are a stable fixed point of a mutual avoid-each-other rule, with no observation available to break the tie, so the feature can convert one client's transient error into a locked-in mutual one.
 - **The near-miss variants inherit the same defect.** A server-side avoidance *oracle* (client posts candidate points, server returns 0..1 scores and never coordinates) keeps the letter of "volumes, not positions" but hands a spoofer an "is an enemy within hearing range of this arbitrary point" probe over the whole map. A team-scoped exchange over the WebRTC data channels is worse still: any client in the room can open a data channel and assert it is a teammate, and it reinstates the client-to-client position relay the v0.2 refactor removed.
 
-The client-side remnant of this idea — a peer-avoidance penalty in the tracker's blob scoring — has been deleted. It had scored a constant for every candidate since v0.2, because the coordinates it needed already stopped arriving. Self-identification is instead being addressed locally, by per-game template matching against the real champion icons (Phase B of [`docs/plans/2026-06-03-cv-tracking-research.md`](plans/2026-06-03-cv-tracking-research.md)), which discriminates allies from self directly and needs no peer data at all.
+The client-side remnant of this idea — a peer-avoidance penalty in the tracker's blob scoring — has been deleted. It had scored a constant for every candidate since v0.2, because the coordinates it needed already stopped arriving. Self-identification is instead being addressed locally, by per-game template matching against the real champion icons (Phase B of [`docs/plans/2026-06-03-cv-tracking-research.md`](plans/2026-06-03-cv-tracking-research.md)), which discriminates allies from self directly and needs no peer data at all. Reintroducing it would now fail `tests/e2e/compliance.e2e.test.ts`, which is deliberate: that test exists so a future "fix" for #13 cannot ship peer coordinates to clients without someone having to delete an assertion that says why not.
 
 ## What the design does not protect
 

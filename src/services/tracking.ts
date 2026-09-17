@@ -9,7 +9,8 @@ import {
   MinimapBounds,
   ScreenRect,
 } from '../core/map-calibration';
-import { ChampionClassifier } from './champion-classifier';
+import { BlobScorer } from './champion-classifier';
+import { FrameSource, TauriFrameSource } from './frame-source';
 import {
   computeMaxJumpPx,
   computeReacquireThreshold,
@@ -38,7 +39,10 @@ export class TrackingService {
   readonly captureBounds: MinimapBounds;
   private gameRect: ScreenRect;
   private mapType: MapType;
-  private intervalId: number | null = null;
+  private frameSource: FrameSource;
+  // Node and the DOM disagree on what setInterval hands back, and tests/cv runs
+  // the real scan loop under node.
+  private intervalId: ReturnType<typeof setInterval> | null = null;
   private onPositionUpdate: ((pos: Position) => void) | null = null;
 
   // Minimap region (detected or set by calibration/config)
@@ -65,7 +69,7 @@ export class TrackingService {
   private lastDebugImageMs = 0;
 
   // Champion classifier (ONNX model)
-  private classifier: ChampionClassifier | null = null;
+  private classifier: BlobScorer | null = null;
   // Cached classifier scores per blob (refreshed periodically, not every frame)
   private classifierScores: Map<string, number> = new Map();
   // EMA-smoothed classifier scores to dampen single-frame misclassifications
@@ -103,10 +107,11 @@ export class TrackingService {
   private diagCounter = 0;
   private scanFps = 30;
 
-  constructor(gameRect: ScreenRect, mapType: MapType) {
+  constructor(gameRect: ScreenRect, mapType: MapType, frameSource: FrameSource = new TauriFrameSource()) {
     this.gameRect = gameRect;
     this.captureBounds = getCaptureBoundsForRect(gameRect);
     this.mapType = mapType;
+    this.frameSource = frameSource;
   }
 
   /** Send capture bounds to the Tauri backend for screen capture cropping */
@@ -273,7 +278,7 @@ export class TrackingService {
     console.log('[Tracking] Using color filter + blob detection');
   }
 
-  setClassifier(classifier: ChampionClassifier): void {
+  setClassifier(classifier: BlobScorer): void {
     this.classifier = classifier;
     console.log('[Tracking] Champion classifier set');
   }
@@ -290,10 +295,6 @@ export class TrackingService {
   ): Promise<void> {
     if (!this.classifier || !this.classifier.isLoaded()) return;
 
-    // The classifier crops through a canvas, which is the only consumer in the
-    // pipeline that needs a real ImageData rather than the raw frame.
-    const imageData = new ImageData(frame.data, frame.width, frame.height);
-
     const crops = tealBlobs.map(b => ({
       cropX: region.x + b.minX - 1,
       cropY: region.y + b.minY - 1,
@@ -302,7 +303,7 @@ export class TrackingService {
     }));
 
     try {
-      const rawScores = await this.classifier.scoreBlobsForLocalChampion(imageData, crops);
+      const rawScores = await this.classifier.scoreBlobsForLocalChampion(frame, crops);
 
       // Normalize scores across blobs: the model may have low absolute confidence
       // but still correctly RANK blobs. Normalizing makes relative differences useful.
@@ -410,7 +411,7 @@ export class TrackingService {
     this.lastClassifierRunMs = 0;
     this.lastClassifierLogMs = 0;
     this.tickRunning = false;
-    this.intervalId = window.setInterval(() => this.tick(), intervalMs);
+    this.intervalId = setInterval(() => { void this.tick(); }, intervalMs);
   }
 
   stop(): void {
@@ -765,8 +766,16 @@ export class TrackingService {
 
   // --- Main tick ---
 
-  private tick(): void {
+  /**
+   * One scan frame. Public, and returns its promise, so a caller can step the
+   * pipeline deterministically a frame at a time (tests/cv); in the app the
+   * interval installed by start() is the only caller and ignores the promise.
+   */
+  async tick(): Promise<void> {
     if (this.state === TrackingState.DEAD) {
+      // Ahead of the tick guard and the dt bookkeeping on purpose: there is
+      // nothing on screen to track, so a dead champion should cost no capture —
+      // and the overlay still needs a position every tick while you wait.
       if (this.deathPosition && this.onPositionUpdate) {
         this.onPositionUpdate(this.deathPosition);
       }
@@ -782,23 +791,21 @@ export class TrackingService {
     this.lastDtSec = (tickNow - this.lastTickMs) / 1000;
     this.lastTickMs = tickNow;
 
-    invoke<ArrayBuffer>('capture_minimap')
-      .then((buffer) => {
-        try {
-          this.processFrame(buffer);
-        } catch (err) {
-          // Kept separate from the capture failure below: "the backend couldn't
-          // grab the screen" and "the frame it grabbed isn't one we can use"
-          // have nothing in common except the symptom.
-          this.logCaptureError('[Tracking] frame decode failed:', err);
-        } finally {
-          this.tickRunning = false;
-        }
-      })
-      .catch((err) => {
-        this.logCaptureError('[Tracking] capture_minimap failed:', err);
-        this.tickRunning = false;
-      });
+    try {
+      const buffer = await this.frameSource.capture();
+      try {
+        this.processFrame(buffer);
+      } catch (err) {
+        // Kept separate from the capture failure below: "the backend couldn't
+        // grab the screen" and "the frame it grabbed isn't one we can use"
+        // have nothing in common except the symptom.
+        this.logCaptureError('[Tracking] frame decode failed:', err);
+      }
+    } catch (err) {
+      this.logCaptureError('[Tracking] capture_minimap failed:', err);
+    } finally {
+      this.tickRunning = false;
+    }
   }
 
   /**

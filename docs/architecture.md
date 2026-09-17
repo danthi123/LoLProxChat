@@ -165,9 +165,9 @@ Manual checks (Settings → Updates → CHECK) skip the launch delay and the Aut
 
 | Service | Responsibility |
 |---|---|
-| `Orchestrator` | Game-state polling, session lifecycle, broadcast cadence, scanning-mode passthrough, peer state registry. The wiring layer between everything else. |
-| `TrackingService` | Minimap CV pipeline. State machine described above. Constructed with the League game window's client rect (a `ScreenRect`), not a width/height pair — the capture square is derived from that rect's origin and height. |
-| `ChampionClassifier` | Champion classifier (a small CNN run via ONNX Runtime Web) — the champion-identity signal for tracking. |
+| `Orchestrator` | Game-state polling, session lifecycle, broadcast cadence, scanning-mode passthrough, peer state registry. The wiring layer between everything else. Its collaborators and its three loop periods come from an `OrchestratorDeps` record with a `defaultDeps()` fallback, so `new Orchestrator()` — the app's only construction — builds exactly what it always did, while tests can substitute fakes. `stop()` is the counterpart to `start()`; the app has no shutdown path that calls it. |
+| `TrackingService` | Minimap CV pipeline. State machine described above. Constructed with the League game window's client rect (a `ScreenRect`), not a width/height pair — the capture square is derived from that rect's origin and height. Frames come from an injectable `FrameSource` (default: the Tauri capture command) and the identity signal from a `BlobScorer` (default: `ChampionClassifier`), which is what lets `tests/cv/` drive the real pipeline over synthesized minimaps. |
+| `ChampionClassifier` | Champion classifier (a small CNN run via ONNX Runtime Web) — the champion-identity signal for tracking. Implements `BlobScorer`, and owns the one canvas-dependent step in the scan path: it builds the `ImageData` its crop packing needs, so every stage between capture and scoring is DOM-free plain array work. |
 | `AudioService` | WebRTC audio + per-peer volume control. Input mode toggle (Always Open / PTT). Mic acquisition with selected device. Output via shared `AudioContext`. Noise suppression handled natively by Chromium. |
 | `SignalingService` | WebSocket presence + signal relay. Auto-reconnect with exponential backoff, except on close code 4000 (the room+name was taken over by another connection), which is terminal. |
 | `PeerConnection` | Single peer's `RTCPeerConnection` wrapper. EMA-smoothed gain, periodic `getStats()` logging, ICE-restart on failure, ICE-transport-policy reading from privacy settings. |
@@ -184,12 +184,22 @@ Not services in their own right — small support modules consumed by the servic
 | Module | Used by | Purpose |
 |---|---|---|
 | `src/services/tracking-helpers.ts` | `TrackingService` | Pure scoring/selection math used by `handleLocked`. Unit-tested in isolation. |
+| `src/services/frame-source.ts` | `tracking.ts` | `FrameSource` — one capture, returned as the raw wire bytes `capture.rs` writes. Deliberately not a decoded frame: decoding, the header/bounds agreement check and the bounds resync stay in the tracker, so a test frame source exercises them too. |
 | `src/services/blob-types.ts` | `tracking.ts`, `tracking-helpers.ts` | Shared `Blob` interface. Lives outside `tracking.ts` so the helpers can import it without a circular reach back. |
 | `src/core/capture-frame.ts` | `tracking.ts` | Decodes the raw `capture_minimap` byte frame into a `CaptureFrame` (`width`, `height`, `Uint8ClampedArray`). DOM-free — it is a view over the transferred buffer, not an `ImageData`. |
 | `src/core/identity.ts` | `game-state.ts`, `orchestrator.ts`, `streamer-detect.ts` | Reads whichever Riot ID fields a patch of League provides into one comparable `Identity`, and matches the local player against the roster. |
 | `src/core/map-detect.ts` | `game-state.ts` | Resolves the map from `mapNumber` / `mapName` / `gameMode`, or refuses. A refusal is what disables proximity rather than defaulting to Summoner's Rift geometry. |
 | `src/core/streamer-detect.ts` | `game-state.ts`, `orchestrator.ts` | Streamer-mode heuristic (displayed name equals champion name, and, where the roster carries tag lines, no tag line on that player). |
 | `src/core/window-globals.ts` | `overlay.ts`, `background.ts`, `orchestrator.ts` | `declare global { interface Window { … } }` for the two app-specific properties used as a cross-module bus (`__proxchatRunUpdateCheck`, `__lolproxchat_debug_enabled`). Imported side-effect-only. |
+
+### Where the seams are, and why
+
+Two of the services above take their collaborators as constructor arguments rather than building them inline, and both defaults are exactly the expression that used to be inline — the app constructs them the same way it always did.
+
+- `TrackingService(gameRect, mapType, frameSource?)` plus `setClassifier(scorer)` is what makes the CV pipeline runnable outside the WebView. Everything from `decodeCaptureFrame` down is plain array work, so `tests/cv/` feeds synthesized minimaps through the real colour classification, blob detection, scoring and state machine and checks the reported game coordinates against known ground truth.
+- `Orchestrator(deps?)` is what makes the session lifecycle runnable without I/O: the game-state transition table, interval teardown and audio-monitor cleanup run under fake timers in the fast suite, and `tests/e2e/` stands two whole clients up against the real built signaling server.
+
+See [`CONTRIBUTING.md`](../CONTRIBUTING.md) § "Testing" for what each suite covers, and [`docs/manual-test-checklist.md`](manual-test-checklist.md) for what only a real match on Windows can prove.
 
 ## Key Rust commands (under `src-tauri/src/`)
 

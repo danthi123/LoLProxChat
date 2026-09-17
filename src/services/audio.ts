@@ -153,9 +153,23 @@ export class AudioService {
   // PTT state
   private pttHeld = false;
 
-  constructor(signaling: SignalingService, localName: string) {
+  /**
+   * How a peer connection is built. The default is the real one; tests/e2e
+   * substitutes a fake so two orchestrators can complete the real signaling
+   * handshake — through the real server — without WebRTC. Every creation path
+   * funnels through `createPeer`, so this one seam covers both the
+   * connectToPeer and incoming-offer routes.
+   */
+  private peerFactory: (remoteName: string) => Promise<PeerConnection>;
+
+  constructor(
+    signaling: SignalingService,
+    localName: string,
+    peerFactory: (remoteName: string) => Promise<PeerConnection> = PeerConnection.create,
+  ) {
     this.signaling = signaling;
     this.localName = localName;
+    this.peerFactory = peerFactory;
   }
 
   async initMicrophone(): Promise<void> {
@@ -302,7 +316,7 @@ export class AudioService {
   ): Promise<PeerConnection> {
     console.log('[Audio] Connecting to peer:', remoteName);
     try {
-      const peer = await PeerConnection.create(remoteName);
+      const peer = await this.peerFactory(remoteName);
       // The connection can have become unwanted while we awaited the ICE fetch
       // — the peer left, or the session ended. Both drop the claim, and a peer
       // inserted after that point is one nobody will ever close.

@@ -37,6 +37,10 @@ npm test
 # Run server tests
 cd server && npm test
 
+# Run the end-to-end session tests (builds the server, then spawns it on :31998).
+# Excluded from `npm test`; `npm run test:all` runs the fast suite and this one.
+npm run test:e2e
+
 # Run Rust tests (Windows only — the crate links Win32 bindings). Needs a
 # frontend build first, because tauri::generate_context!() resolves ../dist
 # at compile time.
@@ -70,7 +74,8 @@ server/                — Node WebSocket + HTTP signaling server
 ├── src/              — Rooms, signaling handler, volume math, TURN credential issuance
 └── tests/            — vitest unit tests
 
-tests/                 — Client jest tests (separate roots: tests/core, tests/services, tests/integration)
+tests/                 — Client jest tests (separate roots: tests/core, tests/services, tests/integration,
+                         tests/overlay, tests/cv, and tests/e2e — the last excluded from `npm test`)
 docs/                  — User guide, architecture, self-hosting, threat model, compliance
 ```
 
@@ -83,10 +88,11 @@ docs/                  — User guide, architecture, self-hosting, threat model,
 
 ## Testing
 
-- **Client tests** live under `tests/` (separate root from `src/`). Run with `npm test`. The 307 tests cover core logic, tracking state machine, audio gain math (slider×proximity, plus `resolveProximityTargets` which silences peers the server drops from range), device list filtering, tracking-helper scoring math (composite/jump/hold-cap), the position-jump warning gates, the session-flow integration, the champion-classifier label resolver and batched inference (crop packing and per-row softmax slicing), the debug-log buffering and flush ordering, the raw capture-frame decoder and the tracking tick's dimension guard, Riot ID reading and local-player matching, map detection and streamer-mode detection, the dynamic overlay resize helpers, the game-window geometry resolver and capture-bounds math, and the PTT-rebind keymap.
+- **Client tests** live under `tests/` (separate root from `src/`). Run with `npm test`. The 342 tests cover core logic, tracking state machine, audio gain math (slider×proximity, plus `resolveProximityTargets` which silences peers the server drops from range), device list filtering, tracking-helper scoring math (composite/jump/hold-cap), the position-jump warning gates, the session-flow integration, the champion-classifier label resolver and batched inference (crop packing and per-row softmax slicing), the debug-log buffering and flush ordering, the raw capture-frame decoder and the tracking tick's dimension guard, Riot ID reading and local-player matching, map detection and streamer-mode detection, the dynamic overlay resize helpers, the game-window geometry resolver and capture-bounds math, the minimap tracking simulation in `tests/cv/` (synthesized scenes driven through the real CV pipeline against known ground truth, including the v0.5.8 zero-classifier regression), the session lifecycle (the game-state transition table, interval teardown across two consecutive games, and the audio level-monitor leak), and the PTT-rebind keymap.
+- **End-to-end session tests** live under `tests/e2e/`. Run with `npm run test:e2e` (it builds the server first; `npm run test:all` runs both suites). Two Orchestrator-level clients meet in a room on the real built signaling server, spawned as a subprocess on port 31998, and the proximity chain is asserted from the server's own responses. They are excluded from `npm test` and run in a separate, **non-blocking** CI job — treat a red e2e run as a real signal, but the transitions it covers that must never regress are duplicated in the fast suite on purpose. The suite fakes the Tauri command surface, WebRTC, WebAudio and the CV tracker, and nothing else; what it therefore does *not* prove is listed at the bottom of [`docs/manual-test-checklist.md`](docs/manual-test-checklist.md).
 - **Server tests** live under `server/tests/`. Run with `cd server && npm test`. 165 tests cover room management (team + coords storage), `join` argument validation, WebSocket heartbeat/reaping, TURN credential generation (both coturn-HMAC and Cloudflare paths), the tiered proximity-volume math, and rate-limiting (`TokenBucket`, `ConcurrencyLimiter`, `clientIp`'s proxy-trust rules, plus end-to-end per-player isolation and forwarding-header tests against a real spawned server).
-- **Rust tests** live beside the code they cover (`#[cfg(test)] mod tests`). 31 tests across `capture.rs`, `game_window.rs`, `key_decision.rs` and `lcu.rs` cover the pure helpers — lockfile parsing, install-dir caching, capture-bounds validation, the BGRA→RGBA conversion the capture frame ships through, game-rect handling and the PTT key decision. They only build on Windows; see "Common commands" for the invocation.
-- New features should land with tests where the logic is testable (pure functions, state machines). DOM-heavy or Tauri-IPC-heavy code can skip tests; mock surfaces are too brittle to be worth maintaining.
+- **Rust tests** live beside the code they cover (`#[cfg(test)] mod tests`). 31 tests across `capture.rs`, `game_window.rs`, `key_decision.rs` and `lcu.rs` cover the pure helpers — lockfile parsing, install-dir caching, capture-bounds validation, the BGRA→RGBA conversion the capture frame ships through, game-rect handling and the PTT key decision. They only build on Windows, and **CI does not run them** — `src-tauri` depends on the `windows` crate unconditionally with no `cfg` gating anywhere in `src-tauri/src`, so it cannot build on the ubuntu runners, and a `windows-latest` job would additionally need `npm ci && npm run build:prod` first because `tauri::generate_context!()` resolves `frontendDist: "../dist"` at compile time. Run `cargo test --manifest-path src-tauri/Cargo.toml` locally on Windows before sending a PR that touches Rust; nothing else will — see "Common commands" for the full invocation.
+- New features should land with tests where the logic is testable. That now includes the CV pipeline and the tracking state machine: `TrackingService` takes a `FrameSource` and a `BlobScorer`, so `tests/cv/` drives the real detector over synthesized minimaps under plain node — see `tests/cv/harness-selfcheck.test.ts` for the geometry those scenes depend on, and read its header before changing a drawing constant. It also includes the session lifecycle: `Orchestrator` takes its collaborators through injectable factories, so transitions can be driven under fake timers with no I/O. What genuinely cannot be tested here is the OS surface itself (GDI capture, the keyboard hook, WebView2, real audio hardware); that belongs on [`docs/manual-test-checklist.md`](docs/manual-test-checklist.md), not in a mock.
 
 ## Refreshing the champion classifier
 
@@ -138,13 +144,14 @@ So a manual release is:
 1. `node scripts/bump-version.mjs --type patch --changelog "### Fixed\n- …"` — bumps `Cargo.toml` + `Cargo.lock` and adds the dated `CHANGELOG.md` section + footnote (use `--type minor` for notable/behavior changes).
    `src-tauri/Cargo.toml`'s version is the single source of truth: the exe's Windows file-properties version comes from it too, because `tauri.conf.json` deliberately has no `version` field. Don't re-add one — it would override `Cargo.toml` and drift the moment someone bumps by hand.
 2. Commit (`release:`) and push to `main`.
-3. Wait for the draft release to appear, then review and publish it.
+3. Run [`docs/manual-test-checklist.md`](docs/manual-test-checklist.md) against the built installer and paste the filled-in table into the release PR. A blank row is more useful than a hopeful tick.
+4. Wait for the draft release to appear, then review and publish it.
 
 (You can also trigger `release.yml` manually via workflow_dispatch — it builds whatever version is in `Cargo.toml`.) To build locally for a sanity check, `npx tauri build` drops the exe at `src-tauri/target/release/lolproxchat.exe`. No build secrets are needed — `PROXCHAT_SERVER` defaults to the public server.
 
 ### Automated classifier retrain → release
 
-[`.github/workflows/icon-watch.yml`](.github/workflows/icon-watch.yml) runs daily: it scrapes the latest champion icons and, if the set changed (new champion, skin, or rework), retrains the classifier, **patch-bumps the version**, and opens a PR with the new model + a quality report. Validate tracking in a real game and merge — the version bump then triggers `release.yml` to build the draft release automatically. See § "Refreshing the champion classifier". The PR step needs Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests" enabled. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) type-checks, builds, and tests every PR.
+[`.github/workflows/icon-watch.yml`](.github/workflows/icon-watch.yml) runs daily: it scrapes the latest champion icons and, if the set changed (new champion, skin, or rework), retrains the classifier, **patch-bumps the version**, and opens a PR with the new model + a quality report. Validate tracking in a real game and merge — the version bump then triggers `release.yml` to build the draft release automatically. See § "Refreshing the champion classifier". The PR step needs Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests" enabled. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) type-checks (both `src/` and, via `tsconfig.test.json`, the test sources), builds, and tests every PR; the e2e suite runs in a separate non-blocking job.
 
 ## Anti-patterns we've explicitly avoided
 
