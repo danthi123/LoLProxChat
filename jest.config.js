@@ -10,6 +10,7 @@ module.exports = {
   roots: ['<rootDir>/tests'],
   testMatch: ['**/*.test.ts'],
   testPathIgnorePatterns: ['/node_modules/', '/tests/e2e/'],
+  setupFiles: ['<rootDir>/tests/setup/browser-globals.ts'],
   transform: {
     '^.+\\.tsx?$': ['ts-jest', { tsconfig: '<rootDir>/tsconfig.test.json' }],
   },

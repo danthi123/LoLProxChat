@@ -12,6 +12,17 @@ import { installTaps } from '../harness/tap';
 
 const g = globalThis as any;
 
+// Unlike the fast suite, this one opens REAL sockets to the spawned server, so a
+// constants-only stub would not do — it needs the genuine global, which node
+// only grew in 22. Fail with the reason rather than a ReferenceError from deep
+// inside signaling.ts.
+if (typeof g.WebSocket === 'undefined') {
+  throw new Error(
+    'The end-to-end suite needs a global WebSocket, which node gained in v22. ' +
+    'Running node ' + process.version + '. Use node 22 or newer for npm run test:e2e.',
+  );
+}
+
 // Port 31998: the server's own vitest integration suite owns 31999, and the two
 // can run at the same time on a developer's machine.
 g.__PROXCHAT_SERVER__ = 'http://127.0.0.1:31998';
