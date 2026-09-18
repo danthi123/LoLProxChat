@@ -73,12 +73,10 @@ jobs:
   # in node 22 — which is what lets it run with no new dependency in
   # package.json at all.
   #
-  # There is deliberately no cargo job. src-tauri depends on the `windows` crate
-  # unconditionally with no cfg gating anywhere in src-tauri/src, so it cannot
-  # build on ubuntu; and `cargo test` on windows-latest would additionally need
-  # `npm ci && npm run build:prod` first, because tauri::generate_context!()
-  # resolves frontendDist: "../dist" at compile time. The Rust #[cfg(test)]
-  # modules therefore run locally on Windows only — see CONTRIBUTING.md.
+  # The cargo job below is windows-only by necessity: src-tauri depends on the
+  # `windows` crate unconditionally with no cfg gating anywhere in src-tauri/src,
+  # so it cannot build on ubuntu, and cross-checking from linux dies in `ring`'s
+  # build script for want of MSVC's lib.exe.
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -100,3 +98,33 @@ jobs:
         working-directory: server
       - name: End-to-end session tests
         run: npx jest --config jest.e2e.config.js
+
+  # Compiles and tests the Rust the other jobs cannot touch. Until this existed,
+  # every line under src-tauri/ shipped having been read but never compiled —
+  # and the crate holds the screen capture, the keyboard hook and the updater.
+  #
+  # `npm run build:prod` is a prerequisite rather than a convenience:
+  # tauri::generate_context!() resolves frontendDist ("../dist") at COMPILE time,
+  # so the macro fails outright without a built frontend.
+  rust:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - name: Build frontend
+        run: npm run build:prod
+      - name: Check
+        run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+      - name: Test
+        # key_decision.rs and the capture/geometry helpers carry #[cfg(test)]
+        # modules that no runner has ever executed.
+        run: cargo test --manifest-path src-tauri/Cargo.toml
