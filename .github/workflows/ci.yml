@@ -128,3 +128,14 @@ jobs:
         # key_decision.rs and the capture/geometry helpers carry #[cfg(test)]
         # modules that no runner has ever executed.
         run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Build exe
+        # The only way to validate this app is to play a game with it, so every
+        # PR leaves behind something a tester can actually run. --no-bundle
+        # matches release.yml: the raw exe, no installer.
+        run: npx tauri build --no-bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lolproxchat-exe-${{ github.sha }}
+          path: src-tauri/target/release/lolproxchat.exe
+          if-no-files-found: error
+          retention-days: 14
