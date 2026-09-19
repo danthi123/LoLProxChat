@@ -206,9 +206,22 @@ export class SignalingService {
    * v0.2: send the local player's XY coordinates to the server, where they
    * land in the room state and feed the next /compute-volumes request.
    */
-  sendCoords(x: number, y: number): void {
+  /**
+   * Report our position, or disown it.
+   *
+   * `stale` says the tracker has lost the player and this is only the last
+   * place we saw them. A server that understands the flag drops the stored
+   * position immediately; one that does not sees an ordinary coords message
+   * carrying the same numbers it would have kept serving anyway, so an older
+   * server is no worse off than before the flag existed. That back-compat is
+   * the reason this rides on `coords` rather than a message type of its own —
+   * an unknown type draws an error reply from every server already deployed.
+   */
+  sendCoords(x: number, y: number, stale = false): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'coords', x, y }));
+      this.ws.send(JSON.stringify(stale
+        ? { type: 'coords', x, y, stale: true }
+        : { type: 'coords', x, y }));
     }
   }
 

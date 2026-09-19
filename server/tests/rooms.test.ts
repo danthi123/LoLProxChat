@@ -476,3 +476,26 @@ describe('wire shape of the frames a room lifecycle emits', () => {
     }
   });
 });
+
+describe('clearPosition', () => {
+  it('forgets the position but keeps the client in the room', () => {
+    const rooms = new RoomManager();
+    const ws = mockWs();
+    rooms.join('r1', 'Alice', ws, 'ORDER');
+    rooms.setPosition(ws, 500, 600);
+    expect(rooms.getRoomClients('r1')[0].position).toBeDefined();
+
+    rooms.clearPosition(ws);
+    const after = rooms.getRoomClients('r1');
+    // Still present — they can still talk, and teammates still hear them at
+    // full volume. Only the distance scoring loses its input.
+    expect(after).toHaveLength(1);
+    expect(after[0].name).toBe('Alice');
+    expect(after[0].position).toBeUndefined();
+  });
+
+  it('is a no-op for a socket that is not in a room', () => {
+    const rooms = new RoomManager();
+    expect(() => rooms.clearPosition(mockWs())).not.toThrow();
+  });
+});

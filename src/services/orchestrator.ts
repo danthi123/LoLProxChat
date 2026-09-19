@@ -115,6 +115,9 @@ export class Orchestrator {
   private lastLoggedPosition: { x: number; y: number } | null = null;
   private lastMinimapScale: number | null = null;
   private lastGameState: TauriGameState | null = null;
+  /** True once we have told the server our position is stale, so the message
+   *  goes out on the transition rather than at the tick rate. */
+  private coordsDisowned = false;
   private gameStatePollRunning = false;
   private geometryPollRunning = false;
   /** Panel-facing reason the capture geometry may be wrong, or null. */
@@ -538,17 +541,27 @@ export class Orchestrator {
       return;
     }
 
-    // Stop reporting if our position is stale (CV has been extrapolating
-    // for >2s). The server prunes positions older than STALE_POSITION_MS
-    // (60s) on its own, but we want to stop polluting earlier than that
-    // when CV has clearly lost the player.
+    // The tracker has lost the player and is extrapolating. Say so, once, and
+    // stop reporting.
+    //
+    // Simply going quiet is not enough: the server keeps serving the last
+    // position it has for STALE_POSITION_MS, so the two silences compound into
+    // several seconds during which peers are still scored against wherever we
+    // were last seen. A recall is the case that makes this obvious — it is an
+    // instant teleport the tracker cannot follow, so an enemy standing where
+    // we recalled from goes on hearing us long after we are in base.
     if (this.tracking.getHoldDurationSec() > 2) {
+      if (!this.coordsDisowned) {
+        this.coordsDisowned = true;
+        this.signaling.sendCoords(position.x, position.y, /*stale*/ true);
+      }
       this.broadcastOverlayState();
       return;
     }
 
     // Push our latest XY to server-side room state. /compute-volumes reads
     // every peer's stored position from there — no more P2P blob exchange.
+    this.coordsDisowned = false;
     this.signaling.sendCoords(position.x, position.y);
 
     // Log our position whenever it moves >500 game units so we can see the

@@ -138,6 +138,18 @@ export class RoomManager {
   }
 
   /**
+   * Forget a client's position without disconnecting them. They stay in the
+   * room and keep being heard by teammates, who are not scored on distance;
+   * cross-team peers stop hearing them at once rather than after the staleness
+   * window, because the client has told us the position is no longer true.
+   */
+  clearPosition(ws: WebSocket): void {
+    const info = this.clients.get(ws);
+    if (!info) return;
+    info.position = undefined;
+  }
+
+  /**
    * Snapshot of all peer positions in a room, keyed by name. Skips the
    * requester (`exceptName`) and skips entries with no position set yet,
    * or whose position is older than `staleMs`.

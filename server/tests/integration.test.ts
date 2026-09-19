@@ -90,6 +90,11 @@ function sendCoords(ws: WebSocket, x: number, y: number): void {
   ws.send(JSON.stringify({ type: 'coords', x, y }));
 }
 
+/** What a client sends when its tracker has lost the player (#recall lag). */
+function disownCoords(ws: WebSocket, x: number, y: number): void {
+  ws.send(JSON.stringify({ type: 'coords', x, y, stale: true }));
+}
+
 async function computeVolumesAt(
   base: string,
   myPosition: { x: number; y: number },
@@ -213,6 +218,53 @@ describe('tiered proximity — end-to-end against the real server', () => {
     expect(enemyView.peerVolumes.CamAlice).toBeUndefined();
 
     alice.close(); enemy.close();
+  });
+
+  it('a disowned position stops cross-team audio at once, without leaving the room', async () => {
+    // A recall is an instant teleport the tracker cannot follow, so the client
+    // says "this is only the last place I saw myself". Before the flag existed
+    // the server kept serving that position for its whole staleness window and
+    // the enemy went on hearing them from where they used to be.
+    const room = 'r-stale';
+    const me = await joinRoom(room, 'StaleMe', 'ORDER');
+    const enemy = await joinRoom(room, 'StaleEnemy', 'CHAOS');
+    const ally = await joinRoom(room, 'StaleAlly', 'ORDER');
+
+    sendCoords(me, 0, 0);
+    sendCoords(enemy, 300, 0);   // well inside the range → clearly audible
+    sendCoords(ally, 9000, 0);
+    await sleep(400);
+
+    const before = await computeVolumes({ x: 300, y: 0 }, room, 'StaleEnemy');
+    expect(before.peerVolumes.StaleMe).toBeGreaterThan(0);
+
+    // The tracker loses StaleMe, who disowns the position it last had.
+    disownCoords(me, 0, 0);
+    await sleep(400);
+
+    const after = await computeVolumes({ x: 300, y: 0 }, room, 'StaleEnemy');
+    expect(after.peerVolumes.StaleMe).toBeUndefined();
+
+    // ...but they are still in the room, still audible to their own team,
+    // which is scored by membership rather than distance.
+    const allyView = await computeVolumes({ x: 9000, y: 0 }, room, 'StaleAlly');
+    expect(allyView.peerVolumes.StaleMe).toBe(1.0);
+
+    me.close(); enemy.close(); ally.close();
+  });
+
+  it('an older client that never sends the flag is unaffected', async () => {
+    // Back-compat in the direction that matters: pre-0.5.9 clients keep the
+    // old behaviour, where a position lingers until the staleness window.
+    const room = 'r-nostale';
+    const me = await joinRoom(room, 'OldMe', 'ORDER');
+    const enemy = await joinRoom(room, 'OldEnemy', 'CHAOS');
+    sendCoords(me, 0, 0);
+    sendCoords(enemy, 300, 0);
+    await sleep(400);
+    const seen = await computeVolumes({ x: 300, y: 0 }, room, 'OldEnemy');
+    expect(seen.peerVolumes.OldMe).toBeGreaterThan(0);
+    me.close(); enemy.close();
   });
 
   it('legacy v0.1 clients (no team on join) still get team-blind volumes', async () => {

@@ -206,6 +206,14 @@ export function handleConnection(
             sendError(ws, 'coords requires finite x and y');
             return;
           }
+          // A client that has lost track of its own player disowns the
+          // position rather than letting it age out: waiting for the staleness
+          // window keeps cross-team peers scored against a place it has
+          // already left.
+          if (msg.stale === true) {
+            rooms.clearPosition(ws);
+            break;
+          }
           rooms.setPosition(ws, msg.x, msg.y);
           break;
         }
