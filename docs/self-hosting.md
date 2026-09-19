@@ -191,13 +191,22 @@ echo "" | openssl s_client -connect turn.your-domain.com:5349 \
 
 If your remote is a hand-synced directory of `server/` files (rather than a `git` checkout on the host), **updates are a file-sync, not a `git pull`** — and a partial sync silently runs stale code: clients talk to an old server and proximity quietly breaks with no error. (This has bitten the project in production.)
 
-Use [`scripts/deploy-server.sh`](../scripts/deploy-server.sh) to do it safely. It builds + tests locally first, backs up the remote source, syncs **all** of `server/src/` plus the build files, rebuilds the container, and then verifies the new code is actually serving before declaring success. It never touches the remote `docker-compose.yml`, so your secrets stay put.
+Use [`scripts/deploy-server.sh`](../scripts/deploy-server.sh) to do it safely. It builds + tests locally first, backs up the remote source, syncs **all** of `server/src/` plus the build files, rebuilds the container, and then verifies the new code is actually serving before declaring success. It never touches the remote compose file, so your secrets stay put.
 
 ```bash
-PROXCHAT_DEPLOY_HOST=root@your-host \
+PROXCHAT_DEPLOY_HOST=you@your-host \
 PROXCHAT_DEPLOY_PATH=/path/to/proxchat-server \
+PROXCHAT_COMPOSE_DIR=/path/to/the/compose/project \
 ./scripts/deploy-server.sh
 ```
+
+`PROXCHAT_COMPOSE_DIR` is separate from `PROXCHAT_DEPLOY_PATH` on purpose, and getting it wrong is the failure worth knowing about. The build context and the compose project are usually different directories — especially if the stack is one `include:` fragment among many. Running `docker compose up` inside the *source* directory starts a second, competing stack instead of updating the running one, and the source directory may well still contain an old `docker-compose.yml` that looks plausible and is not what is deployed. Find the real one with:
+
+```bash
+docker inspect <container> --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
+```
+
+Two more things the script handles that catch people out by hand: the source directory is often root-owned, so files are staged in `/tmp` and installed with `sudo`; and the container usually does **not** publish its port to the host, because the reverse proxy reaches it over a docker network — so `curl localhost:3100` fails on a perfectly healthy deployment, and verification has to run inside the container.
 
 ## Operational notes
 
