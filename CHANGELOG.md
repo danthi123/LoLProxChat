@@ -4,7 +4,11 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Notes
+- **Proximity audio does not respect fog of war, and cannot at present.** An enemy in a brush or behind a wall is as audible as one in the open at the same distance. League's client API reports positions but nothing about vision, so there is no signal to gate on; modelling it would need a static terrain mesh and line-of-sight tests, which is not implemented. [`docs/compliance.md`](docs/compliance.md) now says so directly rather than claiming no fog-of-war reveals.
+
 ### Changed
+- **A player who should stop being heard now goes quiet in under a second, instead of about five.** The fade was advancing one step per proximity update, and those only arrive as fast as a round trip to the signaling server allows — so how quickly someone faded out depended on the network rather than on the fade. It now runs on a local timer at a fixed rate. Most noticeable with **Voice on camera**, where panning off someone used to leave them audible for around four seconds.
 - **Enemies are now at full volume out to ~900 game units, instead of fading the whole way in.** The old curve put two ranged champions holding a lane against each other at roughly half volume while a melee trade sat near full — so the people this feature is for could not actually hold a conversation in lane without walking into each other. Voice is now flat inside ~900 units and fades over the last stretch to the unchanged ~1350 cutoff. What you can hear has not changed, only how loud it is; and because volume is constant inside the plateau, it now carries less information about exactly where an enemy is than it used to.
 
 ### Fixed

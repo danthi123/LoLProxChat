@@ -19,7 +19,8 @@ LoLProxChat is built to stay within the categories Riot Games explicitly publish
 - ❌ No network packet interception, modification, or replay.
 - ❌ No automation, scripting, or bot behavior — the app never takes any in-game action on your behalf.
 - ❌ No decision-making aids — no enemy ult timers, no warned-by, no jungle timers, no skill suggestions.
-- ❌ No exposure of obfuscated information — no fog-of-war reveals, no warded-by indicators, no enemy item builds, no spectator-mode data. **One caveat: the opt-in "Voice on camera" setting is a deliberate exception — see below.**
+- ❌ No warded-by indicators, no enemy item builds, no spectator-mode data.
+- ⚠️ **Proximity audio does not respect fog of war.** Hearing is computed from distance alone, so an enemy in a brush or behind a wall is as audible as one standing in the open at the same range. The opt-in "Voice on camera" setting widens that further. Both are covered below — this is the app's one real departure from "no exposure of obfuscated information", and it is stated here rather than buried.
 - ❌ No in-game advertising (banned by Riot in May 2025).
 - ❌ No paid tier or freemium gating — Riot's monetization rules require a free tier; LoLProxChat is fully open source and free.
 
@@ -30,6 +31,16 @@ The volume falloff drops to zero at ~1350 game units — roughly a champion's vi
 That inner plateau is a loudness choice, not a reach one: the ~1350-unit cutoff is what bounds *which* enemies are audible, and it is unchanged. Inside the plateau volume is constant, so it conveys nothing about how far away the enemy actually is.
 
 The app does not reveal *where* an enemy is — only that one is somewhere within hearing range. This is strictly less information than Discord voice chat with the same opponent already provides (which has zero distance modulation).
+
+### Fog of war, stated plainly
+
+The paragraph above is the argument for why the hearing radius is set where it is. It is an argument about *distance*, and distance is not what the game actually uses to decide what you may know about. League gates that on **vision**, and vision is blocked by brush and terrain. This app cannot see any of that.
+
+So an enemy sitting in a lane brush eight hundred units away is audible at full volume, and an enemy behind a wall is too. A player testing the app described this as fog of war being broken, which is a fair description of the experience.
+
+It is not a bug that can be fixed at this layer. The Live Client Data API reports positions and roster, and reports nothing about what any player can currently see — no vision state, no brush occupancy, no ward coverage. Without that, the only way to model vision would be to ship a static Summoner's Rift brush-and-wall mesh and test line of sight against it server-side, which is sketched in [`threat-model.md`](threat-model.md) under the `MAX_HEARING_RANGE` calibration. That would cover terrain but still not wards, and it is a substantial build. It is not implemented, and so is not claimed.
+
+What bounds the leak today is the hearing radius and nothing else: you learn that *an* enemy is within roughly vision range of you, not which one, not where, and not through any mechanism you could aim. Players who do not want that should not run the app, and anyone running it in a competitive context should understand it is what they are opting into.
 
 For the precise threat-modeling around how a modified client *could* extract additional information from the volume side channel, see [`threat-model.md`](threat-model.md). Note that the volume value the server returns is **continuous** — the v0.1.26 bucket quantization and jitter were reverted in v0.1.33 because the bucket transitions were audible in real games; the mitigations that remain are the hard cutoff at vision range and the staleness window on peer coordinates.
 
