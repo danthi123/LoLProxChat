@@ -1,18 +1,93 @@
 import { invoke } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
-import { GameStateService, GameSession, TauriGameState } from './game-state';
+import {
+  GameStateService,
+  GameSession,
+  SessionFailureReason,
+  TauriGameState,
+} from './game-state';
 import { SignalingService, SignalMessage, PositionBroadcast } from './signaling';
 import { AudioService } from './audio';
 import { TrackingService, TrackingState } from './tracking';
-import { ChampionClassifier } from './champion-classifier';
+import { BlobScorer, ChampionClassifier } from './champion-classifier';
 import { VolumeClient } from './volume-client';
 import { getAllyProximity, getCameraListen } from './audio-prefs';
-import { PeerState } from '../core/types';
+import { ScreenRect } from '../core/map-calibration';
+import {
+  GameWindowInfoDto,
+  decideGameRectUpdate,
+  resolveGameRect,
+  WARN_QUERY_FAILED,
+} from '../core/game-window';
+import { MapType, PeerState, Player } from '../core/types';
 import '../core/window-globals';
 import { isStreamerMode } from '../core/streamer-detect';
+import {
+  Identity,
+  identityEquals,
+  presentIdentityFields,
+  readIdentity,
+} from '../core/identity';
 
+
+function rectStr(r: ScreenRect): string {
+  return r.width + 'x' + r.height + '@(' + r.x + ',' + r.y + ')';
+}
+
+/** Interval periods the orchestrator drives its three loops at, in ms. */
+export interface OrchestratorTimings {
+  gameStatePollMs: number;
+  volumeTickMs: number;
+  configPollMs: number;
+}
+
+/**
+ * Everything the orchestrator builds that reaches outside this process — the
+ * Tauri commands behind game state and tracking, the microphone, the signaling
+ * socket, the ONNX model — named so a test can substitute it.
+ *
+ * Factories rather than instances because a session builds its audio, tracking
+ * and volume client fresh on every game start and drops them on game end; an
+ * injected instance could not survive that.
+ *
+ * Every default below is the exact expression `startSession` used inline
+ * before, so `new Orchestrator()` is unchanged for background.ts.
+ */
+export interface OrchestratorDeps {
+  createGameState(): GameStateService;
+  createSignaling(): SignalingService;
+  createAudio(signaling: SignalingService, localName: string): AudioService;
+  createTracking(gameRect: ScreenRect, mapType: MapType): TrackingService;
+  /** Resolves null when no scorer is available; tracking runs without one. */
+  createClassifier(championName: string): Promise<BlobScorer | null>;
+  createVolumeClient(): VolumeClient;
+  timings: OrchestratorTimings;
+}
+
+export function defaultDeps(): OrchestratorDeps {
+  return {
+    createGameState: () => new GameStateService(),
+    createSignaling: () => new SignalingService(),
+    createAudio: (signaling, localName) => new AudioService(signaling, localName),
+    createTracking: (gameRect, mapType) => new TrackingService(gameRect, mapType),
+    createClassifier: async (championName) => {
+      const classifier = new ChampionClassifier();
+      await classifier.load(
+        '../models/champion_classifier.onnx',
+        '../models/champion_labels.json',
+        championName,
+      );
+      return classifier;
+    },
+    createVolumeClient: () => new VolumeClient(),
+    // The volume tick is 10 Hz because GainNode smoothing turns those steps
+    // into a ramp; the other two are housekeeping.
+    timings: { gameStatePollMs: 3000, volumeTickMs: 100, configPollMs: 5000 },
+  };
+}
 
 export class Orchestrator {
+  private readonly deps: OrchestratorDeps;
   private gameState: GameStateService;
   private signaling: SignalingService;
   private audio: AudioService | null = null;
@@ -21,6 +96,14 @@ export class Orchestrator {
   private session: GameSession | null = null;
 
   private localSummonerName = '';
+  /** Local player's Riot ID as League spelled it this game, read once. */
+  private localIdentity: Identity | null = null;
+  /** Roster identities, resolved once per session — handlePeerPosition runs on
+   *  every incoming position broadcast. */
+  private rosterIdentities: { player: Player; identity: Identity }[] = [];
+  /** Why the last session attempt was refused, throttled for the 3s poll. */
+  private lastSessionFailure:
+    { sig: string; reason: SessionFailureReason; detail: string; at: number } | null = null;
   private peerStates: Map<string, PeerState> = new Map();
   private volumeTickId: number | null = null;
   private configPollId: number | null = null;
@@ -31,8 +114,16 @@ export class Orchestrator {
   private lastOverlayBounds: { x: number; y: number; w: number; h: number } | null = null;
   private lastLoggedPosition: { x: number; y: number } | null = null;
   private lastMinimapScale: number | null = null;
-  private dpiScale = 1;
   private lastGameState: TauriGameState | null = null;
+  /** True once we have told the server our position is stale, so the message
+   *  goes out on the transition rather than at the tick rate. */
+  private coordsDisowned = false;
+  private gameStatePollRunning = false;
+  private geometryPollRunning = false;
+  /** Panel-facing reason the capture geometry may be wrong, or null. */
+  private geometryWarning: string | null = null;
+  /** Last moved-window rect we logged, so a permanent move isn't logged every poll. */
+  private loggedMovedRect: string | null = null;
 
   // User mute prefs survive across session start/end so the panel's MIC / VOL
   // buttons stay sticky when toggled outside a game (audio is null between
@@ -40,22 +131,45 @@ export class Orchestrator {
   private selfMutedPref = false;
   private muteAllPref = false;
 
-  constructor() {
-    this.gameState = new GameStateService();
-    this.signaling = new SignalingService();
+  constructor(deps: Partial<OrchestratorDeps> = {}) {
+    this.deps = { ...defaultDeps(), ...deps };
+    this.gameState = this.deps.createGameState();
+    this.signaling = this.deps.createSignaling();
   }
 
   start(): void {
     console.log('[LoLProxChat] Orchestrator.start() called');
 
-    // Poll Tauri backend for game state every 3 seconds
-    this.gameStatePollId = window.setInterval(() => this.pollGameState(), 3000) as unknown as number;
+    // Poll Tauri backend for game state (3s by default — see defaultDeps)
+    this.gameStatePollId = window.setInterval(
+      () => this.pollGameState(),
+      this.deps.timings.gameStatePollMs,
+    ) as unknown as number;
 
     // Also poll immediately on start
     this.pollGameState();
   }
 
+  /**
+   * Counterpart to start(): drop the game-state poll and tear down any live
+   * session. The app itself never stops short of process exit, so this exists
+   * for anything that owns an orchestrator with a shorter life than the
+   * process — today that is the session e2e suite, which would otherwise leave
+   * a poll running against a server it has already shut down.
+   */
+  stop(): void {
+    if (this.gameStatePollId !== null) {
+      clearInterval(this.gameStatePollId);
+      this.gameStatePollId = null;
+    }
+    if (this.session) this.endSession();
+  }
+
   private async pollGameState(): Promise<void> {
+    // The LCU round-trip can outrun the 3s timer on a busy machine; overlapping
+    // polls race startSession and endSession against each other.
+    if (this.gameStatePollRunning) return;
+    this.gameStatePollRunning = true;
     try {
       const state: TauriGameState = await this.gameState.pollGameState();
       this.lastGameState = state;
@@ -65,6 +179,7 @@ export class Orchestrator {
           console.log('[LoLProxChat] LoL closed, ending session');
           this.endSession();
         }
+        this.clearSessionAttemptState();
         // Fire an overlay refresh so the empty-state text reflects "Waiting for LoL"
         this.broadcastOverlayState();
         return;
@@ -86,6 +201,13 @@ export class Orchestrator {
         }
       }
 
+      if (!state.isInGame) {
+        // A refused attempt never creates `this.session`, so endSession() below
+        // can never clear the refusal — it would otherwise follow the user
+        // through the post-game client, the next lobby and champ select.
+        this.clearSessionAttemptState();
+      }
+
       if (!state.isInGame && this.session) {
         console.log('[LoLProxChat] Game ended (phase: ' + state.gameFlowPhase + ')');
         this.endSession();
@@ -97,6 +219,8 @@ export class Orchestrator {
       }
     } catch (e) {
       console.error('[LoLProxChat] pollGameState failed:', e);
+    } finally {
+      this.gameStatePollRunning = false;
     }
   }
 
@@ -118,47 +242,113 @@ export class Orchestrator {
     if (this.session) return;
 
     try {
-      if (lcd.activePlayer && !this.localSummonerName) {
-        const active = typeof lcd.activePlayer === 'string'
+      let active: any = null;
+      if (lcd.activePlayer) {
+        active = typeof lcd.activePlayer === 'string'
           ? JSON.parse(lcd.activePlayer)
           : lcd.activePlayer;
-        this.localSummonerName = active.riotId || active.summonerName || '';
-        console.log('[LoLProxChat] Local summoner:', this.localSummonerName);
-      }
-
-      if (lcd.allPlayers && this.localSummonerName) {
-        const playersData = typeof lcd.allPlayers === 'string'
-          ? JSON.parse(lcd.allPlayers)
-          : lcd.allPlayers;
-        const players = this.gameState.parsePlayerList({ players: playersData });
-        console.log('[LoLProxChat] Parsed players:', players.length);
-
-        const gameMode = lcd.gameData
-          ? (typeof lcd.gameData === 'string' ? JSON.parse(lcd.gameData) : lcd.gameData).gameMode || 'CLASSIC'
-          : 'CLASSIC';
-
-        const session = this.gameState.createSession(
-          players,
-          this.localSummonerName,
-          gameMode,
-        );
-
-        if (session) {
-          this.session = session;
-          console.log('[LoLProxChat] Session created! Room:', session.roomId);
-          this.startSession(session);
+        if (!this.localIdentity) {
+          // Every identity field League has ever used is read here, not just
+          // riotId/summonerName: when a patch moves the spelling, collapsing to
+          // one field yields '' and every diagnostic below becomes unreachable.
+          this.localIdentity = readIdentity(active);
+          if (this.localIdentity) {
+            console.log('[LoLProxChat] Local summoner: ' + this.localIdentity.display +
+              ' (key=' + this.localIdentity.key + ')');
+          }
         }
       }
+
+      if (!lcd.allPlayers) return;
+
+      const playersData = typeof lcd.allPlayers === 'string'
+        ? JSON.parse(lcd.allPlayers)
+        : lcd.allPlayers;
+      const players = this.gameState.parsePlayerList({ players: playersData });
+      console.log('[LoLProxChat] Parsed players:', players.length);
+
+      if (!this.localIdentity) {
+        this.reportSessionFailure('identity-unreadable',
+          'activePlayer carried no usable name; identity fields present=[' +
+          presentIdentityFields(active).join(',') + '] keys=[' +
+          (active && typeof active === 'object' ? Object.keys(active).join(',') : '') + ']');
+        return;
+      }
+
+      const gameData = lcd.gameData
+        ? (typeof lcd.gameData === 'string' ? JSON.parse(lcd.gameData) : lcd.gameData)
+        : null;
+
+      const result = this.gameState.createSession(players, this.localIdentity, gameData);
+      if (!result.ok) {
+        this.reportSessionFailure(result.reason, result.detail);
+        return;
+      }
+
+      const session = result.session;
+      this.lastSessionFailure = null;
+      // The wire name stays the most qualified spelling League gave us — the
+      // full Riot ID where there is one. Peers resolve it against their own
+      // roster through identityEquals, so it does not have to match the
+      // roster's spelling, and keeping the tag is what makes the name globally
+      // unique for the server's one-entry-per-name rule.
+      this.localSummonerName = this.localIdentity.display;
+      if (this.localSummonerName !== session.localPlayer.summonerName) {
+        console.log('[LoLProxChat] activePlayer and allPlayers spell this player' +
+          ' differently: "' + this.localSummonerName + '" vs "' +
+          session.localPlayer.summonerName + '"');
+      }
+      this.rosterIdentities = session.allPlayers.flatMap((player) => {
+        const identity = readIdentity(player);
+        return identity ? [{ player, identity }] : [];
+      });
+      this.session = session;
+      console.log('[LoLProxChat] Session created! Room:', session.roomId);
+      this.startSession(session);
     } catch (e) {
       console.error('[LoLProxChat] Failed to process live client data:', e);
     }
+  }
+
+  /**
+   * Record and log why no session was created. The 3s poll retries forever, so
+   * an unthrottled line here would be the rolling log file's whole content.
+   */
+  private reportSessionFailure(reason: SessionFailureReason, detail: string): void {
+    const sig = reason + '|' + detail;
+    const now = Date.now();
+    const previous = this.lastSessionFailure;
+    const quiet = previous !== null && previous.sig === sig && now - previous.at < 30000;
+    this.lastSessionFailure = { sig, reason, detail, at: quiet ? previous!.at : now };
+    if (quiet) return;
+
+    const line = '[LoLProxChat] Not joining proximity chat (' + reason + '): ' + detail;
+    if (reason === 'streamer-mode') console.warn(line);
+    else console.error(line);
+  }
+
+  private sessionFailureText(reason: SessionFailureReason): string {
+    switch (reason) {
+      case 'identity-unreadable':
+        return "Couldn't read your Riot ID from League — see log";
+      case 'identity-unmatched':
+        return "Couldn't match your Riot ID to the player list — see log";
+      case 'streamer-mode':
+        return 'Streamer mode detected — not joining proximity chat';
+    }
+  }
+
+  /** Reset everything a refused session attempt left behind. */
+  private clearSessionAttemptState(): void {
+    this.lastSessionFailure = null;
+    this.localIdentity = null;
   }
 
   private async startSession(session: GameSession): Promise<void> {
     console.log('[LoLProxChat] Starting session: room=' + session.roomId);
 
     // Initialize audio (mic + WebRTC)
-    this.audio = new AudioService(this.signaling, this.localSummonerName);
+    this.audio = this.deps.createAudio(this.signaling, this.localSummonerName);
     try {
       await this.audio.initMicrophone();
       console.log('[LoLProxChat] Microphone initialized');
@@ -185,21 +375,43 @@ export class Orchestrator {
 
     this.sessionActive = true;
 
+    if (session.mapType === null) {
+      // Unsupported map: keep voice, drop proximity. Tracking is never started,
+      // so no coordinates leave this client and positionTick applies 1.0 to
+      // everyone — which is both closer to Riot's line than broadcasting
+      // Summoner's Rift-scaled coordinates for a map that isn't Summoner's
+      // Rift, and better for the user than losing voice chat outright.
+      console.warn('[LoLProxChat] ' + session.proximityDisabledReason);
+      this.volumeTickId = this.startVolumeTick();
+      this.broadcastOverlayState();
+      return;
+    }
+
     // Start tracking service
     try {
-      // Get actual screen resolution from Tauri backend (Win32 GetSystemMetrics)
-      let gameW = window.screen.width;
-      let gameH = window.screen.height;
-      try {
-        const [w, h] = await invoke<[number, number]>('get_screen_size');
-        gameW = w;
-        gameH = h;
-      } catch (e) {
-        console.warn('[LoLProxChat] get_screen_size failed, using window.screen:', e);
-      }
-      this.dpiScale = window.devicePixelRatio || 1;
-      console.log('[LoLProxChat] Resolution: game=' + gameW + 'x' + gameH +
-        ' dpiScale=' + this.dpiScale);
+      // All capture geometry hangs off the League GAME window's client rect:
+      // the minimap is anchored to that corner, which is the primary monitor's
+      // corner only when League runs borderless at native resolution on the
+      // primary display.
+      //
+      // No fabricated fallback if the query fails — set_capture_bounds and
+      // capture_minimap travel the same channel, so a made-up rect would only
+      // buy a wrong-pixels session instead of a legible error.
+      const info = await invoke<GameWindowInfoDto>('get_game_window_info').catch((e) => {
+        this.geometryWarning = WARN_QUERY_FAILED;
+        throw new Error('get_game_window_info failed: ' + e);
+      });
+      const resolved = resolveGameRect(info);
+      this.geometryWarning = resolved.warning;
+      console.log('[LoLProxChat] Game geometry: source=' + resolved.source +
+        ' rect=' + rectStr(resolved.rect) +
+        ' matchedBy=' + (info.matchedBy ?? 'none') +
+        ' title="' + (info.windowTitle ?? '') + '"' +
+        ' process=' + (info.processName ?? 'unknown') +
+        ' virtual=' + rectStr(info.virtualScreen) +
+        ' primary=' + rectStr(info.primaryScreen) +
+        (info.error ? ' error=' + info.error : ''));
+      if (resolved.warning) console.warn('[LoLProxChat] ' + resolved.warning);
 
       // Note: League install dir is resolved Rust-side via the
       // read_league_config_file command (computes the path from the running
@@ -207,20 +419,15 @@ export class Orchestrator {
       // handles the path directly — closing an arbitrary-file-read attack
       // surface that v0.1.30 and earlier had via read_text_file.
 
-      this.tracking = new TrackingService(gameW, gameH, session.mapType);
+      this.tracking = this.deps.createTracking(resolved.rect, session.mapType);
       this.tracking.loadChampionTemplate(session.localPlayer.championName);
 
       // Set capture bounds in Tauri backend
       await this.tracking.initCaptureBounds();
 
       // Load champion classifier (async, non-blocking — tracking works without it)
-      const classifier = new ChampionClassifier();
-      classifier.load(
-        '../models/champion_classifier.onnx',
-        '../models/champion_labels.json',
-        session.localPlayer.championName,
-      ).then(() => {
-        if (this.tracking) {
+      this.deps.createClassifier(session.localPlayer.championName).then((classifier) => {
+        if (classifier && this.tracking) {
           this.tracking.setClassifier(classifier);
           console.log('[LoLProxChat] Champion classifier loaded');
         }
@@ -246,16 +453,19 @@ export class Orchestrator {
       // Volume client speaks the v0.2 /compute-volumes shape — peer positions
       // come from server-side room state populated by `coords` WSS messages,
       // not from peer-to-peer data channels.
-      this.volumeClient = new VolumeClient();
+      this.volumeClient = this.deps.createVolumeClient();
 
       // Start volume computation tick (~10 Hz). GainNode setTargetAtTime
       // smoothing on the peer connections turns the discrete steps into a
       // continuous ramp; the tick rate just sets how often we refresh the
       // *target*, not how often the audio gain actually moves.
-      this.volumeTickId = window.setInterval(() => this.positionTick(), 100) as unknown as number;
+      this.volumeTickId = this.startVolumeTick();
 
-      // Poll game.cfg every 5 seconds for minimap scale changes
-      this.configPollId = window.setInterval(() => this.pollMinimapScale(), 5000) as unknown as number;
+      // Re-check the game window and game.cfg every few seconds
+      this.configPollId = window.setInterval(
+        () => this.pollGameGeometry(),
+        this.deps.timings.configPollMs,
+      ) as unknown as number;
 
     } catch (e) {
       console.error('[LoLProxChat] Tracking initialization failed:', e);
@@ -264,9 +474,16 @@ export class Orchestrator {
     // Overlay is managed by Tauri window configuration — no manual window open needed
   }
 
+  private startVolumeTick(): number {
+    return window.setInterval(
+      () => this.positionTick(),
+      this.deps.timings.volumeTickMs,
+    ) as unknown as number;
+  }
+
   private async positionTick(): Promise<void> {
     if (this.positionTickRunning) return;
-    if (!this.audio || !this.session || !this.tracking || !this.volumeClient) return;
+    if (!this.audio || !this.session) return;
     this.positionTickRunning = true;
     try {
       await this.positionTickInner();
@@ -276,12 +493,12 @@ export class Orchestrator {
   }
 
   private async positionTickInner(): Promise<void> {
-    if (!this.audio || !this.session || !this.tracking || !this.volumeClient) return;
+    if (!this.audio || !this.session) return;
 
     // Keep camera-viewport detection in step with the toggle. Set before the
     // early returns below so the 30 FPS tracking loop is already producing
     // camera positions by the time we need one, rather than a tick behind.
-    this.tracking.setCameraTracking(getCameraListen());
+    this.tracking?.setCameraTracking(getCameraListen());
 
     // Broadcast presence over signaling so peers can discover us.
     // Coordinates go separately via sendCoords() — kept off this message so
@@ -295,11 +512,15 @@ export class Orchestrator {
       isDead: this.session.localPlayer.isDead ?? false,
     });
 
-    // Feed known ally peer positions to tracking for self-identification disambiguation
-    const allyPeerPositions = Array.from(this.peerStates.values())
-      .filter(p => p.team === this.session!.localPlayer.team && p.position.x > 0 && p.position.y > 0)
-      .map(p => p.position);
-    this.tracking.setPeerGamePositions(allyPeerPositions);
+    // Proximity off (unsupported map): everyone in the room stays audible at
+    // full volume and no coordinates are sent.
+    if (!this.tracking || !this.volumeClient) {
+      const flat: Record<string, number> = {};
+      for (const name of this.peerStates.keys()) flat[name] = 1.0;
+      this.audio.applyPeerVolumes(flat);
+      this.broadcastOverlayState();
+      return;
+    }
 
     // Before CV locks on (SCANNING), pass through all ally audio at full volume (fountain)
     if (this.tracking.getState() === TrackingState.SCANNING) {
@@ -320,17 +541,27 @@ export class Orchestrator {
       return;
     }
 
-    // Stop reporting if our position is stale (CV has been extrapolating
-    // for >2s). The server prunes positions older than STALE_POSITION_MS
-    // (60s) on its own, but we want to stop polluting earlier than that
-    // when CV has clearly lost the player.
+    // The tracker has lost the player and is extrapolating. Say so, once, and
+    // stop reporting.
+    //
+    // Simply going quiet is not enough: the server keeps serving the last
+    // position it has for STALE_POSITION_MS, so the two silences compound into
+    // several seconds during which peers are still scored against wherever we
+    // were last seen. A recall is the case that makes this obvious — it is an
+    // instant teleport the tracker cannot follow, so an enemy standing where
+    // we recalled from goes on hearing us long after we are in base.
     if (this.tracking.getHoldDurationSec() > 2) {
+      if (!this.coordsDisowned) {
+        this.coordsDisowned = true;
+        this.signaling.sendCoords(position.x, position.y, /*stale*/ true);
+      }
       this.broadcastOverlayState();
       return;
     }
 
     // Push our latest XY to server-side room state. /compute-volumes reads
     // every peer's stored position from there — no more P2P blob exchange.
+    this.coordsDisowned = false;
     this.signaling.sendCoords(position.x, position.y);
 
     // Log our position whenever it moves >500 game units so we can see the
@@ -375,7 +606,10 @@ export class Orchestrator {
       this.lastCameraListenState = null;
       return;
     }
-    const state = listenPosition ? 'camera' : 'fallback-champion';
+    const miss = listenPosition ? null : this.tracking?.getCameraMiss() ?? null;
+    const state = listenPosition
+      ? 'camera'
+      : 'fallback-champion:' + (miss ? miss.reason + '/' + miss.markedPixels + 'px' : 'unknown');
     if (state === this.lastCameraListenState) return;
     this.lastCameraListenState = state;
     console.log('[LoLProxChat] Voice on camera: hearing from ' + state +
@@ -387,11 +621,14 @@ export class Orchestrator {
   private async handlePeerPosition(peer: PositionBroadcast): Promise<void> {
     if (!this.session || !this.audio) return;
 
-    // Skip streamer mode players
-    const player = this.session.allPlayers.find(
-      (p) => p.summonerName === peer.summonerName,
-    );
-    if (player && isStreamerMode(player)) return;
+    // Skip streamer mode players. The roster lookup goes through the same
+    // identity rules as the local match, so the two can't drift apart and
+    // leave this one silently matching nobody.
+    const peerIdentity = readIdentity({ summonerName: peer.summonerName });
+    const entry = peerIdentity
+      ? this.rosterIdentities.find((r) => identityEquals(r.identity, peerIdentity))
+      : undefined;
+    if (entry && isStreamerMode(entry.player, this.session.hasTagLines)) return;
 
     const existing = this.peerStates.get(peer.summonerName);
     if (!existing) {
@@ -403,7 +640,6 @@ export class Orchestrator {
       summonerName: peer.summonerName,
       championName: peer.championName,
       team: peer.team as 'ORDER' | 'CHAOS',
-      position: existing?.position ?? { x: 0, y: 0 },
       isMuted: peer.isMuted,
       isDead: peer.isDead,
     };
@@ -436,11 +672,29 @@ export class Orchestrator {
     const gs = this.lastGameState;
     if (!gs || !gs.isLeagueRunning) return 'Waiting for League of Legends';
     if (this.session) {
+      // Proximity being off is the whole story for this session, and unlike a
+      // geometry warning it never resolves itself.
+      if (this.session.proximityDisabledReason) return this.session.proximityDisabledReason;
+      // A refused minimap region outranks everything below: tracking can never
+      // leave SCANNING while it stands, and the log line that explains it is
+      // only written to disk when Debug is already on. Optional call because
+      // orchestrator test doubles implement only the surface they exercise.
+      const refusal = this.tracking?.getGeometryRefusal?.() ?? null;
+      if (refusal) return refusal;
       const ts = this.tracking?.getState();
+      // A geometry problem is the most useful thing to say while nothing is
+      // locked — including when tracking never started at all, which is what a
+      // failed game-window query leaves behind. Once LOCKED it is moot, so a
+      // warning that was never explicitly cleared cannot pin itself to the panel.
+      if (this.geometryWarning && ts !== 'locked') return this.geometryWarning;
       if (ts === 'scanning') return 'Searching for your champion on the minimap';
       // LOCKED with no peers in the room — empty waiting state handled elsewhere
       return '';
     }
+    // A refusal beats the phase text: without it the panel sits on
+    // "Joining game..." forever with no hint that we decided not to join.
+    if (this.lastSessionFailure) return this.sessionFailureText(this.lastSessionFailure.reason);
+
     const phase = gs.gameFlowPhase || 'None';
     switch (phase) {
       case 'None':         return 'In client';
@@ -587,7 +841,9 @@ export class Orchestrator {
 
   /**
    * Read MinimapScale from League's game.cfg. The file is an INI-style config
-   * with [Section] headers. MinimapScale is under [HUD] and ranges from 0.0 to 1.0.
+   * with [Section] headers. MinimapScale is under [HUD] and ranges from 0.0 to
+   * 3.0 — the calibration in `TrackingService.setMinimapScaleFromConfig` is
+   * fitted at scale 0 and scale 3.
    * The Rust side computes the install dir and reads only `Config/game.cfg`;
    * the frontend never handles arbitrary paths.
    */
@@ -614,6 +870,13 @@ export class Orchestrator {
         const val = parseFloat(rawVal);
         if (!isNaN(val)) {
           console.log('[LoLProxChat] MinimapScale raw="' + rawVal + '" parsed=' + val);
+          // Applied anyway: a Riot range change should show up in the log as a
+          // wrong-looking minimap region we can explain, not be clamped into a
+          // wrong region silently.
+          if (val < 0 || val > 3) {
+            console.warn('[LoLProxChat] MinimapScale ' + val +
+              ' is outside the expected 0.0-3.0 range — minimap region may be wrong');
+          }
           callback(val);
           return;
         }
@@ -624,17 +887,50 @@ export class Orchestrator {
   }
 
   /**
-   * Poll game.cfg for MinimapScale changes and update tracking bounds.
+   * 5s housekeeping: refresh the game-window warning the panel shows while
+   * scanning, then pick up MinimapScale changes from game.cfg.
+   *
+   * Re-anchoring capture bounds when the window actually moves is deliberately
+   * NOT wired up — it tears the in-flight capture frame against the canvas and
+   * invalidates any stored calibration, and a mid-game monitor move is rare
+   * enough to cost less than that risk. A moved window is logged and left alone.
    */
-  private pollMinimapScale(): void {
-    this.readMinimapScale((scale) => {
-      if (scale === null || !this.tracking) return;
-      if (scale !== this.lastMinimapScale) {
+  private async pollGameGeometry(): Promise<void> {
+    // The two awaits below can outrun the 5s timer; two overlapping polls would
+    // each be free to re-apply the minimap scale, which resets tracking to
+    // SCANNING and drops the lock.
+    if (this.geometryPollRunning) return;
+    this.geometryPollRunning = true;
+    try {
+      const current = this.tracking?.getGameRect() ?? null;
+      if (current) {
+        let info: GameWindowInfoDto | null = null;
+        try {
+          info = await invoke<GameWindowInfoDto>('get_game_window_info');
+        } catch (e) {
+          console.warn('[LoLProxChat] get_game_window_info failed:', e);
+        }
+        const decision = decideGameRectUpdate(current, info);
+        this.geometryWarning = decision.warning;
+        if (decision.action === 'apply' && decision.rect) {
+          const moved = rectStr(decision.rect);
+          if (moved !== this.loggedMovedRect) {
+            this.loggedMovedRect = moved;
+            console.warn('[LoLProxChat] League window moved to ' + moved +
+              ' — capture stays on ' + rectStr(current) + ' until the next game');
+          }
+        }
+      }
+
+      const scale = await new Promise<number | null>((resolve) => this.readMinimapScale(resolve));
+      if (scale !== null && this.tracking && scale !== this.lastMinimapScale) {
         console.log('[LoLProxChat] MinimapScale changed:', this.lastMinimapScale, '->', scale);
         this.lastMinimapScale = scale;
         this.tracking.setMinimapScaleFromConfig(scale);
       }
-    });
+    } finally {
+      this.geometryPollRunning = false;
+    }
   }
 
   private endSession(): void {
@@ -659,9 +955,13 @@ export class Orchestrator {
     this.session = null;
     this.peerStates.clear();
     this.localSummonerName = '';
+    this.rosterIdentities = [];
+    this.clearSessionAttemptState();
     // Allow re-positioning on the next session
     this.lastOverlayBounds = null;
     this.lastOverlayRepositionTime = 0;
+    this.geometryWarning = null;
+    this.loggedMovedRect = null;
 
     // Hide the scanner window so it doesn't float wherever the minimap last was
     invoke('hide_scanner').catch(() => { /* non-fatal */ });

@@ -21,19 +21,32 @@ describe('calculateVolume', () => {
     expect(calculateVolume(5000)).toBe(0.0);
   });
 
-  it('is strictly monotonically decreasing across the audible range', () => {
-    const distances = [0, 100, 200, 400, 600, 800, 1000, 1100, 1199];
-    const volumes = distances.map(calculateVolume);
-    for (let i = 1; i < volumes.length; i++) {
-      expect(volumes[i]).toBeLessThan(volumes[i - 1]);
+  it('is flat across the plateau, then strictly decreasing to the cutoff', () => {
+    // Inside the plateau every distance is equally loud — that is the point of
+    // it, and it is also why volume carries no distance information there.
+    for (const d of [0, 100, 400, 700, 899, 900]) {
+      expect(calculateVolume(d)).toBe(1.0);
+    }
+    const falling = [901, 1000, 1100, 1200, 1300, 1349].map(calculateVolume);
+    for (let i = 1; i < falling.length; i++) {
+      expect(falling[i]).toBeLessThan(falling[i - 1]);
     }
   });
 
-  it('follows the documented 1 - (d/MAX)² quadratic falloff', () => {
-    // At half the hearing range (1350/2 = 675): 1 - 0.5² = 0.75
-    expect(calculateVolume(675)).toBeCloseTo(0.75, 5);
-    // At 3/4 range (1012.5): 1 - 0.75² = 0.4375
-    expect(calculateVolume(1012.5)).toBeCloseTo(0.4375, 5);
+  it('keeps a ranged lane trade at full volume', () => {
+    // The curve exists for two ranged champions holding a lane against each
+    // other. Anything under the plateau must be indistinguishable from melee
+    // range, which the pure-falloff curve it replaced was not: it put 700u at
+    // 0.73 against melee's 0.95.
+    expect(calculateVolume(550)).toBe(calculateVolume(150));
+    expect(calculateVolume(700)).toBe(1.0);
+  });
+
+  it('falls quadratically across the outer band only', () => {
+    // Half way through the 900-1350 band (1125): 1 - 0.5² = 0.75
+    expect(calculateVolume(1125)).toBeCloseTo(0.75, 5);
+    // Three quarters through (1237.5): 1 - 0.75² = 0.4375
+    expect(calculateVolume(1237.5)).toBeCloseTo(0.4375, 5);
   });
 
   it('is deterministic — same input gives same output', () => {
@@ -111,7 +124,7 @@ describe('computeVolumesFromRoom (v0.2 path)', () => {
       { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me' },
       makeGetter({
         Adjacent: { x: 0, y: 0 },       // distance 0 → 1.0
-        Mid: { x: 675, y: 0 },           // half range → 0.75
+        Mid: { x: 1125, y: 0 },          // half way through the falloff band → 0.75
         Far: { x: 1350, y: 0 },          // at edge → 0.0
       }),
     );
@@ -193,8 +206,8 @@ describe('computeTieredVolumes (v0.3 path)', () => {
       { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me', allyProximity: true },
       makeGetter([
         { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: Date.now() } },
-        { name: 'AllyClose',  team: 'ORDER', position: { x: 400, y: 0, updatedMs: Date.now() } },
-        { name: 'AllyEdge',   team: 'ORDER', position: { x: 1300, y: 0, updatedMs: Date.now() } }, // < 1350 → faint
+        { name: 'AllyClose',  team: 'ORDER', position: { x: 1050, y: 0, updatedMs: Date.now() } }, // in the band → attenuated
+        { name: 'AllyEdge',   team: 'ORDER', position: { x: 1340, y: 0, updatedMs: Date.now() } }, // just inside 1350 → faint
         { name: 'AllyBeyond', team: 'ORDER', position: { x: 1500, y: 0, updatedMs: Date.now() } }, // > 1350 → omitted
       ]),
     );
@@ -211,7 +224,7 @@ describe('computeTieredVolumes (v0.3 path)', () => {
       makeGetter([
         { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: Date.now() } },
         { name: 'EnemyClose',  team: 'CHAOS', position: { x: 400, y: 0, updatedMs: Date.now() } },
-        { name: 'EnemyEdge',   team: 'CHAOS', position: { x: 1300, y: 0, updatedMs: Date.now() } }, // < 1350 → faintly audible
+        { name: 'EnemyEdge',   team: 'CHAOS', position: { x: 1340, y: 0, updatedMs: Date.now() } }, // < 1350 → faintly audible
         { name: 'EnemyBeyond', team: 'CHAOS', position: { x: 1500, y: 0, updatedMs: Date.now() } }, // > 1350 → omitted
       ]),
     );
@@ -363,5 +376,112 @@ describe('computeTieredVolumes — listenPosition ("voice on camera", #36)', () 
     );
     // Enemy is still far from the camera, so still absent from the response.
     expect(result.peerVolumes.Enemy).toBeUndefined();
+  });
+});
+
+// The other half of docs/threat-model.md Part 1, in the blocking `server` job:
+// /compute-volumes is the one endpoint that HAS every peer's raw XY in hand,
+// and it must answer with gains only. `index.ts` writes `JSON.stringify(result)`
+// straight to the response, so the wire payload is exactly what these functions
+// return. tests/e2e/compliance.e2e.test.ts sweeps the live responses, but it
+// runs only in the continue-on-error `e2e` job — see .github/workflows/ci.yml.
+describe('/compute-volumes response shape', () => {
+  /** Every object anywhere in `value`, the root included. */
+  function objectsIn(value: unknown, out: Record<string, unknown>[] = []): Record<string, unknown>[] {
+    if (Array.isArray(value)) {
+      for (const item of value) objectsIn(item, out);
+    } else if (value && typeof value === 'object') {
+      out.push(value as Record<string, unknown>);
+      for (const item of Object.values(value)) objectsIn(item, out);
+    }
+    return out;
+  }
+
+  /** A numeric x/y pair is what a leaked game coordinate looks like on the wire. */
+  function coordinateShaped(value: unknown): Record<string, unknown>[] {
+    return objectsIn(value).filter(o => typeof o.x === 'number' && typeof o.y === 'number');
+  }
+
+  /**
+   * Asserts the exact payload contract. Serialised first, because that is what
+   * the client receives and because an undefined-valued key would otherwise
+   * pass a key-set check while being absent on the wire.
+   */
+  function expectGainsOnly(result: unknown): Record<string, any> {
+    const wire = JSON.parse(JSON.stringify(result));
+    expect(Object.keys(wire).sort()).toEqual(['myBlob', 'peerVolumes']);
+    expect(typeof wire.myBlob).toBe('string');
+    for (const [name, volume] of Object.entries(wire.peerVolumes)) {
+      expect(typeof name).toBe('string');
+      expect(typeof volume).toBe('number');
+      expect(volume as number).toBeGreaterThanOrEqual(0);
+      expect(volume as number).toBeLessThanOrEqual(1);
+    }
+    expect(coordinateShaped(wire)).toEqual([]);
+    return wire;
+  }
+
+  const now = () => Date.now();
+
+  it('answers the v0.3 tiered path with gains only', () => {
+    const wire = expectGainsOnly(computeTieredVolumes(
+      { myPosition: { x: 4200, y: 7300 }, roomId: 'r1', name: 'Me' },
+      () => [
+        { name: 'Me', team: 'ORDER', position: { x: 4200, y: 7300, updatedMs: now() } },
+        { name: 'Ally', team: 'ORDER', position: { x: 9000, y: 1000, updatedMs: now() } },
+        { name: 'Enemy', team: 'CHAOS', position: { x: 4600, y: 7300, updatedMs: now() } },
+      ],
+    ));
+    // Both tiers present, so the sweep above ran over a populated response
+    // rather than an empty one.
+    expect(Object.keys(wire.peerVolumes).sort()).toEqual(['Ally', 'Enemy']);
+  });
+
+  it('answers the camera (listenPosition) path with gains only', () => {
+    // #36 hands the endpoint a SECOND coordinate pair per request, which is the
+    // newest thing it could echo back.
+    const wire = expectGainsOnly(computeTieredVolumes(
+      {
+        myPosition: { x: 0, y: 0 },
+        roomId: 'r1',
+        name: 'Me',
+        listenPosition: { x: 5000, y: 0 },
+      },
+      () => [
+        { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: now() } },
+        { name: 'Enemy', team: 'CHAOS', position: { x: 5100, y: 0, updatedMs: now() } },
+      ],
+    ));
+    expect(wire.peerVolumes.Enemy).toBeGreaterThan(0);
+  });
+
+  it('answers the v0.2 room path with gains only', () => {
+    const wire = expectGainsOnly(computeVolumesFromRoom(
+      { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me' },
+      () => ({ Near: { x: 400, y: 0 } }),
+    ));
+    expect(wire.peerVolumes.Near).toBeGreaterThan(0);
+  });
+
+  it('answers the legacy v0.1 encrypted path with gains only', async () => {
+    const peerBlob = await encryptPosition(TEST_KEY, 400, 0);
+    const wire = expectGainsOnly(await computeVolumes(
+      { myPosition: { x: 0, y: 0 }, peers: { PeerA: peerBlob } },
+      TEST_KEY,
+    ));
+    expect(wire.peerVolumes.PeerA).toBeGreaterThan(0);
+    // This path really does return a blob, so the myBlob key is not vacuously
+    // an empty string in every branch.
+    expect(wire.myBlob).not.toBe('');
+  });
+
+  it('answers with gains only when the requester is not in the room', () => {
+    // The early-return branch — a separate return statement, so it needs its
+    // own sweep.
+    const wire = expectGainsOnly(computeTieredVolumes(
+      { myPosition: { x: 4200, y: 7300 }, roomId: 'r1', name: 'Stranger' },
+      () => [{ name: 'Me', team: 'ORDER', position: { x: 4200, y: 7300, updatedMs: now() } }],
+    ));
+    expect(wire.peerVolumes).toEqual({});
   });
 });

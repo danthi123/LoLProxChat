@@ -6,7 +6,11 @@ LoLProxChat is built to stay within the categories Riot Games explicitly publish
 
 - Reads the **League Client (LCU) API** for game phase and your summoner identity, and the **Live Client Data API** (`https://127.0.0.1:2999`) for the player roster. Both are interfaces Riot specifically designed for third-party use. See the [LCU policy](https://www.riotgames.com/en/DevRel/changes-to-the-lcu-api-policy).
 - Captures the **minimap region only** via standard Win32 `BitBlt` — the same mechanism OBS, ShareX, and the Snipping Tool use. No video frames from the game render path are touched.
+- Locates the **game window** with `FindWindowW` + `GetClientRect` — read-only window-manager queries against a window handle, the same pair every overlay uses to position itself. It is what anchors the capture region to the game's bottom-right corner instead of the primary monitor's, so the app works when League runs windowed or on a second display. No memory read, no injection, and the rect never leaves the machine.
 - Renders an **overlay window** that paints **outside** the LoL process — never injects, never reads game memory, never hooks DirectX. Riot's own Vanguard FAQ confirms: *"Overlays and internal tools using the API, game client, and in-game APIs should continue to function"* ([Vanguard FAQ](https://www.riotgames.com/en/DevRel/vanguard-faq)).
+- Installs a user-mode **`WH_KEYBOARD_LL` keyboard hook** so push-to-talk reaches the app while the game has focus — the same mechanism Discord, Mumble, and OBS use, running in our own process and never inside LoL's. The hook **observes and passes every key straight through**: it never withholds a keystroke from the game or from any other application.
+
+  The one thing it writes back is a single synthetic Caps Lock press via `SendInput`, and only when Caps Lock is the bound push-to-talk key. Windows toggles Caps Lock on the down edge of each press, so the app cancels that toggle to stop PTT from flipping your Caps Lock state all game ([#27](https://github.com/danthi123/LoLProxChat/issues/27)). Stated plainly, because the list below is about what the app does not do: this is a real OS-level keystroke on the normal input queue, so the focused window — LoL included — sees one extra Caps Lock press per PTT press. It is not injection into the game process, it carries no gameplay key, and LoL binds nothing to Caps Lock by default. Bind PTT to any other key in Settings and no synthetic input is sent at all.
 
 ## What it explicitly does NOT do (Riot ban triggers)
 
@@ -21,11 +25,13 @@ LoLProxChat is built to stay within the categories Riot Games explicitly publish
 
 ## Specifically: the proximity audio
 
-The volume falloff drops to zero at ~1350 game units — roughly a champion's vision range. You only hear enemies who are close enough that the game would already give you visual indicators of their presence (minimap icon when they walk past warded ground, champion model when they enter your vision); they fade in faintly at that edge and grow louder as they approach.
+The volume falloff drops to zero at ~1350 game units — roughly a champion's vision range. You only hear enemies who are close enough that the game would already give you visual indicators of their presence (minimap icon when they walk past warded ground, champion model when they enter your vision); they fade in faintly at that edge and reach full volume once they are within ~900 units, about the distance two ranged champions hold a lane at.
+
+That inner plateau is a loudness choice, not a reach one: the ~1350-unit cutoff is what bounds *which* enemies are audible, and it is unchanged. Inside the plateau volume is constant, so it conveys nothing about how far away the enemy actually is.
 
 The app does not reveal *where* an enemy is — only that one is somewhere within hearing range. This is strictly less information than Discord voice chat with the same opponent already provides (which has zero distance modulation).
 
-For the precise threat-modeling around how a modified client *could* extract additional information from the volume side channel, and the server-side quantization + jitter mitigations applied, see [`threat-model.md`](threat-model.md).
+For the precise threat-modeling around how a modified client *could* extract additional information from the volume side channel, see [`threat-model.md`](threat-model.md). Note that the volume value the server returns is **continuous** — the v0.1.26 bucket quantization and jitter were reverted in v0.1.33 because the bucket transitions were audible in real games; the mitigations that remain are the hard cutoff at vision range and the staleness window on peer coordinates.
 
 ## Specifically: "Voice on camera" (opt-in, default OFF)
 

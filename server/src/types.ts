@@ -14,6 +14,12 @@ export interface ClientMessage {
   // blobs for each other (see docs/plans/2026-06-02-server-side-positions.md).
   x?: number;
   y?: number;
+  // 'coords' only. True means "this is the last place I saw myself, not where
+  // I am" — the client's tracker has lost the player. Absent from every client
+  // before v0.5.9, which is why the flag rides on coords rather than a message
+  // type of its own: an old client simply never sets it and the server falls
+  // back to the staleness timeout exactly as before.
+  stale?: boolean;
   // v0.3: team identifier on 'join' (ORDER / CHAOS). Optional for back-compat
   // — a v0.2 client omits it and the server falls back to team-blind behavior.
   team?: 'ORDER' | 'CHAOS';

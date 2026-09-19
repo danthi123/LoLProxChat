@@ -73,10 +73,13 @@ The log is plain text. It contains your summoner name and nearby players' summon
 | Overlay invisible during gameplay | League is in true fullscreen — switch to **Borderless** in Video Settings. |
 | Panel sits in the middle of the screen | No game detected yet, or tracking hasn't locked on. The panel's status text tells you which. |
 | Panel sits above the minimap instead of beside it | The detected minimap bounds are off. Turn on **Debug** and check the tracking log lines. (The draggable panel never auto-positions — only the minimap overlay does.) |
+| Panel says it can't find the League window | League is in true fullscreen, or minimized. Switch to **Borderless** in Video Settings. |
+| Tracking never locks when League is on a second monitor | Fixed in v0.5.9 — update. Older builds only ever looked at the primary monitor, so the capture region landed on the wrong display. |
+| Tracking never locks at a very large minimap | The debug log says `capture square is only NNNpx`. Lower **MinimapScale** in League's HUD settings. |
 | Audio cuts out or crackles | Usually the minimap scan competing for the main thread at a high scan rate. Lower the **Scan Rate** slider to ~50 (Debug). |
 | Connected to a peer but hear nothing | First check your **Output Device** (Settings) — the wrong default device is the most common cause. Then turn on Debug and confirm the connection reaches `connected`; if it shows `failed`, you're behind a restrictive network and need **Hide IP (Force TURN)**. |
 | Can't hear one specific player | Check their per-player volume slider isn't at zero and their **MUTE** isn't on. |
-| Faint or no audio from a nearby enemy | Enemy voices are quiet at the edge of champion-vision range and grow louder as they approach — that's by design. Allies are always full volume. |
+| Faint or no audio from a nearby enemy | Enemy voices are full volume within about 900 game units and fade over the last stretch to ~1350 (roughly champion-vision range), where they cut out — that's by design. Allies are always full volume. If an enemy standing next to you is still faint, that's tracking, not the falloff: turn on Debug and check the log. |
 | Something else seems off | Make sure you're on the latest version: turn on **Auto-update**, or grab the newest build from [Releases](https://github.com/danthi123/LoLProxChat/releases/latest). |
 
 ## Updating

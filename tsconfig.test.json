@@ -1,0 +1,16 @@
+// Type-check config for the test tree. tsconfig.json deliberately covers only
+// src/, so `npx tsc --noEmit` never looked at a single test file — this is the
+// config that does.
+//
+// rootDir has to be widened to the repo root: the base sets it to ./src, and a
+// file outside it is TS6059 even under noEmit. "node" joins the type list
+// because the suites use node globals (timers, Buffer, process).
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true,
+    "types": ["jest", "node"]
+  },
+  "include": ["src/**/*", "tests/**/*"]
+}
