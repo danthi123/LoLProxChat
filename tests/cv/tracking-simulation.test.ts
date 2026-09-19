@@ -582,3 +582,64 @@ describe('a single-frame classifier misfire', () => {
     expect(distance(last.px!, VANISH)).toBeLessThan(12);
   });
 });
+
+describe('a recall', () => {
+  // A recall is an instant teleport across the map, and the tracker cannot
+  // follow one: the destination is far outside the per-frame jump radius, and
+  // Phase 2 re-acquisition wants high classifier confidence — which tightens
+  // further precisely BECAUSE the champion stood still to channel it.
+  //
+  // So the reported position keeps pointing at the lane for a while after the
+  // champion is already in base, and an enemy standing where they were goes on
+  // hearing them. This pins how long that window is, because it is a number
+  // worth noticing if it grows.
+  const LANE: Point = { x: 190, y: 110 };
+  const BASE: Point = { x: 30, y: 245 };
+
+  const stand = (at: Point, trailFrom: number, n: number): SceneSpec[] =>
+    Array.from({ length: n }, () => ({
+      self: at,
+      selfTrail: { x: at.x + trailFrom, y: at.y },
+      allies: [{ x: 60, y: 60 }],
+    }));
+
+  test('the reported position lags in lane for several seconds after the teleport', async () => {
+    const specs = [...stand(LANE, -6, 32), ...stand(BASE, 6, 72)];
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const recs = await driveTracker(h, scenes);
+
+    const post = recs.slice(32);
+    const near = (p: { x: number; y: number } | null, t: Point) =>
+      !!p && Math.hypot(p.x - t.x, p.y - t.y) < 20;
+
+    const stillLane = post.filter(r => near(r.px, LANE)).length;
+    const firstAtBase = post.findIndex(r => near(r.px, BASE));
+
+    // It does recover — this is a lag, not the v0.5.8 permanent freeze.
+    expect(firstAtBase).toBeGreaterThanOrEqual(0);
+    // ...but not quickly. Measured at 48 frames (6.0s at the 8 FPS the harness
+    // runs); the client additionally stops sending coords partway through, and
+    // the server then holds the last one for STALE_POSITION_MS on top.
+    expect(stillLane).toBeGreaterThan(24);
+    expect(firstAtBase).toBeLessThanOrEqual(56);
+  });
+
+  test('coords stop being sent well before the position is right again', async () => {
+    // positionTickInner suppresses coords once the hold passes 2s, so the
+    // phantom window is bounded by that plus the server's staleness horizon
+    // rather than by the tracker recovering.
+    const specs = [...stand(LANE, -6, 32), ...stand(BASE, 6, 72)];
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const recs = await driveTracker(h, scenes);
+
+    const post = recs.slice(32);
+    const suppressedAt = post.findIndex(r => r.holdSec > 2);
+    const firstAtBase = post.findIndex(
+      r => !!r.px && Math.hypot(r.px.x - BASE.x, r.px.y - BASE.y) < 20,
+    );
+    expect(suppressedAt).toBeGreaterThanOrEqual(0);
+    expect(suppressedAt).toBeLessThan(firstAtBase);
+  });
+});
