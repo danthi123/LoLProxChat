@@ -282,7 +282,10 @@ describe('the audio level monitor', () => {
     const first = new AudioService(signaling, 'me', peerFactory);
     await first.initMicrophone();
     const withOneSession = jest.getTimerCount();
-    expect(withOneSession).toBe(1);
+    // Two per session: the 2s level monitor and the 20Hz volume glide. The
+    // number matters far less than the two assertions below — that cleanup
+    // returns to zero, and that a second session does not accumulate.
+    expect(withOneSession).toBe(2);
 
     first.cleanup();
     expect(jest.getTimerCount()).toBe(0);

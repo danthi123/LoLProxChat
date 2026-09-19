@@ -83,13 +83,13 @@ export function resolveProximityTargets(
 // an ordinary, deliberate event rather than a sign of packet loss: panning the
 // camera off someone should stop their voice promptly, and a tester measured a
 // median 4.9s before an enemy fell silent, of which this window was the largest
-// single part. 600ms still absorbs six ticks at the 10 Hz volume cadence, which
+// single part. 300ms still absorbs three ticks at the 10 Hz volume cadence, which
 // is the "packet or two" this exists for. It can afford to be this short
 // because the server independently keeps a peer's last position for
 // STALE_POSITION_MS, so a dropped coords message does not remove them from the
 // response in the first place — this window only ever covers a peer genuinely
 // leaving range or the room.
-const PROXIMITY_GRACE_MS = 600;
+const PROXIMITY_GRACE_MS = 300;
 
 // Cap on signals buffered for a peer that does not exist yet. A real trickle-ICE
 // burst is well under half of this; the cap only bounds a peer spraying at the
@@ -165,6 +165,18 @@ export class AudioService {
   private pttHeld = false;
 
   /**
+   * Drives every peer's volume glide on a LOCAL clock.
+   *
+   * The glide used to advance one step per proximity update, which arrives only
+   * as fast as a round trip to the signaling server allows — so how quickly a
+   * peer faded out depended on the network, and in practice ran at about half
+   * the rate the smoothing was designed for. Stepping here instead makes the
+   * fade a fixed wall-clock duration, and keeps each individual step small
+   * enough to stay click-free.
+   */
+  private volumeGlideId: number | null = null;
+
+  /**
    * How a peer connection is built. The default is the real one; tests/e2e
    * substitutes a fake so two orchestrators can complete the real signaling
    * handshake — through the real server — without WebRTC. Every creation path
@@ -210,6 +222,8 @@ export class AudioService {
     // Apply initial transmit state through the normal path so the first
     // [Audio] Local mic transmit log line is emitted.
     this.updateLocalTrackState();
+
+    this.startVolumeGlide();
 
     // Attach analysers to monitor whether the mic is actually producing audio
     // and whether the WebRTC-output stream contains audio. Reported every 2s.
@@ -259,6 +273,17 @@ export class AudioService {
         ' selfMuted=' + this.selfMuted,
       );
     }, 2000) as unknown as number;
+  }
+
+  /** 20 Hz: fast enough that a fade finishes promptly, slow enough to be cheap. */
+  private static readonly VOLUME_GLIDE_MS = 50;
+
+  private startVolumeGlide(): void {
+    if (this.volumeGlideId !== null) return;
+    this.volumeGlideId = window.setInterval(() => {
+      const now = performance.now();
+      for (const peer of this.peers.values()) peer.stepVolume(now);
+    }, AudioService.VOLUME_GLIDE_MS) as unknown as number;
   }
 
   private isTransmitting(): boolean {
@@ -751,6 +776,10 @@ export class AudioService {
     if (this.levelMonitorId !== null) {
       clearInterval(this.levelMonitorId);
       this.levelMonitorId = null;
+    }
+    if (this.volumeGlideId !== null) {
+      clearInterval(this.volumeGlideId);
+      this.volumeGlideId = null;
     }
     this.micLevelAnalyser = null;
     this.outputLevelAnalyser = null;

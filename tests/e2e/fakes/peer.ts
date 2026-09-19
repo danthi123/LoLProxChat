@@ -46,7 +46,15 @@ export class FakePeerConnection {
   async handleAnswer(_payload: unknown): Promise<void> { this.answersHandled++; }
   async addIceCandidate(payload: unknown): Promise<void> { this.remoteCandidates.push(payload); }
 
+  // Records the TARGET the proximity pipeline asked for, with no glide. The
+  // real class separates the two — setVolume names a destination and stepVolume
+  // walks towards it on a timer — but an e2e assertion is about what the server
+  // decided this peer should be, not how many frames the gain took to get
+  // there, and a fake that reproduced the ramp would make every assertion a
+  // timing race.
   setVolume(volume: number): void { this.volume = volume; this.volumes.push(volume); }
+  /** No-op: this fake is already at its target the moment it is set. */
+  stepVolume(_nowMs: number): void { /* nothing to glide */ }
   mute(): void { this.muted = true; }
   unmute(): void { this.muted = false; }
   close(): void { this.closed = true; }

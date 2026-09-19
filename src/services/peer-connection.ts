@@ -17,6 +17,18 @@ import { getForceTurnRelay } from './privacy';
 //     them. Falling quiet quickly has no audible downside; there is nothing to
 //     startle.
 // Exported so tests can verify the math without a real RTCPeerConnection.
+// Time constants, in seconds, for the two directions. Falling is quicker for
+// the reason above; both are long enough that a step at the smoothing rate
+// stays small, which is what keeps the gain change click-free without WebAudio
+// ramping.
+const RISE_TAU_SEC = 0.30;
+const FALL_TAU_SEC = 0.12;
+
+// Ceilings on a single step, whatever the elapsed time says. The exponential
+// alone tends to 1 as dt grows, so one long gap — a throttled timer, a paused
+// session — would jump straight to the target. That is unacceptable upwards,
+// where it means a peer who re-enters range arrives at full volume in one step,
+// and merely untidy downwards, where an abrupt drop to silence can click.
 const RISE_ALPHA_CAP = 0.3;
 const FALL_ALPHA_CAP = 0.6;
 
@@ -28,9 +40,11 @@ export function nextSmoothedVolume(
 ): number {
   const clamped = Math.max(0, Math.min(1, target));
   if (prev === null) return clamped;
-  const dtSec = (nowMs - lastUpdateMs) / 1000;
-  const cap = clamped < prev ? FALL_ALPHA_CAP : RISE_ALPHA_CAP;
-  const alpha = Math.min(cap, 1 - Math.exp(-dtSec / 0.3));
+  const dtSec = Math.max(0, (nowMs - lastUpdateMs) / 1000);
+  const falling = clamped < prev;
+  const tau = falling ? FALL_TAU_SEC : RISE_TAU_SEC;
+  const cap = falling ? FALL_ALPHA_CAP : RISE_ALPHA_CAP;
+  const alpha = Math.min(cap, 1 - Math.exp(-dtSec / tau));
   return prev * (1 - alpha) + clamped * alpha;
 }
 
@@ -284,11 +298,43 @@ export class PeerConnection {
     this.pendingCandidates = [];
   }
 
+  /**
+   * Where this peer's gain should end up. Only records the target — the glide
+   * towards it is driven by stepVolume on a local timer.
+   *
+   * These used to be the same call, one EMA step per setVolume, which tied the
+   * fade rate to how often the proximity loop ran. That loop awaits a round
+   * trip to the signaling server, so on a real connection it ticks nearer 6 Hz
+   * than the 10 it is written for, and a peer going out of range took several
+   * seconds to fall quiet instead of well under one.
+   */
   setVolume(volume: number): void {
-    const now = performance.now();
-    this.smoothedVolume = nextSmoothedVolume(this.smoothedVolume, volume, now, this.lastSetVolumeMs);
-    this.lastSetVolumeMs = now;
-    this.targetVolume = this.smoothedVolume;
+    this.targetVolume = Math.max(0, Math.min(1, volume));
+    if (this.smoothedVolume === null) {
+      // First value for this peer snaps, so a new peer does not audibly ramp
+      // up from silence to wherever they actually are.
+      this.smoothedVolume = this.targetVolume;
+      this.lastSetVolumeMs = performance.now();
+      if (!this.muted) this.applyGain(this.smoothedVolume);
+    }
+  }
+
+  /** One smoothing step towards the target. Driven by AudioService's ticker. */
+  stepVolume(nowMs: number): void {
+    if (this.smoothedVolume === null) return;
+    if (this.smoothedVolume === this.targetVolume) {
+      this.lastSetVolumeMs = nowMs;
+      return;
+    }
+    this.smoothedVolume = nextSmoothedVolume(
+      this.smoothedVolume, this.targetVolume, nowMs, this.lastSetVolumeMs,
+    );
+    this.lastSetVolumeMs = nowMs;
+    // Settle exactly rather than approaching forever, so a peer that should be
+    // silent reaches zero instead of an inaudible-but-nonzero gain.
+    if (Math.abs(this.smoothedVolume - this.targetVolume) < 0.005) {
+      this.smoothedVolume = this.targetVolume;
+    }
     if (!this.muted) this.applyGain(this.smoothedVolume);
   }
 
@@ -300,7 +346,9 @@ export class PeerConnection {
   unmute(): void {
     this.muted = false;
     this.audioElement.muted = false;
-    this.applyGain(this.targetVolume);
+    // Resume at where the glide has actually reached, not at the target it is
+    // still travelling towards — otherwise unmuting jumps the gain.
+    this.applyGain(this.smoothedVolume ?? this.targetVolume);
   }
 
   close(): void {

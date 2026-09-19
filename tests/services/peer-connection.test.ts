@@ -75,15 +75,23 @@ describe('nextSmoothedVolume — asymmetric ramp', () => {
     return t / 1000;
   };
 
-  test('falls faster than it rises exactly when the loop is slow', () => {
-    // The caps only bind once a tick is long enough that the natural alpha
-    // would exceed them. At a healthy 10 Hz neither binds, so the two
-    // directions are identical and nothing is traded away; at 6 Hz — what the
-    // 100ms loop degrades to once a /compute-volumes round trip is counted,
-    // and the regime the tester was actually in — the fall cap is what lets it
-    // move quicker than the rise.
-    expect(secondsToFall(6)).toBeLessThan(secondsToRise(6));
-    expect(secondsToFall(10)).toBe(secondsToRise(10));
+  test('falls faster than it rises at every rate the glide runs at', () => {
+    // The two directions have different time constants now, not just different
+    // ceilings, so the asymmetry holds whatever the step rate — including the
+    // 20Hz the local glide actually ticks at.
+    for (const hz of [6, 10, 20]) {
+      expect(secondsToFall(hz)).toBeLessThan(secondsToRise(hz));
+    }
+  });
+
+  test('a peer leaving range is inaudible inside half a second at glide rate', () => {
+    // The whole point of moving the glide off the network clock: this number is
+    // now a property of the smoother, not of the server round-trip time.
+    const dt = 1000 / 20;
+    let v = 1;
+    let t = 0;
+    while (v > 0.05 && t < 20000) { v = nextSmoothedVolume(v, 0, t + dt, t); t += dt; }
+    expect(t / 1000).toBeLessThan(0.5);
   });
 
   test('a peer leaving range is silent well inside two seconds', () => {
