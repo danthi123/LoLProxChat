@@ -239,13 +239,43 @@ export function nextClassifierEma(currentEma: number, raw: number, decay: number
  * corner) reports null instead of a centre that is off by half its width. The
  * caller falls back to the champion's own position in that case.
  */
+/**
+ * Why a frame produced no camera centre. A bare null tells a bug report nothing:
+ * "the rectangle was not readable" covers both "no bright pixels survived the
+ * white threshold at all" and "the rectangle was found but looked implausible",
+ * which need opposite fixes.
+ */
+export type ViewportMiss =
+  | 'no-marked-pixels'
+  | 'no-opposing-edges'
+  | 'span-too-large'
+  | 'edges-disagree';
+
+export interface ViewportResult {
+  centre: { cx: number; cy: number } | null;
+  miss?: ViewportMiss;
+  /** Marked pixels seen, so a threshold problem is distinguishable from a shape one. */
+  markedPixels: number;
+}
+
 export function computeViewportCenter(
   viewportMask: Uint8Array,
   width: number,
   height: number,
   minRunPx = 12,
 ): { cx: number; cy: number } | null {
-  if (width <= 0 || height <= 0 || viewportMask.length < width * height) return null;
+  return describeViewportCenter(viewportMask, width, height, minRunPx).centre;
+}
+
+export function describeViewportCenter(
+  viewportMask: Uint8Array,
+  width: number,
+  height: number,
+  minRunPx = 12,
+): ViewportResult {
+  if (width <= 0 || height <= 0 || viewportMask.length < width * height) {
+    return { centre: null, miss: 'no-marked-pixels', markedPixels: 0 };
+  }
 
   const rowCounts = new Uint32Array(height);
   const colCounts = new Uint32Array(width);
@@ -265,20 +295,31 @@ export function computeViewportCenter(
   const MIN_SPAN_FRACTION = 0.04;
   const MAX_SPAN_FRACTION = 0.70;
 
+  let markedPixels = 0;
+  for (let y = 0; y < height; y++) markedPixels += rowCounts[y];
+  if (markedPixels === 0) return { centre: null, miss: 'no-marked-pixels', markedPixels };
+
   const rows = findOpposingEdges(rowCounts, minRunPx, height * MIN_SPAN_FRACTION);
   const cols = findOpposingEdges(colCounts, minRunPx, width * MIN_SPAN_FRACTION);
-  if (!rows || !cols) return null;
+  if (!rows || !cols) return { centre: null, miss: 'no-opposing-edges', markedPixels };
 
   const spanX = cols.far - cols.near;
   const spanY = rows.far - rows.near;
-  if (spanX > width * MAX_SPAN_FRACTION || spanY > height * MAX_SPAN_FRACTION) return null;
+  if (spanX > width * MAX_SPAN_FRACTION || spanY > height * MAX_SPAN_FRACTION) {
+    return { centre: null, miss: 'span-too-large', markedPixels };
+  }
 
   // Consistency: the horizontal edges should be about as long as the box is
   // wide, and the vertical edges about as tall as it is high. A pairing that
   // fails this is two unrelated runs, not one rectangle.
-  if (!spansAgree(rows.strength, spanX) || !spansAgree(cols.strength, spanY)) return null;
+  if (!spansAgree(rows.strength, spanX) || !spansAgree(cols.strength, spanY)) {
+    return { centre: null, miss: 'edges-disagree', markedPixels };
+  }
 
-  return { cx: (cols.near + cols.far) / 2, cy: (rows.near + rows.far) / 2 };
+  return {
+    centre: { cx: (cols.near + cols.far) / 2, cy: (rows.near + rows.far) / 2 },
+    markedPixels,
+  };
 }
 
 /**

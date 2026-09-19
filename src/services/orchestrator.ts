@@ -593,7 +593,10 @@ export class Orchestrator {
       this.lastCameraListenState = null;
       return;
     }
-    const state = listenPosition ? 'camera' : 'fallback-champion';
+    const miss = listenPosition ? null : this.tracking?.getCameraMiss() ?? null;
+    const state = listenPosition
+      ? 'camera'
+      : 'fallback-champion:' + (miss ? miss.reason + '/' + miss.markedPixels + 'px' : 'unknown');
     if (state === this.lastCameraListenState) return;
     this.lastCameraListenState = state;
     console.log('[LoLProxChat] Voice on camera: hearing from ' + state +

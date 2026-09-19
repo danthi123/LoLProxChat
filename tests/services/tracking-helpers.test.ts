@@ -10,6 +10,7 @@ import {
   nextClassifierEma,
   computeNearFieldPx,
   computeViewportCenter,
+  describeViewportCenter,
 } from '../../src/services/tracking-helpers';
 import type { Blob } from '../../src/services/blob-types';
 
@@ -388,5 +389,55 @@ describe('computeViewportCenter (#36 voice on camera)', () => {
   test('guards against a mask smaller than the stated region', () => {
     expect(computeViewportCenter(new Uint8Array(10), W, H)).toBeNull();
     expect(computeViewportCenter(new Uint8Array(0), 0, 0)).toBeNull();
+  });
+});
+
+describe('describeViewportCenter — why a camera frame missed', () => {
+  const W = 340, H = 340;
+
+  function mkMask(left: number, top: number, right: number, bottom: number): Uint8Array {
+    const mask = new Uint8Array(W * H);
+    for (let x = left; x <= right; x++) { mask[top * W + x] = 1; mask[bottom * W + x] = 1; }
+    for (let y = top; y <= bottom; y++) { mask[y * W + left] = 1; mask[y * W + right] = 1; }
+    return mask;
+  }
+
+  // These four reasons need opposite fixes — a threshold that is too strict
+  // versus a rectangle that is the wrong shape — so a bug report has to be able
+  // to tell them apart. Before this, every one of them logged "not readable".
+  test('an empty mask reports no-marked-pixels, not a shape failure', () => {
+    const r = describeViewportCenter(new Uint8Array(W * H), W, H);
+    expect(r.centre).toBeNull();
+    expect(r.miss).toBe('no-marked-pixels');
+    expect(r.markedPixels).toBe(0);
+  });
+
+  test('marked pixels that form no rectangle report no-opposing-edges', () => {
+    // A single long horizontal streak: pixels exist, but there is no second
+    // edge to pair it with.
+    const mask = new Uint8Array(W * H);
+    for (let x = 100; x < 180; x++) mask[150 * W + x] = 1;
+    const r = describeViewportCenter(mask, W, H);
+    expect(r.centre).toBeNull();
+    expect(r.miss).toBe('no-opposing-edges');
+    expect(r.markedPixels).toBeGreaterThan(0);
+  });
+
+  test('a box spanning most of the minimap reports span-too-large', () => {
+    const r = describeViewportCenter(mkMask(5, 5, 334, 334), W, H);
+    expect(r.centre).toBeNull();
+    expect(r.miss).toBe('span-too-large');
+  });
+
+  test('a real camera box reports a centre and no miss', () => {
+    const r = describeViewportCenter(mkMask(100, 150, 166, 187), W, H);
+    expect(r.centre).toEqual({ cx: 133, cy: 168.5 });
+    expect(r.miss).toBeUndefined();
+    expect(r.markedPixels).toBeGreaterThan(0);
+  });
+
+  test('computeViewportCenter still returns just the centre', () => {
+    expect(computeViewportCenter(mkMask(100, 150, 166, 187), W, H)).toEqual({ cx: 133, cy: 168.5 });
+    expect(computeViewportCenter(new Uint8Array(W * H), W, H)).toBeNull();
   });
 });

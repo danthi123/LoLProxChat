@@ -22,7 +22,8 @@ import {
   nextClassifierEma,
   shouldForceReacquisition,
   computeNearFieldPx,
-  computeViewportCenter,
+  describeViewportCenter,
+  ViewportMiss,
   FORCED_REACQUIRE_HOLD_MS,
 } from './tracking-helpers';
 
@@ -145,6 +146,12 @@ export class TrackingService {
    */
   getCameraPosition(): Position | null { return this.cameraPosition; }
 
+  /** Why the camera rectangle was not found this frame, with the pixel count
+   *  that separates "nothing passed the white threshold" from "wrong shape". */
+  getCameraMiss(): { reason: ViewportMiss; markedPixels: number } | null {
+    return this.cameraMiss ? { reason: this.cameraMiss, markedPixels: this.cameraMarkedPixels } : null;
+  }
+
   /**
    * Enable/disable camera-viewport detection. Off costs nothing — the scan is
    * two extra passes over the mask per frame, so it only runs when someone is
@@ -162,7 +169,10 @@ export class TrackingService {
     region: { x: number; y: number; width: number; height: number },
   ): void {
     if (!this.cameraTrackingEnabled) return;
-    const centre = computeViewportCenter(viewportMask, region.width, region.height);
+    const result = describeViewportCenter(viewportMask, region.width, region.height);
+    this.cameraMiss = result.miss ?? null;
+    this.cameraMarkedPixels = result.markedPixels;
+    const centre = result.centre;
     this.cameraPosition = centre
       ? this.pixelToGamePosition(region.x + centre.cx, region.y + centre.cy, region)
       : null;
@@ -607,6 +617,11 @@ export class TrackingService {
   // frame, or when camera tracking is off.
   private cameraTrackingEnabled = false;
   private cameraPosition: Position | null = null;
+  // Why the last frame produced no camera centre, for the panel/log. A bare
+  // "not readable" cannot distinguish a white-threshold problem from a
+  // shape-plausibility one, and those need opposite fixes.
+  private cameraMiss: ViewportMiss | null = null;
+  private cameraMarkedPixels = 0;
 
   /**
    * Build a mask of white pixels, marking those that belong to the camera viewport

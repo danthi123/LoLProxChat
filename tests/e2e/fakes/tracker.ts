@@ -77,6 +77,10 @@ export class ScriptedTracker {
     this.cameraTrackingEnabled = enabled;
     if (!enabled) this.cameraPosition = null;
   }
+  /** A scripted camera position is either set or absent; when it is absent the
+   *  reason is that the script said so, which is not one of the real detector's
+   *  failure modes. */
+  getCameraMiss(): null { return null; }
   getFilteredImageUrl(): string | null { return null; }
   getDetectedMinimapScreenBounds(): null { return null; }
   getScanFps(): number { return this.fps; }
