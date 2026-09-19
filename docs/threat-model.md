@@ -52,7 +52,7 @@ The client-side remnant of this idea — a peer-avoidance penalty in the tracker
 
 ### Volume itself is a coarse side channel
 
-- A modified client can read its per-peer volume vector to learn whether an enemy is within `MAX_HEARING_RANGE` (1350 game units, calibrated to roughly match LoL vision range).
+- A modified client can read its per-peer volume vector to learn whether an enemy is within `MAX_HEARING_RANGE` (1350 game units, calibrated to roughly match LoL vision range). Distance itself is only legible in the outer band: inside `FULL_VOLUME_RANGE` (900 units) every enemy reports 1.0, so the vector says "closer than 900" and nothing more precise.
 - That binary "enemy is in audible range" signal is information the stock game wouldn't provide if the enemy is in fog of war.
 - The volume is continuous, so the leak is "presence within range, plus a distance estimate" — accurate only to the noise floor of the underlying minimap tracking.
 - This leak is **inherent to proximity audio existing at all** — closing it would mean abandoning the feature.

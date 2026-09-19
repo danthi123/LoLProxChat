@@ -175,6 +175,19 @@ fn main() {
                 }
             }
 
+            // First line of every log names the build. Without it a log is not
+            // self-identifying, and a bug report against a test build is
+            // indistinguishable from one against the release it was meant to
+            // fix — which has already cost a round trip with a tester.
+            rust_log(
+                app.handle(),
+                format!(
+                    "LoLProxChat {} starting (log: lolproxchat.log is THIS session; \
+                     .1.log and .2.log are the two before it)",
+                    env!("CARGO_PKG_VERSION"),
+                ),
+            );
+
             // Install the low-level WH_KEYBOARD_LL hook for in-game PTT (#1).
             // Replaces the old RegisterHotKey-based plugin which LoL's
             // DirectInput layer was eating. Default PTT = Caps Lock (v0.5.6

@@ -172,8 +172,8 @@ describe('tiered proximity — end-to-end against the real server', () => {
     sendCoords(ally, 9000, 9000);
     // Enemy close → clearly audible
     sendCoords(enemyClose, 400, 0);
-    // Enemy near the edge of vision range (1350u) → faintly audible
-    sendCoords(enemyEdge, 1300, 0);
+    // Enemy just inside the edge of vision range (1350u) → faintly audible
+    sendCoords(enemyEdge, 1340, 0);
     // Enemy beyond vision range → omitted entirely
     sendCoords(enemyBeyond, 1500, 0);
 

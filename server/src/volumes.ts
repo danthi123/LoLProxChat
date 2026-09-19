@@ -11,6 +11,19 @@ const DEBUG_VOLUMES = process.env.DEBUG_VOLUMES === '1';
 // enemy fades in (very faintly) about when they'd enter your vision and grows
 // louder as they close. Game units (Summoner's Rift is ~14870x14980).
 const MAX_HEARING_RANGE = 1350;
+
+// Inside this radius an enemy is simply audible, with no distance attenuation
+// at all. It sits just past the distance two ranged laners hold against each
+// other, because the pure-falloff curve put a normal ranged trade at roughly
+// half volume while a melee trade sat near full — so the people the feature is
+// for could not hold a conversation in lane without walking into each other.
+//
+// This is deliberately NOT a change to what is audible: MAX_HEARING_RANGE is
+// the compliance boundary (see docs/compliance.md) and is untouched. The only
+// thing that changes is loudness inside a radius a player could already hear
+// across. It also narrows the volume side channel rather than widening it —
+// inside the plateau, volume no longer encodes distance at all.
+const FULL_VOLUME_RANGE = 900;
 // Max age of an encrypted position blob the server will accept before
 // rejecting it as stale. Tuned to absorb common Windows-clock drift
 // (NTP service can lag 10-30s in the wild — we saw this in issue #7
@@ -97,9 +110,9 @@ async function importKey(hexKey: string): Promise<CryptoKey> {
 
 export function calculateVolume(distance: number): number {
   if (distance >= MAX_HEARING_RANGE) return 0.0;
-  if (distance <= 0) return 1.0;
-  // Quadratic falloff — more generous in the mid-range than the previous
-  // logarithmic curve. At MAX/2: log gave ~0.38, quadratic gives 0.75.
+  if (distance <= FULL_VOLUME_RANGE) return 1.0;
+  // Quadratic falloff across the outer band only, so an enemy still fades
+  // rather than cutting out at the edge of the radius.
   //
   // Reverted v0.1.26 quantization (5 buckets) + ±5% jitter in v0.1.33:
   // The bucket transitions produced audible "cliffs" in real gameplay,
@@ -110,8 +123,8 @@ export function calculateVolume(distance: number): number {
   // boundaries. Reverted to continuous output; client-side EMA handles
   // transitions naturally. See docs/threat-model.md Part 1 for the
   // updated mitigation table.
-  const normalized = distance / MAX_HEARING_RANGE;
-  return Math.max(0, 1 - normalized * normalized);
+  const t = (distance - FULL_VOLUME_RANGE) / (MAX_HEARING_RANGE - FULL_VOLUME_RANGE);
+  return Math.max(0, 1 - t * t);
 }
 
 export async function encryptPosition(

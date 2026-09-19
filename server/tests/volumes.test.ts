@@ -21,19 +21,32 @@ describe('calculateVolume', () => {
     expect(calculateVolume(5000)).toBe(0.0);
   });
 
-  it('is strictly monotonically decreasing across the audible range', () => {
-    const distances = [0, 100, 200, 400, 600, 800, 1000, 1100, 1199];
-    const volumes = distances.map(calculateVolume);
-    for (let i = 1; i < volumes.length; i++) {
-      expect(volumes[i]).toBeLessThan(volumes[i - 1]);
+  it('is flat across the plateau, then strictly decreasing to the cutoff', () => {
+    // Inside the plateau every distance is equally loud — that is the point of
+    // it, and it is also why volume carries no distance information there.
+    for (const d of [0, 100, 400, 700, 899, 900]) {
+      expect(calculateVolume(d)).toBe(1.0);
+    }
+    const falling = [901, 1000, 1100, 1200, 1300, 1349].map(calculateVolume);
+    for (let i = 1; i < falling.length; i++) {
+      expect(falling[i]).toBeLessThan(falling[i - 1]);
     }
   });
 
-  it('follows the documented 1 - (d/MAX)² quadratic falloff', () => {
-    // At half the hearing range (1350/2 = 675): 1 - 0.5² = 0.75
-    expect(calculateVolume(675)).toBeCloseTo(0.75, 5);
-    // At 3/4 range (1012.5): 1 - 0.75² = 0.4375
-    expect(calculateVolume(1012.5)).toBeCloseTo(0.4375, 5);
+  it('keeps a ranged lane trade at full volume', () => {
+    // The curve exists for two ranged champions holding a lane against each
+    // other. Anything under the plateau must be indistinguishable from melee
+    // range, which the pure-falloff curve it replaced was not: it put 700u at
+    // 0.73 against melee's 0.95.
+    expect(calculateVolume(550)).toBe(calculateVolume(150));
+    expect(calculateVolume(700)).toBe(1.0);
+  });
+
+  it('falls quadratically across the outer band only', () => {
+    // Half way through the 900-1350 band (1125): 1 - 0.5² = 0.75
+    expect(calculateVolume(1125)).toBeCloseTo(0.75, 5);
+    // Three quarters through (1237.5): 1 - 0.75² = 0.4375
+    expect(calculateVolume(1237.5)).toBeCloseTo(0.4375, 5);
   });
 
   it('is deterministic — same input gives same output', () => {
@@ -111,7 +124,7 @@ describe('computeVolumesFromRoom (v0.2 path)', () => {
       { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me' },
       makeGetter({
         Adjacent: { x: 0, y: 0 },       // distance 0 → 1.0
-        Mid: { x: 675, y: 0 },           // half range → 0.75
+        Mid: { x: 1125, y: 0 },          // half way through the falloff band → 0.75
         Far: { x: 1350, y: 0 },          // at edge → 0.0
       }),
     );
@@ -193,8 +206,8 @@ describe('computeTieredVolumes (v0.3 path)', () => {
       { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me', allyProximity: true },
       makeGetter([
         { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: Date.now() } },
-        { name: 'AllyClose',  team: 'ORDER', position: { x: 400, y: 0, updatedMs: Date.now() } },
-        { name: 'AllyEdge',   team: 'ORDER', position: { x: 1300, y: 0, updatedMs: Date.now() } }, // < 1350 → faint
+        { name: 'AllyClose',  team: 'ORDER', position: { x: 1050, y: 0, updatedMs: Date.now() } }, // in the band → attenuated
+        { name: 'AllyEdge',   team: 'ORDER', position: { x: 1340, y: 0, updatedMs: Date.now() } }, // just inside 1350 → faint
         { name: 'AllyBeyond', team: 'ORDER', position: { x: 1500, y: 0, updatedMs: Date.now() } }, // > 1350 → omitted
       ]),
     );
@@ -211,7 +224,7 @@ describe('computeTieredVolumes (v0.3 path)', () => {
       makeGetter([
         { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: Date.now() } },
         { name: 'EnemyClose',  team: 'CHAOS', position: { x: 400, y: 0, updatedMs: Date.now() } },
-        { name: 'EnemyEdge',   team: 'CHAOS', position: { x: 1300, y: 0, updatedMs: Date.now() } }, // < 1350 → faintly audible
+        { name: 'EnemyEdge',   team: 'CHAOS', position: { x: 1340, y: 0, updatedMs: Date.now() } }, // < 1350 → faintly audible
         { name: 'EnemyBeyond', team: 'CHAOS', position: { x: 1500, y: 0, updatedMs: Date.now() } }, // > 1350 → omitted
       ]),
     );
