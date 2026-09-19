@@ -78,7 +78,18 @@ export function resolveProximityTargets(
 // the server response before fading to 0. Covers a dropped coords packet or two
 // on a lossy / DPI-bypass connection so the audio doesn't blip to silence and
 // back (#27).
-const PROXIMITY_GRACE_MS = 1500;
+//
+// Shortened from 1500ms once "voice on camera" made a peer leaving the response
+// an ordinary, deliberate event rather than a sign of packet loss: panning the
+// camera off someone should stop their voice promptly, and a tester measured a
+// median 4.9s before an enemy fell silent, of which this window was the largest
+// single part. 600ms still absorbs six ticks at the 10 Hz volume cadence, which
+// is the "packet or two" this exists for. It can afford to be this short
+// because the server independently keeps a peer's last position for
+// STALE_POSITION_MS, so a dropped coords message does not remove them from the
+// response in the first place — this window only ever covers a peer genuinely
+// leaving range or the room.
+const PROXIMITY_GRACE_MS = 600;
 
 // Cap on signals buffered for a peer that does not exist yet. A real trickle-ICE
 // burst is well under half of this; the cap only bounds a peer spraying at the

@@ -2,14 +2,24 @@ import { getIceServers } from '../core/config';
 import { getForceTurnRelay } from './privacy';
 
 // Time-based EMA on per-peer volume targets. Damps CV-jitter spikes without
-// introducing audible ramp delay on normal updates. Two important properties:
+// introducing audible ramp delay on normal updates. Three properties:
 //   • First call (prev == null) snaps to the new value so new peers don't
 //     start playing at 1.0 before the proximity pipeline catches up.
-//   • Alpha is capped at 0.3 so even a long gap between updates (e.g. a peer
-//     re-entering hearing range after going far away) ramps over multiple
-//     ticks instead of snapping to a loud value. At ~3 FPS update cadence,
-//     the smoother reaches ~95% of target in about a second.
+//   • Getting LOUDER is slow. A long gap between updates (a peer re-entering
+//     hearing range after being far away) must not snap to a loud value.
+//   • Getting QUIETER is fast, and deliberately faster than it used to be.
+//     The two directions are not symmetric in what they cost: a slow ramp up
+//     protects the listener from a sudden blast, while a slow ramp down just
+//     means hearing someone you should no longer hear. Measured on a real
+//     session, a peer going out of range took a median 4.9 s to fall silent —
+//     the hold window plus a ramp this gentle — which a tester reported as
+//     still hearing an enemy about four seconds after panning the camera off
+//     them. Falling quiet quickly has no audible downside; there is nothing to
+//     startle.
 // Exported so tests can verify the math without a real RTCPeerConnection.
+const RISE_ALPHA_CAP = 0.3;
+const FALL_ALPHA_CAP = 0.6;
+
 export function nextSmoothedVolume(
   prev: number | null,
   target: number,
@@ -19,7 +29,8 @@ export function nextSmoothedVolume(
   const clamped = Math.max(0, Math.min(1, target));
   if (prev === null) return clamped;
   const dtSec = (nowMs - lastUpdateMs) / 1000;
-  const alpha = Math.min(0.3, 1 - Math.exp(-dtSec / 0.3));
+  const cap = clamped < prev ? FALL_ALPHA_CAP : RISE_ALPHA_CAP;
+  const alpha = Math.min(cap, 1 - Math.exp(-dtSec / 0.3));
   return prev * (1 - alpha) + clamped * alpha;
 }
 

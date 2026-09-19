@@ -607,15 +607,17 @@ export class Orchestrator {
       return;
     }
     const miss = listenPosition ? null : this.tracking?.getCameraMiss() ?? null;
-    const state = listenPosition
-      ? 'camera'
-      : 'fallback-champion:' + (miss ? miss.reason + '/' + miss.markedPixels + 'px' : 'unknown');
+    // The pixel count is worth logging but must stay OUT of the comparison key:
+    // it moves by a pixel or two between frames, so including it made a steady
+    // failure re-log continuously and read like rapid flapping in a report.
+    const state = listenPosition ? 'camera' : 'fallback-champion:' + (miss ? miss.reason : 'unknown');
     if (state === this.lastCameraListenState) return;
     this.lastCameraListenState = state;
     console.log('[LoLProxChat] Voice on camera: hearing from ' + state +
       (listenPosition
         ? ' (' + Math.round(listenPosition.x) + ', ' + Math.round(listenPosition.y) + ')'
-        : ' — camera rectangle not readable on the minimap'));
+        : ' — camera rectangle not readable on the minimap (' +
+          (miss ? miss.markedPixels : 0) + ' marked px)'));
   }
 
   private async handlePeerPosition(peer: PositionBroadcast): Promise<void> {
