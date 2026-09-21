@@ -269,6 +269,36 @@ describe('the volume tick', () => {
     await settle();
     expect(h.volumeCalls).toBe(beforeHold);
   });
+
+  it('keeps applying volumes while holding, so peers do not stay frozen', async () => {
+    // Not reporting our position is right; not touching the volume pipeline at
+    // all is not. This path used to return before applyPeerVolumes, which left
+    // every peer at the gain they happened to have when the tracker lost us —
+    // so after a recall a player went on hearing everyone audible from the lane
+    // they had just left, for as long as the tracker stayed lost.
+    const h = await startInGame();
+    (h.orchestrator as any).peerStates = new Map([
+      ['Ally',  { summonerName: 'Ally',  championName: 'Lux',  team: 'ORDER', isMuted: false, isDead: false }],
+      ['Enemy', { summonerName: 'Enemy', championName: 'Zed',  team: 'CHAOS', isMuted: false, isDead: false }],
+    ]);
+    h.tracker.moveTo(7000, 7000);
+    await jest.advanceTimersByTimeAsync(300);
+    await settle();
+
+    h.audio.applyPeerVolumes.mockClear();
+    h.tracker.holdSec = 5;
+    await jest.advanceTimersByTimeAsync(500);
+    await settle();
+
+    expect(h.audio.applyPeerVolumes).toHaveBeenCalled();
+    const calls = h.audio.applyPeerVolumes.mock.calls;
+    const applied = calls[calls.length - 1][0];
+    // Teammates need no coordinates to be scored, so they stay audible.
+    expect(applied.Ally).toBe(1.0);
+    // The enemy is scored by distance, and we have no position to measure from,
+    // so they are omitted — which fades them rather than holding them.
+    expect(applied.Enemy).toBeUndefined();
+  });
 });
 
 describe('the audio level monitor', () => {

@@ -524,19 +524,14 @@ export class Orchestrator {
 
     // Before CV locks on (SCANNING), pass through all ally audio at full volume (fountain)
     if (this.tracking.getState() === TrackingState.SCANNING) {
-      const allyVolumes: Record<string, number> = {};
-      for (const [name, state] of this.peerStates) {
-        if (state.team === this.session.localPlayer.team) {
-          allyVolumes[name] = 1.0;
-        }
-      }
-      this.audio.applyPeerVolumes(allyVolumes);
+      this.applyTeamOnlyVolumes();
       this.broadcastOverlayState();
       return;
     }
 
     const position = this.tracking.getLastPosition();
     if (!position || (position.x === 0 && position.y === 0)) {
+      this.applyTeamOnlyVolumes();
       this.broadcastOverlayState();
       return;
     }
@@ -555,6 +550,14 @@ export class Orchestrator {
         this.coordsDisowned = true;
         this.signaling.sendCoords(position.x, position.y, /*stale*/ true);
       }
+      // Symmetric with the disown above. Telling the server to forget our
+      // position stops cross-team peers hearing US; this stops us hearing
+      // THEM, which needs saying separately because the volume pipeline is not
+      // re-entered at all on this path. Returning without applying anything
+      // used to freeze every peer at whatever gain they last had, so after a
+      // recall a player went on hearing everyone they could hear from the lane
+      // they had just left, for as long as the tracker stayed lost.
+      this.applyTeamOnlyVolumes();
       this.broadcastOverlayState();
       return;
     }
@@ -596,6 +599,26 @@ export class Orchestrator {
     }
 
     this.broadcastOverlayState();
+  }
+
+  /**
+   * What to play when our own position is unknown or not trusted: teammates at
+   * full volume, nobody else.
+   *
+   * Team audio is scored by membership and needs no coordinates, so it is
+   * unaffected. Cross-team audio is scored by distance, and with no position of
+   * our own there is no distance to score — so it is omitted, which
+   * resolveProximityTargets turns into a fade-out for any peer currently
+   * connected. The alternative is leaving the last gains in place, which means
+   * continuing to hear people on the strength of where we used to be.
+   */
+  private applyTeamOnlyVolumes(): void {
+    if (!this.audio || !this.session) return;
+    const teamVolumes: Record<string, number> = {};
+    for (const [name, state] of this.peerStates) {
+      if (state.team === this.session.localPlayer.team) teamVolumes[name] = 1.0;
+    }
+    this.audio.applyPeerVolumes(teamVolumes);
   }
 
   // Log camera-listen transitions only — at 10 Hz a per-tick line would be the
