@@ -53,6 +53,24 @@ npm run refresh-model
 
 There is no `tauri dev` flow — the project doesn't run a webpack dev server. The iterative loop is `npx tauri build && src-tauri/target/release/lolproxchat.exe`, which is fast enough at ~60-90 s for incremental Rust compiles.
 
+### Cross-compiling the Windows exe from Linux
+
+```bash
+npm run build:prod
+npx tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --no-bundle
+```
+
+Needs [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) (`cargo install cargo-xwin`) and the `x86_64-pc-windows-msvc` rustup target. The exe lands at `src-tauri/target/x86_64-pc-windows-msvc/release/lolproxchat.exe`.
+
+**Go through `tauri build`, not `cargo build` directly.** A bare `cargo xwin build --release --target x86_64-pc-windows-msvc` succeeds, produces a valid PE, and stamps the right version — but embeds none of the frontend, so you get a ~12 MB exe instead of ~28 MB that starts to a blank window. A quick check before shipping one:
+
+```bash
+# Should print a non-zero count; zero means the frontend was not embedded.
+grep -ac 'champion_classifier' src-tauri/target/x86_64-pc-windows-msvc/release/lolproxchat.exe
+```
+
+Release builds still come from CI on a real Windows runner — this path is for getting a testable exe to someone quickly.
+
 ## Project layout
 
 See [`docs/architecture.md`](docs/architecture.md) for the system-level view (windows, services, server, TURN, etc.). The relevant directories for contributors:
