@@ -6,7 +6,7 @@ import {
   computeVolumes,
   computeVolumesFromRoom,
 } from '../src/volumes.js';
-import { computeTieredVolumes } from '../src/volumes.js';
+import { computeTieredVolumes, closestApproach } from '../src/volumes.js';
 
 // 64 hex chars = 256-bit test key
 const TEST_KEY = 'a'.repeat(64);
@@ -295,87 +295,175 @@ describe('computeTieredVolumes (v0.3 path)', () => {
   });
 });
 
-describe('computeTieredVolumes — listenPosition ("voice on camera", #36)', () => {
-  const makeGetter = (clients: Array<{ name: string; team?: 'ORDER' | 'CHAOS'; position?: { x: number; y: number; updatedMs: number } }>) =>
-    () => clients;
+describe('computeTieredVolumes — "voice on camera" (#36)', () => {
+  // The feature is an opt-in BETWEEN two players. A camera in room state IS
+  // the consent: a client publishes one only while the user has the setting
+  // on, the server reads the requester's own from room state too, and a camera
+  // counts for a pair only when both sides have published one.
+  //
+  // That makes the whole thing symmetric — the point you listen from is a
+  // point you can be heard at — and it means a player who leaves the setting
+  // off can only be heard by someone actually near them on the map, whatever
+  // anyone else does with their camera.
+  type Client = {
+    name: string;
+    team?: 'ORDER' | 'CHAOS';
+    position?: { x: number; y: number; updatedMs: number };
+    camera?: { x: number; y: number; updatedMs: number };
+  };
+  const makeGetter = (clients: Client[]) => () => clients;
 
-  const room = (enemyAt: { x: number; y: number }) => makeGetter([
-    { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: Date.now() } },
-    { name: 'Enemy', team: 'CHAOS', position: { ...enemyAt, updatedMs: Date.now() } },
+  const now = () => Date.now();
+  const at = (x: number, y: number) => ({ x, y, updatedMs: now() });
+
+  /** Both players opted in; each camera given, or omitted to mean "off". */
+  const pair = (
+    mePos: { x: number; y: number },
+    enemyPos: { x: number; y: number },
+    myCam?: { x: number; y: number },
+    enemyCam?: { x: number; y: number },
+  ) => makeGetter([
+    { name: 'Me', team: 'ORDER', position: at(mePos.x, mePos.y), camera: myCam && at(myCam.x, myCam.y) },
+    { name: 'Enemy', team: 'CHAOS', position: at(enemyPos.x, enemyPos.y), camera: enemyCam && at(enemyCam.x, enemyCam.y) },
   ]);
 
+  const ask = (name: string, myPosition: { x: number; y: number }, getter: () => Client[]) =>
+    computeTieredVolumes({ myPosition, roomId: 'r1', name }, getter);
+
   it('hears an enemy near the camera that is out of range of the champion', () => {
-    // Champion at origin, enemy 5000u away — far outside the 1350u range.
-    // Camera panned to sit right next to the enemy.
-    const result = computeTieredVolumes(
-      {
-        myPosition: { x: 0, y: 0 },
-        roomId: 'r1',
-        name: 'Me',
-        listenPosition: { x: 5000, y: 0 },
-      },
-      room({ x: 5000, y: 0 }),
-    );
-    expect(result.peerVolumes.Enemy).toBe(1.0);
+    // Champions 5000u apart, far outside the 1350u range. Both opted in, and
+    // my camera is parked on top of the enemy.
+    const room = pair({ x: 0, y: 0 }, { x: 5000, y: 0 }, { x: 5000, y: 0 }, { x: 5000, y: 0 });
+    expect(ask('Me', { x: 0, y: 0 }, room).peerVolumes.Enemy).toBe(1.0);
   });
 
-  it('stops hearing an enemy next to the champion once the camera pans away', () => {
-    const result = computeTieredVolumes(
-      {
-        myPosition: { x: 0, y: 0 },
-        roomId: 'r1',
-        name: 'Me',
-        listenPosition: { x: 9000, y: 9000 },
-      },
-      room({ x: 100, y: 0 }),
-    );
-    expect(result.peerVolumes.Enemy).toBeUndefined();
+  it('...and the enemy hears the eavesdropper just as loudly', () => {
+    // The point of the symmetry: listening from a camera means being audible
+    // at it. Panning onto a fight to listen in is not free.
+    const room = pair({ x: 0, y: 0 }, { x: 5000, y: 0 }, { x: 5000, y: 0 }, { x: 5000, y: 0 });
+    expect(ask('Enemy', { x: 5000, y: 0 }, room).peerVolumes.Me).toBe(1.0);
   });
 
-  it('falls back to the champion position when no listenPosition is sent', () => {
-    const result = computeTieredVolumes(
-      { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me' },
-      room({ x: 100, y: 0 }),
-    );
-    expect(result.peerVolumes.Enemy).toBeGreaterThan(0);
-  });
-
-  it('ignores a malformed listenPosition rather than throwing', () => {
-    for (const bad of [null, undefined, {}, { x: 1 }, { x: NaN, y: 0 }, { x: Infinity, y: 0 }, 'nope', 42]) {
-      const result = computeTieredVolumes(
-        { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me', listenPosition: bad as any },
-        room({ x: 100, y: 0 }),
-      );
-      expect(result.peerVolumes.Enemy).toBeGreaterThan(0);
+  it('gives both sides the same volume however the four points are arranged', () => {
+    const cases: Array<[{ x: number; y: number }, { x: number; y: number }, { x: number; y: number }, { x: number; y: number }]> = [
+      [{ x: 0, y: 0 }, { x: 5000, y: 0 }, { x: 4800, y: 0 }, { x: 300, y: 0 }],
+      [{ x: 0, y: 0 }, { x: 1200, y: 0 }, { x: 9000, y: 9000 }, { x: 9000, y: 9000 }],
+      [{ x: 700, y: 700 }, { x: 8000, y: 200 }, { x: 8000, y: 900 }, { x: 4000, y: 4000 }],
+    ];
+    for (const [mePos, enemyPos, myCam, enemyCam] of cases) {
+      const room = pair(mePos, enemyPos, myCam, enemyCam);
+      expect(ask('Me', mePos, room).peerVolumes.Enemy)
+        .toBe(ask('Enemy', enemyPos, room).peerVolumes.Me);
     }
   });
 
-  it('is listen-only — it never changes what a peer hears from the requester', () => {
-    // The requester's camera is parked next to the enemy, but the enemy's own
-    // request measures against the requester's CHAMPION position in room state,
-    // which the camera never touches.
-    const enemyView = computeTieredVolumes(
-      { myPosition: { x: 5000, y: 0 }, roomId: 'r1', name: 'Enemy' },
-      makeGetter([
-        { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: Date.now() } },
-        { name: 'Enemy', team: 'CHAOS', position: { x: 5000, y: 0, updatedMs: Date.now() } },
-      ]),
-    );
-    expect(enemyView.peerVolumes.Me).toBeUndefined();
+  it('keeps hearing an enemy beside the champion while the camera is elsewhere', () => {
+    // The camera ADDS a listening point, it does not move the one you already
+    // had. Glancing across the map must not cut out the person you are
+    // fighting — which the old replace-the-listen-point behaviour did.
+    const room = pair({ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 9000, y: 9000 }, { x: 9000, y: 9000 });
+    expect(ask('Me', { x: 0, y: 0 }, room).peerVolumes.Enemy).toBeGreaterThan(0);
   });
 
-  it('does not let a listenPosition bypass the team filter or the range cutoff', () => {
+  it('ignores my camera entirely when the enemy has the setting off', () => {
+    // This is what lets someone keep the setting off in a competitive game and
+    // know that nobody can listen in on them from across the map.
+    const room = pair({ x: 0, y: 0 }, { x: 5000, y: 0 }, { x: 5000, y: 0 }, undefined);
+    expect(ask('Me', { x: 0, y: 0 }, room).peerVolumes.Enemy).toBeUndefined();
+    expect(ask('Enemy', { x: 5000, y: 0 }, room).peerVolumes.Me).toBeUndefined();
+  });
+
+  it('ignores the enemy camera when I have the setting off', () => {
+    const room = pair({ x: 0, y: 0 }, { x: 5000, y: 0 }, undefined, { x: 0, y: 0 });
+    expect(ask('Me', { x: 0, y: 0 }, room).peerVolumes.Enemy).toBeUndefined();
+    expect(ask('Enemy', { x: 5000, y: 0 }, room).peerVolumes.Me).toBeUndefined();
+  });
+
+  it('ignores a listenPosition in the request — a camera must be published', () => {
+    // The old wire field. Honouring it would let a client listen from a point
+    // its peers are never scored against, which is exactly the asymmetry this
+    // design removes. Both players have the setting off here; the request asks
+    // to hear from on top of the enemy anyway.
+    const room = pair({ x: 0, y: 0 }, { x: 5000, y: 0 });
     const result = computeTieredVolumes(
-      {
-        myPosition: { x: 0, y: 0 },
-        roomId: 'r1',
-        name: 'Me',
-        listenPosition: { x: 5000, y: 0 },
-      },
-      room({ x: 9000, y: 9000 }),
+      { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me', listenPosition: { x: 5000, y: 0 } },
+      room,
     );
-    // Enemy is still far from the camera, so still absent from the response.
     expect(result.peerVolumes.Enemy).toBeUndefined();
+  });
+
+  it('...and cannot be used to smuggle a camera past an opted-out peer', () => {
+    const room = pair({ x: 0, y: 0 }, { x: 5000, y: 0 }, { x: 5000, y: 0 }, undefined);
+    const result = computeTieredVolumes(
+      { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me', listenPosition: { x: 5000, y: 0 } },
+      room,
+    );
+    expect(result.peerVolumes.Enemy).toBeUndefined();
+  });
+
+  it('treats a stale camera as absent', () => {
+    const stale = Date.now() - 60_000;
+    const room = makeGetter([
+      { name: 'Me', team: 'ORDER', position: at(0, 0), camera: { x: 5000, y: 0, updatedMs: stale } },
+      { name: 'Enemy', team: 'CHAOS', position: at(5000, 0), camera: { x: 5000, y: 0, updatedMs: stale } },
+    ]);
+    expect(ask('Me', { x: 0, y: 0 }, room).peerVolumes.Enemy).toBeUndefined();
+  });
+
+  it('does not let a camera bypass the range cutoff', () => {
+    // All four combinations beyond 1350u.
+    const room = pair({ x: 0, y: 0 }, { x: 9000, y: 9000 }, { x: 5000, y: 0 }, { x: 2000, y: 8000 });
+    expect(ask('Me', { x: 0, y: 0 }, room).peerVolumes.Enemy).toBeUndefined();
+  });
+
+  it('lets two opted-in players watching the same fight hear each other', () => {
+    // Neither champion is anywhere near the other, and neither is near the
+    // fight — but both have put a listening point on it, and a listening point
+    // is also a point you are audible at. Falls out of the symmetry rather
+    // than being a special case, and is asserted here so it stays deliberate.
+    const room = pair({ x: 500, y: 500 }, { x: 13000, y: 13000 }, { x: 7000, y: 7000 }, { x: 7200, y: 7000 });
+    expect(ask('Me', { x: 500, y: 500 }, room).peerVolumes.Enemy).toBe(1.0);
+    expect(ask('Enemy', { x: 13000, y: 13000 }, room).peerVolumes.Me).toBe(1.0);
+  });
+
+  it('does not let a camera bypass the team filter', () => {
+    // An ally is 1.0 by the team rule and never reaches the distance path at
+    // all; the camera must not turn that into a distance answer either way.
+    const room = makeGetter([
+      { name: 'Me', team: 'ORDER', position: at(0, 0), camera: at(9000, 9000) },
+      { name: 'Ally', team: 'ORDER', position: at(5000, 0), camera: at(9000, 9000) },
+    ]);
+    expect(ask('Me', { x: 0, y: 0 }, room).peerVolumes.Ally).toBe(1.0);
+  });
+
+  it('applies to allies too once the requester opts into ally proximity', () => {
+    const room = makeGetter([
+      { name: 'Me', team: 'ORDER', position: at(0, 0), camera: at(5000, 0) },
+      { name: 'Ally', team: 'ORDER', position: at(5000, 0), camera: at(5000, 0) },
+    ]);
+    const result = computeTieredVolumes(
+      { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me', allyProximity: true },
+      room,
+    );
+    expect(result.peerVolumes.Ally).toBe(1.0);
+  });
+});
+
+describe('closestApproach', () => {
+  it('is the champion-to-champion distance when neither side has a camera', () => {
+    expect(closestApproach([{ x: 0, y: 0 }], [{ x: 300, y: 400 }])).toBe(500);
+  });
+
+  it('picks the closest of the four combinations', () => {
+    const me = [{ x: 0, y: 0 }, { x: 5000, y: 0 }];
+    const them = [{ x: 9000, y: 0 }, { x: 5100, y: 0 }];
+    expect(closestApproach(me, them)).toBe(100);
+  });
+
+  it('is symmetric', () => {
+    const a = [{ x: 0, y: 0 }, { x: 700, y: 900 }];
+    const b = [{ x: 1200, y: 40 }, { x: 5, y: 60 }];
+    expect(closestApproach(a, b)).toBe(closestApproach(b, a));
   });
 });
 
@@ -437,19 +525,15 @@ describe('/compute-volumes response shape', () => {
     expect(Object.keys(wire.peerVolumes).sort()).toEqual(['Ally', 'Enemy']);
   });
 
-  it('answers the camera (listenPosition) path with gains only', () => {
-    // #36 hands the endpoint a SECOND coordinate pair per request, which is the
-    // newest thing it could echo back.
+  it('answers the camera path with gains only', () => {
+    // #36 puts a SECOND coordinate pair per player into room state, which is
+    // the newest thing this endpoint could leak. It holds four raw positions
+    // for this pair and must still answer with one number.
     const wire = expectGainsOnly(computeTieredVolumes(
-      {
-        myPosition: { x: 0, y: 0 },
-        roomId: 'r1',
-        name: 'Me',
-        listenPosition: { x: 5000, y: 0 },
-      },
+      { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me' },
       () => [
-        { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: now() } },
-        { name: 'Enemy', team: 'CHAOS', position: { x: 5100, y: 0, updatedMs: now() } },
+        { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: now() }, camera: { x: 5000, y: 0, updatedMs: now() } },
+        { name: 'Enemy', team: 'CHAOS', position: { x: 5100, y: 0, updatedMs: now() }, camera: { x: 9000, y: 9000, updatedMs: now() } },
       ],
     ));
     expect(wire.peerVolumes.Enemy).toBeGreaterThan(0);

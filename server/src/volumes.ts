@@ -52,12 +52,15 @@ export interface VolumeRequestV2 {
   // enemies) instead of always at full volume. Per-user preference; optional for
   // backward compatibility — absent means global/full (the default, #22).
   allyProximity?: boolean;
-  // "Voice on camera" (#36). When present, THIS is the point the requester
-  // hears the map from — the centre of their in-game camera rather than their
-  // champion. Strictly listen-only: it is used solely to score what this
-  // requester hears, and never replaces the champion position that peers
-  // measure their own distance against (that one lives in room state, fed by
-  // `coords`). Absent means "hear from my champion", the default.
+  // IGNORED since v0.5.9, and kept only so the shape of what older clients
+  // send is documented where someone will find it.
+  //
+  // "Voice on camera" (#36) used to work by letting the request name the point
+  // it wanted to hear from. That made listening free and invisible: you could
+  // pan a camera onto an enemy, hear them, and never be audible yourself. The
+  // camera is now published to room state over `coords` like any other
+  // position, read from there for the requester as well, and only used when
+  // both players in a pair have published one. See computeTieredVolumes.
   listenPosition?: { x: number; y: number };
 }
 
@@ -277,6 +280,31 @@ export interface TieredRoomClient {
   name: string;
   team?: 'ORDER' | 'CHAOS';
   position?: { x: number; y: number; updatedMs: number };
+  /** Camera centre, present only while the client has voice on camera ON. */
+  camera?: { x: number; y: number; updatedMs: number };
+}
+
+/**
+ * Closest approach between two players' sets of audible/listening points.
+ *
+ * With voice on camera off on either side this is just champion-to-champion.
+ * With it on for BOTH, each side has two points — champion and camera — and
+ * the pair is scored on whichever combination is closest. That is what makes
+ * the feature symmetric: the camera you listen from is also a place you can be
+ * heard, so panning onto a fight to eavesdrop means the people in it hear you.
+ */
+export function closestApproach(
+  a: readonly { x: number; y: number }[],
+  b: readonly { x: number; y: number }[],
+): number {
+  let best = Infinity;
+  for (const p of a) {
+    for (const q of b) {
+      const d = Math.hypot(p.x - q.x, p.y - q.y);
+      if (d < best) best = d;
+    }
+  }
+  return best;
 }
 
 /**
@@ -305,14 +333,6 @@ export function computeTieredVolumes(
   if (typeof body.roomId !== 'string' || !body.roomId) throw new Error('Invalid roomId');
   if (typeof body.name !== 'string' || !body.name) throw new Error('Invalid name');
 
-  // The point this requester hears FROM. `listenPosition` (camera centre, #36)
-  // when the client sent one, otherwise their champion position. Validated the
-  // same way as myPosition — a malformed one falls back rather than throwing,
-  // so an older/broken client still gets normal proximity audio.
-  const listenFrom = isFinitePoint(body.listenPosition)
-    ? body.listenPosition!
-    : body.myPosition;
-
   const clients = getRoomClients(body.roomId);
   const me = clients.find(c => c.name === body.name);
   if (!me) {
@@ -331,6 +351,9 @@ export function computeTieredVolumes(
   const range = MAX_HEARING_RANGE;
 
   const cutoff = Date.now() - STALE_POSITION_MS;
+  // Our own camera, read from room state rather than from the request. A
+  // stale one counts as absent, the same as a stale position.
+  const myCamera = me.camera && me.camera.updatedMs >= cutoff ? me.camera : undefined;
   const peerVolumes: Record<string, number> = {};
   const trace: string[] = [];
 
@@ -362,21 +385,36 @@ export function computeTieredVolumes(
       continue;
     }
 
-    const dx = listenFrom.x - peer.position.x;
-    const dy = listenFrom.y - peer.position.y;
-    const dist = Math.sqrt(dx * dx + dy * dy);
+    // "Voice on camera" (#36) is an opt-in BETWEEN TWO PLAYERS, not a setting
+    // one of them applies to the other. Both sides have to be publishing a
+    // camera for either side's camera to count; if this peer has the setting
+    // off, their camera is absent from room state and the pair is scored
+    // champion-to-champion in both directions — so a player who leaves it off
+    // can only be heard by someone actually near them on the map.
+    //
+    // Note both cameras are read from ROOM STATE, the requester's included.
+    // That is the whole enforcement: the point you hear from is the same
+    // stored point your peers are scored against, so there is no way to listen
+    // from somewhere without being audible there. A request cannot assert a
+    // listening point of its own (the old `listenPosition` field is ignored).
+    const bothOptedIn = !!myCamera && !!peer.camera &&
+      peer.camera.updatedMs >= cutoff;
+    const myPoints = bothOptedIn ? [body.myPosition, myCamera!] : [body.myPosition];
+    const peerPoints = bothOptedIn ? [peer.position, peer.camera!] : [peer.position];
+
+    const dist = closestApproach(myPoints, peerPoints);
     if (dist >= range) {
       if (DEBUG_VOLUMES) trace.push(peer.name + '[cross team=' + peer.team + ' dist=' + Math.round(dist) + ' >= range=' + range + ']=skip');
       continue;
     }
     peerVolumes[peer.name] = calculateVolume(dist);
-    if (DEBUG_VOLUMES) trace.push(peer.name + '[cross team=' + peer.team + ' dist=' + Math.round(dist) + ']=' + calculateVolume(dist).toFixed(2));
+    if (DEBUG_VOLUMES) trace.push(peer.name + '[cross team=' + peer.team + (bothOptedIn ? ' camera' : '') + ' dist=' + Math.round(dist) + ']=' + calculateVolume(dist).toFixed(2));
   }
 
   if (DEBUG_VOLUMES) {
-    const listenTag = listenFrom === body.myPosition
-      ? ''
-      : ' listenFrom=camera(' + Math.round(listenFrom.x) + ',' + Math.round(listenFrom.y) + ')';
+    const listenTag = myCamera
+      ? ' myCamera=(' + Math.round(myCamera.x) + ',' + Math.round(myCamera.y) + ')'
+      : '';
     console.log('[volumes] req me=' + JSON.stringify(me.name) +
       ' team=' + me.team + ' legacy=' + legacy + ' range=' + range + listenTag +
       ' | ' + (trace.length ? trace.join(' ') : '(no peers)'));

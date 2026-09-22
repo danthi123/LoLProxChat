@@ -25,16 +25,17 @@ export class VolumeClient {
    * `allyProximity` opts the caller into hearing teammates by distance (the same
    * falloff as enemies) instead of always-full volume (#22).
    *
-   * `listenPosition`, when given, is the point we hear FROM — the camera centre
-   * under "voice on camera" (#36). It only affects this response; `myPosition`
-   * remains what peers measure their distance to, so the effect is listen-only.
+   * There is deliberately no camera argument. "Voice on camera" (#36) used to
+   * send a `listenPosition` here, which let the request name a point to hear
+   * from that peers were never scored against — listening for free. The camera
+   * now goes to room state over `coords` and the server reads ours from there,
+   * so it cannot be asserted per-request. See signaling.sendCoords.
    */
   async computeVolumes(
     myPosition: Position,
     roomId: string,
     name: string,
     allyProximity: boolean,
-    listenPosition?: Position | null,
   ): Promise<VolumeResponse> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 3000);
@@ -50,9 +51,6 @@ export class VolumeClient {
           roomId,
           name,
           allyProximity,
-          ...(listenPosition
-            ? { listenPosition: { x: listenPosition.x, y: listenPosition.y } }
-            : {}),
         }),
         signal: controller.signal,
       });

@@ -53,6 +53,7 @@ export class RoomManager {
       // them from the volume response for the tick before the first `coords`.
       team: team ?? evicted?.team,
       position: evicted?.position,
+      camera: evicted?.camera,
     };
     existing.push(info);
     this.rooms.set(roomId, existing);
@@ -138,6 +139,28 @@ export class RoomManager {
   }
 
   /**
+   * Record a client's latest camera centre ("voice on camera", #36). No-op if
+   * the ws isn't in a room.
+   */
+  setCamera(ws: WebSocket, x: number, y: number): void {
+    const info = this.clients.get(ws);
+    if (!info) return;
+    info.camera = { x, y, updatedMs: Date.now() };
+  }
+
+  /**
+   * Forget a client's camera centre. Called whenever a `coords` arrives
+   * WITHOUT one, which is how a client says "voice on camera is off" — so
+   * toggling the setting off takes effect on the next position tick rather
+   * than after the staleness window.
+   */
+  clearCamera(ws: WebSocket): void {
+    const info = this.clients.get(ws);
+    if (!info) return;
+    info.camera = undefined;
+  }
+
+  /**
    * Forget a client's position without disconnecting them. They stay in the
    * room and keep being heard by teammates, who are not scored on distance;
    * cross-team peers stop hearing them at once rather than after the staleness
@@ -147,6 +170,10 @@ export class RoomManager {
     const info = this.clients.get(ws);
     if (!info) return;
     info.position = undefined;
+    // The camera goes with it. Disowning the position means "peers must stop
+    // hearing me"; leaving a camera behind would keep a consenting peer
+    // hearing them at it, which is the same phantom audio by another route.
+    info.camera = undefined;
   }
 
   /**
@@ -189,6 +216,7 @@ export class RoomManager {
       name: c.name,
       team: c.team,
       position: c.position,
+      camera: c.camera,
     }));
   }
 

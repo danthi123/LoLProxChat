@@ -218,12 +218,22 @@ describe('E4 an enemy past vision range is held, then silenced (#27)', () => {
   });
 });
 
-describe('E5 voice on camera moves only the listener (#36)', () => {
-  it('lets A hear a distant enemy from the camera while B still cannot hear A', async () => {
+describe('E5 voice on camera is mutual and symmetric (#36)', () => {
+  // The feature is an opt-in between two players, enforced server-side: each
+  // client publishes its camera centre to room state over `coords`, the server
+  // reads the requester's own from there too, and a camera counts for a pair
+  // only when both sides have published one. So the point you listen from is
+  // the same stored point your peers are scored against — listening in on a
+  // fight means being audible in it.
+  //
+  // audio-prefs is process-global localStorage, so both clients here share one
+  // toggle; the per-side matrix (one on, one off) is covered where the rule is
+  // enforced, in server/tests/volumes.test.ts and server/tests/integration.test.ts.
+  it('lets a distant pair hear each other through the camera, both at once', async () => {
     const { players, a, b } = roster('CHAOS');
     const [one, two] = track(makeClient(a, players), makeClient(b, players));
     // Positioned before the first tick: the distance the camera is supposed to
-    // override is the whole subject here, so it has to hold from the first
+    // reach across is the whole subject, so it has to hold from the first
     // exchange rather than from whenever a move happens to land.
     one.tracker.moveTo(1000, 1000);
     two.tracker.moveTo(12000, 12000);
@@ -231,28 +241,57 @@ describe('E5 voice on camera moves only the listener (#36)', () => {
     await waitForMesh(one, two);
     await waitFor(() => volumesFor(b).length > 2, 'B to be computing volumes');
 
-    // audio-prefs is process-global localStorage, so this toggle is on for BOTH
-    // clients — there is no per-instance preference to set. The asymmetry being
-    // proved is therefore not "only A opted in": it is that B's tracker has no
-    // camera rectangle to report, so B keeps hearing from its champion. That
-    // precondition is asserted rather than assumed.
+    // 15000 units apart — nothing either way while the feature is off.
+    expect(volumesFor(a).filter((e) => b in (e.response?.peerVolumes ?? {}))).toEqual([]);
+    expect(volumesFor(b).filter((e) => a in (e.response?.peerVolumes ?? {}))).toEqual([]);
+
     setCameraListen(true);
     await waitFor(() => one.tracker.cameraTrackingEnabled, 'camera tracking to be enabled');
-    expect(two.tracker.getCameraPosition()).toBeNull();
 
+    // A pans onto B. B is not looking anywhere in particular, so B publishes
+    // its champion as its camera — which is what "opted in, nothing to report
+    // this frame" looks like on the wire, and still counts as consent.
     one.tracker.lookAt(12000, 12100);
-    const heard = await waitFor(
-      () => volumesFor(a).find((e) => e.request?.listenPosition
-        && (e.response?.peerVolumes?.[b] ?? 0) > 0.9),
+
+    const aHeard = await waitFor(
+      () => volumesFor(a).map((e) => e.response?.peerVolumes?.[b]).filter((v) => v !== undefined).pop(),
       'A to hear the enemy under its camera',
     );
-    expect(heard.request.myPosition).toEqual({ x: 1000, y: 1000 });
+    expect(aHeard).toBeGreaterThan(0.9);
 
-    // B's own answer never mentions A: what A broadcast as coords is still A's
-    // champion, 15000 units away.
-    const bHeardA = volumesFor(b).filter((e) => a in (e.response?.peerVolumes ?? {}));
-    expect(bHeardA).toEqual([]);
+    // The half that did not exist before: B hears A back, at the same volume,
+    // without B having done anything. A's camera is a place A can be heard.
+    const bHeard = await waitFor(
+      () => volumesFor(b).map((e) => e.response?.peerVolumes?.[a]).filter((v) => v !== undefined).pop(),
+      'the enemy to hear A back through the same camera',
+    );
+    expect(bHeard).toBe(aHeard);
     await waitFor(() => one.peerFor(b)!.volume > 0.9, 'A to actually play the enemy');
+    await waitFor(() => two.peerFor(a)!.volume > 0.9, 'B to actually play A');
+  });
+
+  it('reaches nobody while the setting is off, and never asks the server to', async () => {
+    const { players, a, b } = roster('CHAOS');
+    const [one, two] = track(makeClient(a, players), makeClient(b, players));
+    one.tracker.moveTo(1000, 1000);
+    two.tracker.moveTo(12000, 12000);
+    await startAll([one, two]);
+    await waitForMesh(one, two);
+
+    setCameraListen(false);
+    one.tracker.lookAt(12000, 12100);
+    await waitFor(() => volumesFor(a).length > 4, 'several volume exchanges to go by');
+
+    expect(volumesFor(a).filter((e) => b in (e.response?.peerVolumes ?? {}))).toEqual([]);
+    expect(volumesFor(b).filter((e) => a in (e.response?.peerVolumes ?? {}))).toEqual([]);
+
+    // And the request never names a listening point of its own. That field is
+    // how the feature used to work, it let a client hear from somewhere its
+    // peers were never scored against, and the server now ignores it — but the
+    // client should not be sending it either.
+    for (const e of [...volumesFor(a), ...volumesFor(b)]) {
+      expect(e.request?.listenPosition).toBeUndefined();
+    }
   });
 });
 

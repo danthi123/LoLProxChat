@@ -215,6 +215,18 @@ export function handleConnection(
             break;
           }
           rooms.setPosition(ws, msg.x, msg.y);
+          // "Voice on camera" (#36). A camera centre on this message means the
+          // user has the setting on; its absence means off, and clearing here
+          // rather than letting it age out is what makes toggling the setting
+          // off take effect immediately. A malformed pair is treated as absent
+          // rather than rejected, so one bad frame cannot drop a client that is
+          // otherwise reporting fine.
+          if (typeof msg.cx === 'number' && typeof msg.cy === 'number' &&
+              isFinite(msg.cx) && isFinite(msg.cy)) {
+            rooms.setCamera(ws, msg.cx, msg.cy);
+          } else {
+            rooms.clearCamera(ws);
+          }
           break;
         }
 

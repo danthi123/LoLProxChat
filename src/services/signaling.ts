@@ -217,12 +217,25 @@ export class SignalingService {
    * the reason this rides on `coords` rather than a message type of its own —
    * an unknown type draws an error reply from every server already deployed.
    */
-  sendCoords(x: number, y: number, stale = false): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(stale
-        ? { type: 'coords', x, y, stale: true }
-        : { type: 'coords', x, y }));
+  /**
+   * Report our champion position to server-side room state.
+   *
+   * `camera` is the centre of our in-game camera, sent only while the user has
+   * "voice on camera" (#36) on. Its presence is the opt-in: the server stores
+   * it, uses it as one of our listening points, and scores peers against it as
+   * one of the points we are audible at — and only when the peer has published
+   * one too. Omitting it is how the client says the setting is off, which the
+   * server acts on immediately rather than waiting for the value to age out.
+   */
+  sendCoords(x: number, y: number, stale = false, camera?: { x: number; y: number } | null): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (stale) {
+      this.ws.send(JSON.stringify({ type: 'coords', x, y, stale: true }));
+      return;
     }
+    this.ws.send(JSON.stringify(camera
+      ? { type: 'coords', x, y, cx: camera.x, cy: camera.y }
+      : { type: 'coords', x, y }));
   }
 
   /** Current room ID + local player name, for HTTP requests that need them

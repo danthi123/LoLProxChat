@@ -573,10 +573,31 @@ export class Orchestrator {
       return;
     }
 
+    // "Voice on camera" (#36): while the user has it on, hear the map from
+    // wherever they are looking as well as from their champion.
+    //
+    // The camera goes to the server alongside the champion position, and the
+    // server reads BOTH of ours from room state when it answers us — so the
+    // point we hear from is the same stored point our peers are scored
+    // against. Listening from a camera therefore means being audible at it,
+    // and a peer who has the setting off publishes no camera, which makes ours
+    // count for nothing against them. Publishing it IS the opt-in; there is no
+    // separate flag on the wire.
+    //
+    // When the rectangle isn't readable this frame we publish the champion
+    // position as the camera rather than dropping the field, because dropping
+    // it reads as "the user turned the setting off" and would flicker the
+    // feature off for a frame. It also matches what the user experiences: an
+    // unreadable frame already falls back to hearing from the champion.
+    const camera = getCameraListen()
+      ? (this.tracking.getCameraPosition() ?? position)
+      : null;
+    this.logCameraListen(getCameraListen() ? this.tracking.getCameraPosition() : null);
+
     // Push our latest XY to server-side room state. /compute-volumes reads
     // every peer's stored position from there — no more P2P blob exchange.
     this.coordsDisowned = false;
-    this.signaling.sendCoords(position.x, position.y);
+    this.signaling.sendCoords(position.x, position.y, /*stale*/ false, camera);
 
     // Log our position whenever it moves >500 game units so we can see the
     // coordinates we're broadcasting (useful for verifying CV accuracy).
@@ -588,21 +609,12 @@ export class Orchestrator {
       console.log('[LoLProxChat] My position: (' + Math.round(position.x) + ', ' + Math.round(position.y) + ')');
     }
 
-    // "Voice on camera" (#36): when the user has opted in, hear the map from
-    // wherever they're looking instead of from their champion. Falls back to the
-    // champion position whenever the camera rectangle isn't readable this frame,
-    // so a missed detection is a no-op rather than a dropout. Listen-only — the
-    // coords we broadcast above are always the champion's.
-    const listenPosition = getCameraListen() ? this.tracking.getCameraPosition() : null;
-    this.logCameraListen(listenPosition);
-
     try {
       const result = await this.volumeClient.computeVolumes(
         position,
         this.session.roomId,
         this.localSummonerName,
         getAllyProximity(),
-        listenPosition,
       );
       this.audio.applyPeerVolumes(result.peerVolumes);
     } catch (e) {

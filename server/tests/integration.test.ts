@@ -90,6 +90,15 @@ function sendCoords(ws: WebSocket, x: number, y: number): void {
   ws.send(JSON.stringify({ type: 'coords', x, y }));
 }
 
+/**
+ * What a client sends while the user has "voice on camera" ON: the champion
+ * position as usual, plus the camera centre. Sending the camera is the whole
+ * opt-in — there is no separate flag.
+ */
+function sendCoordsWithCamera(ws: WebSocket, x: number, y: number, cx: number, cy: number): void {
+  ws.send(JSON.stringify({ type: 'coords', x, y, cx, cy }));
+}
+
 /** What a client sends when its tracker has lost the player (#recall lag). */
 function disownCoords(ws: WebSocket, x: number, y: number): void {
   ws.send(JSON.stringify({ type: 'coords', x, y, stale: true }));
@@ -194,28 +203,57 @@ describe('tiered proximity — end-to-end against the real server', () => {
     alice.close(); ally.close(); enemyClose.close(); enemyEdge.close(); enemyBeyond.close();
   });
 
-  it('"voice on camera" moves what the requester hears, not what peers hear (#36)', async () => {
+  it('"voice on camera" needs both players opted in, and is symmetric (#36)', async () => {
     const room = 'r-camera';
     const alice = await joinRoom(room, 'CamAlice', 'ORDER');
     const enemy = await joinRoom(room, 'CamEnemy', 'CHAOS');
 
-    // Alice's champion is at the origin; the enemy is 5000u away — far outside
-    // the 1350u cross-team range, so normally inaudible in both directions.
+    // Champions 5000u apart — far outside the 1350u cross-team range, so
+    // inaudible in both directions with the feature off.
+    sendCoords(alice, 0, 0);
+    sendCoords(enemy, 5000, 0);
+    await sleep(500);
+    expect((await computeVolumes({ x: 0, y: 0 }, room, 'CamAlice')).peerVolumes.CamEnemy).toBeUndefined();
+
+    // Alice turns it on and pans onto the enemy. The enemy has it OFF, so
+    // nothing changes: their camera is absent from room state, and a camera
+    // counts for a pair only when both sides published one.
+    sendCoordsWithCamera(alice, 0, 0, 5000, 0);
+    await sleep(300);
+    expect((await computeVolumes({ x: 0, y: 0 }, room, 'CamAlice')).peerVolumes.CamEnemy).toBeUndefined();
+    expect((await computeVolumes({ x: 5000, y: 0 }, room, 'CamEnemy')).peerVolumes.CamAlice).toBeUndefined();
+
+    // The enemy turns it on too. Now Alice's camera reaches them — and theirs
+    // reaches her, at exactly the same volume. Listening is not free.
+    sendCoordsWithCamera(enemy, 5000, 0, 5000, 0);
+    await sleep(300);
+    const aliceHears = (await computeVolumes({ x: 0, y: 0 }, room, 'CamAlice')).peerVolumes.CamEnemy;
+    const enemyHears = (await computeVolumes({ x: 5000, y: 0 }, room, 'CamEnemy')).peerVolumes.CamAlice;
+    expect(aliceHears).toBe(1.0);
+    expect(enemyHears).toBe(aliceHears);
+
+    // The enemy turns it back off — a coords with no camera centre — and is
+    // out of reach again on the next tick, not after the staleness window.
+    sendCoords(enemy, 5000, 0);
+    await sleep(300);
+    expect((await computeVolumes({ x: 0, y: 0 }, room, 'CamAlice')).peerVolumes.CamEnemy).toBeUndefined();
+
+    alice.close(); enemy.close();
+  });
+
+  it('a listenPosition in the request buys nothing (#36)', async () => {
+    // The pre-v0.5.9 wire field. Honouring it would let a client hear from a
+    // point its peers are never scored against, which is the asymmetry the
+    // published-camera design exists to remove.
+    const room = 'r-camera-spoof';
+    const alice = await joinRoom(room, 'SpoofAlice', 'ORDER');
+    const enemy = await joinRoom(room, 'SpoofEnemy', 'CHAOS');
     sendCoords(alice, 0, 0);
     sendCoords(enemy, 5000, 0);
     await sleep(500);
 
-    const withoutCamera = await computeVolumes({ x: 0, y: 0 }, room, 'CamAlice');
-    expect(withoutCamera.peerVolumes.CamEnemy).toBeUndefined();
-
-    // Alice pans her camera over to the enemy → she hears them.
-    const withCamera = await computeVolumes({ x: 0, y: 0 }, room, 'CamAlice', { x: 5000, y: 0 });
-    expect(withCamera.peerVolumes.CamEnemy).toBe(1.0);
-
-    // ...and the enemy still does NOT hear Alice, because their distance is
-    // measured against Alice's champion position in room state. Listen-only.
-    const enemyView = await computeVolumes({ x: 5000, y: 0 }, room, 'CamEnemy');
-    expect(enemyView.peerVolumes.CamAlice).toBeUndefined();
+    const spoofed = await computeVolumes({ x: 0, y: 0 }, room, 'SpoofAlice', { x: 5000, y: 0 });
+    expect(spoofed.peerVolumes.SpoofEnemy).toBeUndefined();
 
     alice.close(); enemy.close();
   });
