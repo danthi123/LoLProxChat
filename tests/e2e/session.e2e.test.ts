@@ -256,6 +256,51 @@ describe('E5 voice on camera moves only the listener (#36)', () => {
   });
 });
 
+describe('E5b a blind tracker does not cut the player out of everyone\'s audio', () => {
+  // From a real two-client session: in forty seconds the tracker blinked four
+  // times, every one of them "no own-team icons on the minimap at all", every
+  // one recovered on its own within five seconds — and every one cut the other
+  // player's audio dead for 1-4s, because the coordinate disown fired at 2s
+  // and the server then had no position to score against. A real game always
+  // draws four allies on the minimap, so "none at all" is the capture failing,
+  // not the champion moving.
+  it('keeps B hearing A through a 3s no-icon hold, and silences A on a 3s no-match hold', async () => {
+    const { players, a, b } = roster('CHAOS');
+    const [one, two] = track(makeClient(a, players), makeClient(b, players));
+    await startAll([one, two]);
+    await waitForMesh(one, two);
+
+    one.tracker.moveTo(7000, 7000);
+    two.tracker.moveTo(7400, 7000);
+    await waitFor(
+      () => volumesFor(b).slice(-1).some((e) => (e.response?.peerVolumes?.[a] ?? 0) > 0.5),
+      'B to hear A at close range',
+    );
+
+    // Blind hold: the icon is gone from the capture, but we have no evidence
+    // A moved. A keeps vouching for its position and B keeps hearing it.
+    one.tracker.holdReason = 'no-blobs';
+    one.tracker.holdSec = 3;
+    const blindStarted = volumesFor(b).length;
+    await waitFor(
+      () => volumesFor(b).length > blindStarted + 3,
+      'three more of B\'s volume exchanges to go by while A is blind',
+    );
+    for (const e of volumesFor(b).slice(blindStarted)) {
+      expect(e.response?.peerVolumes?.[a]).toBeGreaterThan(0.5);
+    }
+
+    // Same duration, different reason: icons were on the minimap and none of
+    // them was A. That IS a movement signal — a recall is the case that
+    // matters — so A disowns its position and B stops hearing it.
+    one.tracker.holdReason = 'no-match';
+    await waitFor(
+      () => volumesFor(b).slice(-1).some((e) => !(a in (e.response?.peerVolumes ?? {}))),
+      'the server to forget A once A says it has moved',
+    );
+  });
+});
+
 describe('E6 a peer leaving tears its connection down on both sides', () => {
   it('ends B\'s session and removes B from A\'s room, audio and volumes', async () => {
     const { players, a, b } = roster('ORDER');

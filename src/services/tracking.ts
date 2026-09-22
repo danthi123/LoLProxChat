@@ -24,6 +24,7 @@ import {
   computeNearFieldPx,
   describeViewportCenter,
   ViewportMiss,
+  HoldReason,
   FORCED_REACQUIRE_HOLD_MS,
 } from './tracking-helpers';
 
@@ -98,6 +99,11 @@ export class TrackingService {
   private lastDtSec = 1 / 8; // seconds between this tick and the previous one
   private scanStartMs = 0;
   private holdStartMs = 0;
+  // Why the current hold started. 'no-blobs' means the minimap showed no
+  // own-team icons at all this frame; 'no-match' means icons were there but
+  // none of them was us. The distinction matters to the orchestrator: see
+  // getHoldReason().
+  private holdReason: HoldReason = null;
   // When we successfully tracked a blob that moved >3px from last tick.
   // Used to make Phase 2 re-acquisition stricter when stationary, so we don't
   // teleport the tracking dot onto a minion wave / turret if the icon flickers.
@@ -218,6 +224,23 @@ export class TrackingService {
     return this.holdStartMs > 0 ? (performance.now() - this.holdStartMs) / 1000 : 0;
   }
 
+  /**
+   * Why the tracker is currently holding, or null if it is tracking normally.
+   *
+   * 'no-blobs' — not a single own-team icon was found on the minimap. In a
+   * real game four allies are always drawn there, so this cannot mean we
+   * moved; it means the capture failed or something covered the minimap (the
+   * shop, the scoreboard, a full-screen death cam). The last position is
+   * still very likely correct.
+   *
+   * 'no-match' — icons were present and none of them matched us. That IS a
+   * movement signal: a recall is the case that matters, an instant teleport
+   * the tracker cannot follow.
+   */
+  getHoldReason(): HoldReason {
+    return this.holdStartMs > 0 ? this.holdReason : null;
+  }
+
   /** Get the minimap bounds in screen coordinates */
   getDetectedMinimapScreenBounds(): { screenX: number; screenY: number; screenWidth: number; screenHeight: number } | null {
     if (!this.minimapRegion) return null;
@@ -275,6 +298,7 @@ export class TrackingService {
     this.scanFrameCount = 0;
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
+    this.holdReason = null;
   }
 
   /**
@@ -312,6 +336,7 @@ export class TrackingService {
     this.scanFrameCount = 0;
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
+    this.holdReason = null;
   }
 
   loadChampionTemplate(_championName: string): void {
@@ -447,6 +472,7 @@ export class TrackingService {
     this.lastTickMs = now;
     this.scanStartMs = now;
     this.holdStartMs = 0;
+    this.holdReason = null;
     this.lastDebugImageMs = 0;
     this.lastClassifierRunMs = 0;
     this.lastClassifierLogMs = 0;
@@ -476,6 +502,7 @@ export class TrackingService {
     this.scanFrameCount = 0;
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
+    this.holdReason = null;
   }
 
   // --- Color classification ---
@@ -1057,6 +1084,7 @@ export class TrackingService {
     this.scanFrameCount = 0;
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
+    this.holdReason = null;
     // Treat the moment of lock as a "movement" so Phase 2 doesn't start in
     // stationary-stickiness mode before we've seen any real movement.
     this.lastMovementMs = performance.now();
@@ -1099,6 +1127,7 @@ export class TrackingService {
         'ms — forcing re-acquisition (back to SCANNING)');
       this.state = TrackingState.SCANNING;
       this.holdStartMs = 0;
+    this.holdReason = null;
       this.scanFrameCount = 0;
       this.scanStartMs = performance.now();
       return;
@@ -1112,7 +1141,7 @@ export class TrackingService {
       if (this.lockedTickCount === 0) {
         console.log('[Tracking] Extrapolating position (no teal blobs)');
       }
-      this.extrapolatePosition(region);
+      this.extrapolatePosition(region, 'no-blobs');
       return;
     }
 
@@ -1143,6 +1172,7 @@ export class TrackingService {
     // Phase 2: classifier-based long-range reacquire if Phase 1 found nothing
     if (!phase1 && hasClassifier) {
       if (this.holdStartMs === 0) this.holdStartMs = performance.now();
+      this.holdReason = 'no-match';
       const stationarySec = this.lastMovementMs > 0 ? (now - this.lastMovementMs) / 1000 : 0;
       const reacquireThreshold = computeReacquireThreshold(stationarySec, holdSec);
       const phase2 = pickClassifierReacquisition(tealBlobs, reacquireThreshold, scoreFns.cls);
@@ -1158,7 +1188,7 @@ export class TrackingService {
         console.log('[Tracking] Extrapolating position (no match in range)');
         this.holdStartMs = performance.now();
       }
-      this.extrapolatePosition(region);
+      this.extrapolatePosition(region, 'no-match');
       return;
     }
 
@@ -1216,6 +1246,7 @@ export class TrackingService {
     this.setLastPosition(this.pixelToGamePosition(cx, cy, this.minimapRegion), 'locked-track');
     this.lockedTickCount = 0;
     this.holdStartMs = 0;
+    this.holdReason = null;
 
     if (this.onPositionUpdate && this.lastPosition) {
       this.onPositionUpdate(this.lastPosition);
@@ -1227,9 +1258,16 @@ export class TrackingService {
    * Velocity fades out over ~1 second of wall-clock time, regardless of scan rate.
    * Position is clamped to minimap bounds to prevent drifting off-map.
    */
-  private extrapolatePosition(region: { x: number; y: number; width: number; height: number }): void {
+  private extrapolatePosition(
+    region: { x: number; y: number; width: number; height: number },
+    reason: Exclude<HoldReason, null>,
+  ): void {
     this.lockedTickCount++;
     if (this.holdStartMs === 0) this.holdStartMs = performance.now();
+    // 'no-match' is the stronger signal and wins for the rest of the hold: if
+    // icons came back and still none of them was us, we moved, whatever the
+    // first frame of the hold looked like.
+    if (reason === 'no-match' || this.holdReason === null) this.holdReason = reason;
 
     // Cap velocity to a physically-plausible magnitude before applying. The
     // velocity-EMA in handleLocked can latch onto huge values when the tracked

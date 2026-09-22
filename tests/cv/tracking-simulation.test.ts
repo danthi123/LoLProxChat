@@ -211,6 +211,52 @@ describe('far-field identity gating survives the near-field fix', () => {
   });
 });
 
+describe('why the tracker says it lost us', () => {
+  // The orchestrator disowns our coordinates faster for one of these than the
+  // other (see disownAfterSec), so the tracker has to tell them apart. It is
+  // the difference between "the minimap capture failed" and "we are not where
+  // we said we were".
+  test('reports no-blobs when the minimap has no own-team icons at all', async () => {
+    const scenes = renderScenes([...walk(16), ...Array.from({ length: 12 }, () => NO_TEAL)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    const held = records.filter(r => r.holdSec > 0);
+    expect(held.length).toBeGreaterThan(0);
+    expect(held.every(r => r.holdReason === 'no-blobs')).toBe(true);
+  });
+
+  test('reports no-match when icons are there and none of them is us', async () => {
+    const scenes = renderScenes([...walk(16), ...vanished(12)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    const held = records.filter(r => r.holdSec > 0);
+    expect(held.length).toBeGreaterThan(0);
+    expect(held.some(r => r.holdReason === 'no-match')).toBe(true);
+  });
+
+  test('a hold that starts blind stays no-match once icons come back without us', async () => {
+    // The stronger signal wins for the rest of the hold: whatever the first
+    // frame looked like, icons returning and still not matching means we moved.
+    const scenes = renderScenes([...walk(16), NO_TEAL, NO_TEAL, ...vanished(10)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(records[17].holdReason).toBe('no-blobs');
+    expect(records[records.length - 1].holdReason).toBe('no-match');
+  });
+
+  test('clears the reason once tracking resumes', async () => {
+    const scenes = renderScenes([...walk(16), ...Array.from({ length: 4 }, () => NO_TEAL), ...walk(6, at(START, STEP, 16))]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(records[records.length - 1].holdSec).toBe(0);
+    expect(records[records.length - 1].holdReason).toBeNull();
+  });
+});
+
 describe('losing the icon', () => {
   test('extrapolates, grows the hold past the freshness threshold, and stays bounded', async () => {
     const scenes = renderScenes([...walk(16), ...Array.from({ length: 24 }, () => NO_TEAL)]);

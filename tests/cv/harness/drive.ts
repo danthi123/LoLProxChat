@@ -5,6 +5,7 @@
 import { Position } from '../../../src/core/types';
 import { BlobScorer } from '../../../src/services/champion-classifier';
 import { TrackingService, TrackingState } from '../../../src/services/tracking';
+import { HoldReason } from '../../../src/services/tracking-helpers';
 import {
   GAME_RECT,
   MAP,
@@ -69,6 +70,8 @@ export interface FrameRecord {
   px: Point | null;
   truth: Point | null;
   holdSec: number;
+  /** Why the tracker is holding this frame, or null if it is not. */
+  holdReason: HoldReason;
   /** Positions emitted during this frame (usually 0 or 1). */
   emits: number;
 }
@@ -97,6 +100,7 @@ export async function driveTracker(
       px: game ? gameToTruth(game) : null,
       truth: scenes[i].truth,
       holdSec: h.svc.getHoldDurationSec(),
+      holdReason: h.svc.getHoldReason(),
       emits: h.emitted.length - before,
     });
   }

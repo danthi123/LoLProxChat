@@ -270,6 +270,88 @@ describe('the volume tick', () => {
     expect(h.volumeCalls).toBe(beforeHold);
   });
 
+  // How long we keep vouching for a held position depends on why the tracker
+  // lost us. These came out of a real two-client session: in forty seconds the
+  // tracker blinked four times, every one of them "no own-team icons on the
+  // minimap at all", every one recovered within five seconds — and every one
+  // cut the other player's audio dead for 1-4s because the disown fired at 2s
+  // and the server then had nothing to score against.
+  describe('how fast we disown a held position', () => {
+    const coordsCalls = (h: Harness) =>
+      (h.signaling as unknown as { sendCoords: jest.Mock }).sendCoords.mock.calls;
+    const staleCalls = (h: Harness) => coordsCalls(h).filter(c => c[2] === true);
+
+    async function heldFor(seconds: number, reason: 'no-blobs' | 'no-match') {
+      const h = await startInGame();
+      h.tracker.moveTo(7000, 7000);
+      await jest.advanceTimersByTimeAsync(300);
+      await settle();
+      const reported = h.volumeCalls;
+      (h.signaling as unknown as { sendCoords: jest.Mock }).sendCoords.mockClear();
+
+      h.tracker.holdReason = reason;
+      h.tracker.holdSec = seconds;
+      await jest.advanceTimersByTimeAsync(500);
+      await settle();
+      return { h, reported };
+    }
+
+    it('keeps reporting through a 3s hold with no icons on the minimap', async () => {
+      // A real game always draws four allies, so "none at all" is the capture
+      // failing, not us moving. The last position is still very likely right.
+      const { h, reported } = await heldFor(3, 'no-blobs');
+      expect(h.volumeCalls).toBeGreaterThan(reported);
+      expect(staleCalls(h)).toHaveLength(0);
+    });
+
+    it('gives up on a no-icon hold once it passes the tracker\'s own limit', async () => {
+      const { h, reported } = await heldFor(6, 'no-blobs');
+      expect(h.volumeCalls).toBe(reported);
+      expect(staleCalls(h)).toHaveLength(1);
+    });
+
+    it('disowns a 3s hold where icons were there and none was us', async () => {
+      // This one IS a movement signal — a recall is the case that matters.
+      const { h, reported } = await heldFor(3, 'no-match');
+      expect(h.volumeCalls).toBe(reported);
+      expect(staleCalls(h)).toHaveLength(1);
+    });
+
+    it('disowns once per episode, and vouches again after recovery', async () => {
+      const { h } = await heldFor(3, 'no-match');
+      await jest.advanceTimersByTimeAsync(1000);
+      await settle();
+      expect(staleCalls(h)).toHaveLength(1);
+
+      h.tracker.holdSec = 0;
+      await jest.advanceTimersByTimeAsync(300);
+      await settle();
+      const fresh = coordsCalls(h).filter(c => c[2] !== true);
+      expect(fresh.length).toBeGreaterThan(0);
+
+      h.tracker.holdSec = 3;
+      await jest.advanceTimersByTimeAsync(300);
+      await settle();
+      expect(staleCalls(h)).toHaveLength(2);
+    });
+
+    it('disowns when the tracker gives up and falls back to SCANNING', async () => {
+      // Forced re-acquisition is the tracker saying it no longer believes its
+      // own extrapolation. Without this the server went on serving that
+      // position for another STALE_POSITION_MS after it had been written off.
+      const h = await startInGame();
+      h.tracker.moveTo(7000, 7000);
+      await jest.advanceTimersByTimeAsync(300);
+      await settle();
+      (h.signaling as unknown as { sendCoords: jest.Mock }).sendCoords.mockClear();
+
+      h.tracker.state = TrackingState.SCANNING;
+      await jest.advanceTimersByTimeAsync(500);
+      await settle();
+      expect(staleCalls(h)).toHaveLength(1);
+    });
+  });
+
   it('keeps applying volumes while holding, so peers do not stay frozen', async () => {
     // Not reporting our position is right; not touching the volume pipeline at
     // all is not. This path used to return before applyPeerVolumes, which left

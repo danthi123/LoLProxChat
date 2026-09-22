@@ -13,6 +13,7 @@
 // read as "wrong volume" rather than "no request was ever sent".
 
 import { TrackingState } from '../../../src/services/tracking';
+import { HoldReason } from '../../../src/services/tracking-helpers';
 import { Position } from '../../../src/core/types';
 import { ScreenRect } from '../../../src/core/map-calibration';
 
@@ -38,6 +39,10 @@ export class ScriptedTracker {
   position: Position | null = { ...START_POSITIONS[startSeq++ % START_POSITIONS.length] };
   cameraPosition: Position | null = null;
   holdSec = 0;
+  /** Why the scripted hold is happening; drives how fast the orchestrator
+   *  disowns our coordinates (see disownAfterSec). Left at the cautious
+   *  'no-match' so a test that only sets holdSec keeps the old behaviour. */
+  holdReason: Exclude<HoldReason, null> = 'no-match';
   cameraTrackingEnabled = false;
   started = false;
   stopped = false;
@@ -70,6 +75,7 @@ export class ScriptedTracker {
   getState(): TrackingState { return this.state; }
   getLastPosition(): Position | null { return this.position; }
   getHoldDurationSec(): number { return this.holdSec; }
+  getHoldReason(): HoldReason { return this.holdSec > 0 ? this.holdReason : null; }
   getCameraPosition(): Position | null {
     return this.cameraTrackingEnabled ? this.cameraPosition : null;
   }

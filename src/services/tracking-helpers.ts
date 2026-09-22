@@ -190,6 +190,47 @@ export function pickClassifierReacquisition(
  * orchestrator was sending phantom coords; 5s is the budget for "tracking
  * should have recovered by now or it's time to start over."
  */
+/**
+ * Why the tracker is holding instead of following a blob frame to frame.
+ *
+ * 'no-blobs' — the minimap had no own-team icons at all. A real game always
+ *   draws four allies there, so this says the capture failed or something
+ *   covered the minimap, NOT that we moved.
+ * 'no-match' — icons were present and none was us. This one does say we
+ *   moved; a recall is the case that matters.
+ *
+ * `null` means not holding.
+ */
+export type HoldReason = 'no-blobs' | 'no-match' | null;
+
+/**
+ * How long a hold may run before the position we are still broadcasting stops
+ * being worth anything to our peers, by hold reason.
+ *
+ * These are deliberately different. Disowning our coordinates cuts us out of
+ * every cross-team peer's audio instantly, so the cost of being too eager is
+ * a player going silent mid-sentence while standing right next to someone —
+ * which is what real logs showed: four disowns in forty seconds, each cutting
+ * 1-4s of audio, every one of them a 'no-blobs' hold the tracker recovered
+ * from on its own. The cost of being too patient is a few extra seconds of
+ * audio after a recall. For a voice app the second is much the cheaper
+ * mistake, but only where the position is actually likely to still be right.
+ */
+export const DISOWN_AFTER_SEC: Record<Exclude<HoldReason, null>, number> = {
+  // Held position is probably still correct — wait until the tracker itself
+  // gives up (FORCED_REACQUIRE_HOLD_MS) rather than cutting audio early.
+  'no-blobs': 5,
+  // We have positive evidence we are not where we say we are. Cut fast.
+  'no-match': 2,
+};
+
+/** Seconds of hold after which we stop vouching for our last position. */
+export function disownAfterSec(reason: HoldReason): number {
+  // No reason recorded (a hold that predates the distinction, or a tracker
+  // state we do not model) falls back to the cautious value.
+  return reason ? DISOWN_AFTER_SEC[reason] : DISOWN_AFTER_SEC['no-match'];
+}
+
 export const FORCED_REACQUIRE_HOLD_MS = 5000;
 
 export function shouldForceReacquisition(holdStartMs: number, nowMs: number): boolean {

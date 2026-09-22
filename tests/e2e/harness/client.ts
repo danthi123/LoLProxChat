@@ -11,6 +11,7 @@ import { Orchestrator, OrchestratorDeps } from '../../../src/services/orchestrat
 import { AudioService } from '../../../src/services/audio';
 import { SignalingService } from '../../../src/services/signaling';
 import { VolumeClient } from '../../../src/services/volume-client';
+import { disownAfterSec } from '../../../src/services/tracking-helpers';
 import { TrackingState } from '../../../src/services/tracking';
 import { PeerConnection } from '../../../src/services/peer-connection';
 import { Player } from '../../../src/core/types';
@@ -48,8 +49,10 @@ export function assertTrackerReportsToServer(tracker: ScriptedTracker): void {
   if (!position || (position.x === 0 && position.y === 0)) {
     throw new Error('scripted tracker must report a non-zero position to reach /compute-volumes');
   }
-  if (tracker.getHoldDurationSec() > 2) {
-    throw new Error('scripted tracker hold must stay <= 2s to reach /compute-volumes');
+  const disownAt = disownAfterSec(tracker.getHoldReason());
+  if (tracker.getHoldDurationSec() > disownAt) {
+    throw new Error('scripted tracker hold must stay <= ' + disownAt +
+      's (reason ' + tracker.getHoldReason() + ') to reach /compute-volumes');
   }
 }
 

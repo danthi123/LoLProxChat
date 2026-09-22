@@ -9,6 +9,7 @@ import {
 import { SignalingService, SignalMessage, PositionBroadcast } from './signaling';
 import { AudioService } from './audio';
 import { TrackingService, TrackingState } from './tracking';
+import { disownAfterSec } from './tracking-helpers';
 import { BlobScorer, ChampionClassifier } from './champion-classifier';
 import { VolumeClient } from './volume-client';
 import { getAllyProximity, getCameraListen } from './audio-prefs';
@@ -524,6 +525,13 @@ export class Orchestrator {
 
     // Before CV locks on (SCANNING), pass through all ally audio at full volume (fountain)
     if (this.tracking.getState() === TrackingState.SCANNING) {
+      // If we ever had a lock, we are here because the tracker gave up on a
+      // hold. It stopped believing its own extrapolation, so we have to stop
+      // asking peers to believe it too — otherwise the server goes on serving
+      // our last position for STALE_POSITION_MS after the tracker has already
+      // written it off. No-op before the first lock, when there is nothing to
+      // disown.
+      this.disownCoords();
       this.applyTeamOnlyVolumes();
       this.broadcastOverlayState();
       return;
@@ -545,11 +553,14 @@ export class Orchestrator {
     // were last seen. A recall is the case that makes this obvious — it is an
     // instant teleport the tracker cannot follow, so an enemy standing where
     // we recalled from goes on hearing us long after we are in base.
-    if (this.tracking.getHoldDurationSec() > 2) {
-      if (!this.coordsDisowned) {
-        this.coordsDisowned = true;
-        this.signaling.sendCoords(position.x, position.y, /*stale*/ true);
-      }
+    //
+    // How long we wait depends on WHY the tracker lost us — see
+    // disownAfterSec(). A hold with no own-team icons anywhere on the minimap
+    // is a capture failure, not a movement, and real logs showed those
+    // recovering on their own within a few seconds while the disown cut the
+    // player out of everyone's audio in the meantime.
+    if (this.tracking.getHoldDurationSec() > disownAfterSec(this.tracking.getHoldReason())) {
+      this.disownCoords();
       // Symmetric with the disown above. Telling the server to forget our
       // position stops cross-team peers hearing US; this stops us hearing
       // THEM, which needs saying separately because the volume pipeline is not
@@ -612,6 +623,27 @@ export class Orchestrator {
    * connected. The alternative is leaving the last gains in place, which means
    * continuing to hear people on the strength of where we used to be.
    */
+  /**
+   * Tell the server to forget our position, once per lost-tracking episode.
+   *
+   * Going quiet is not enough on its own: the server keeps serving the last
+   * position it has for STALE_POSITION_MS, so silence alone leaves several
+   * seconds during which peers are still scored against wherever we were last
+   * seen. A recall makes this obvious — an instant teleport the tracker cannot
+   * follow, so an enemy standing where we recalled from goes on hearing us
+   * long after we are in base.
+   *
+   * Idempotent: `coordsDisowned` is cleared only when real coordinates start
+   * flowing again, so this sends one message however long the episode lasts.
+   */
+  private disownCoords(): void {
+    if (this.coordsDisowned) return;
+    const position = this.tracking?.getLastPosition();
+    if (!position || (position.x === 0 && position.y === 0)) return;
+    this.coordsDisowned = true;
+    this.signaling.sendCoords(position.x, position.y, /*stale*/ true);
+  }
+
   private applyTeamOnlyVolumes(): void {
     if (!this.audio || !this.session) return;
     const teamVolumes: Record<string, number> = {};
