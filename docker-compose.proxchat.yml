@@ -20,10 +20,21 @@ services:
   server:
     container_name: proxchat-server
     build: ./server
+    # Published on all interfaces so a reverse proxy running in its own
+    # container can reach it. If your proxy runs on the host instead, prefer
+    # "127.0.0.1:3100:3100" — nothing outside then reaches the server except
+    # through TLS. See docs/self-hosting.md § "Client IP and rate limits".
     ports:
       - "3100:3100"
     environment:
       - PORT=3100
+      # How many reverse proxies of yours sit in front. Unset = 1 (the Caddy /
+      # nginx setup in the docs); "2" for a CDN in front of that proxy, which
+      # ALSO requires configuring the proxy to trust the CDN; "off" to ignore
+      # forwarding headers entirely (no proxy, or a rootless container runtime
+      # that rewrites source addresses). docs/self-hosting.md has the details —
+      # a wrong value here rate-limits every user as if they were one client.
+      - TRUST_PROXY=${TRUST_PROXY:-}
       # Cloudflare Realtime TURN (preferred)
       - TURN_KEY_ID=${TURN_KEY_ID:-}
       - TURN_KEY_API_TOKEN=${TURN_KEY_API_TOKEN:-}

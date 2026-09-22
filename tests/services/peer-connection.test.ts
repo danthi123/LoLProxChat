@@ -40,10 +40,73 @@ describe('nextSmoothedVolume', () => {
     expect(smoothed).toBeLessThanOrEqual(1);
   });
 
-  test('symmetric: ramping down works the same way as ramping up', () => {
-    const downStep = nextSmoothedVolume(1, 0, 1000, 0);
-    const upStep = nextSmoothedVolume(0, 1, 1000, 0);
-    // Both should move ~the same fraction of the gap, just in opposite directions
-    expect(downStep).toBeCloseTo(1 - upStep, 5);
+  test('asymmetric: one step down covers more of the gap than one step up', () => {
+    // This used to assert the two directions were symmetric. They are
+    // deliberately not: see the RISE/FALL caps and the comment above them.
+    const downStep = nextSmoothedVolume(1, 0, 1000, 0);   // 1.0 -> lower is better
+    const upStep = nextSmoothedVolume(0, 1, 1000, 0);     // 0.0 -> higher is louder
+    expect(1 - downStep).toBeGreaterThan(upStep);
+  });
+});
+
+describe('nextSmoothedVolume — asymmetric ramp', () => {
+  // Falling quiet fast and rising loud slow are not the same trade. A slow rise
+  // protects the listener from a sudden blast; a slow fall just means hearing
+  // someone you should not. A tester measured a median 4.9s to silence after
+  // panning the camera off a peer, which this halves at the tick rates the
+  // volume loop actually runs at once a /compute-volumes round trip is in it.
+  /** Seconds to traverse 90% of the range, so both directions are measured the same. */
+  const secondsToFall = (hz: number) => {
+    const dt = 1000 / hz;
+    let v = 1, t = 0;
+    while (v > 0.1 && t < 20000) { v = nextSmoothedVolume(v, 0, t + dt, t); t += dt; }
+    return t / 1000;
+  };
+  const secondsToRise = (hz: number) => {
+    const dt = 1000 / hz;
+    let v = 0, t = 0;
+    while (v < 0.9 && t < 20000) { v = nextSmoothedVolume(v, 1, t + dt, t); t += dt; }
+    return t / 1000;
+  };
+  const fadeToSilence = (hz: number) => {
+    const dt = 1000 / hz;
+    let v = 1, t = 0;
+    while (v >= 0.005 && t < 20000) { v = nextSmoothedVolume(v, 0, t + dt, t); t += dt; }
+    return t / 1000;
+  };
+
+  test('falls faster than it rises at every rate the glide runs at', () => {
+    // The two directions have different time constants now, not just different
+    // ceilings, so the asymmetry holds whatever the step rate — including the
+    // 20Hz the local glide actually ticks at.
+    for (const hz of [6, 10, 20]) {
+      expect(secondsToFall(hz)).toBeLessThan(secondsToRise(hz));
+    }
+  });
+
+  test('a peer leaving range is inaudible inside half a second at glide rate', () => {
+    // The whole point of moving the glide off the network clock: this number is
+    // now a property of the smoother, not of the server round-trip time.
+    const dt = 1000 / 20;
+    let v = 1;
+    let t = 0;
+    while (v > 0.05 && t < 20000) { v = nextSmoothedVolume(v, 0, t + dt, t); t += dt; }
+    expect(t / 1000).toBeLessThan(0.5);
+  });
+
+  test('a peer leaving range is silent well inside two seconds', () => {
+    expect(fadeToSilence(6)).toBeLessThan(2.0);
+    expect(fadeToSilence(10)).toBeLessThan(2.0);
+  });
+
+  test('rising is still gentle — no snap to full volume on one tick', () => {
+    // The property the rise cap exists for: a peer re-entering range after a
+    // long gap must not arrive at full volume in a single step.
+    const afterOneLongGap = nextSmoothedVolume(0, 1, 10_000, 0);
+    expect(afterOneLongGap).toBeLessThanOrEqual(0.3);
+  });
+
+  test('still snaps on the first sample, so a new peer does not ramp up from 0', () => {
+    expect(nextSmoothedVolume(null, 0.42, 1000, 0)).toBe(0.42);
   });
 });

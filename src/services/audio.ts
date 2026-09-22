@@ -78,7 +78,35 @@ export function resolveProximityTargets(
 // the server response before fading to 0. Covers a dropped coords packet or two
 // on a lossy / DPI-bypass connection so the audio doesn't blip to silence and
 // back (#27).
-const PROXIMITY_GRACE_MS = 1500;
+//
+// Shortened from 1500ms once "voice on camera" made a peer leaving the response
+// an ordinary, deliberate event rather than a sign of packet loss: panning the
+// camera off someone should stop their voice promptly, and a tester measured a
+// median 4.9s before an enemy fell silent, of which this window was the largest
+// single part. 300ms still absorbs three ticks at the 10 Hz volume cadence, which
+// is the "packet or two" this exists for. It can afford to be this short
+// because the server independently keeps a peer's last position for
+// STALE_POSITION_MS, so a dropped coords message does not remove them from the
+// response in the first place — this window only ever covers a peer genuinely
+// leaving range or the room.
+const PROXIMITY_GRACE_MS = 300;
+
+// Cap on signals buffered for a peer that does not exist yet. A real trickle-ICE
+// burst is well under half of this; the cap only bounds a peer spraying at the
+// server's 100/sec per-connection allowance.
+const MAX_PENDING_SIGNALS = 64;
+
+/**
+ * Thrown when a peer creation is discarded after its ICE fetch resolved because
+ * the peer left or the session ended in the meantime. Distinct from a genuine
+ * creation failure, which callers must keep propagating.
+ */
+class PeerCreationAbandoned extends Error {
+  constructor(remoteName: string) {
+    super('Peer creation abandoned for ' + remoteName);
+    this.name = 'PeerCreationAbandoned';
+  }
+}
 
 export class AudioService {
   private localStream: MediaStream | null = null;
@@ -119,17 +147,52 @@ export class AudioService {
   // PeerConnections received stays the same).
   private micSource: MediaStreamAudioSourceNode | null = null;
 
-  // Guard against concurrent connectToPeer calls for the same peer
-  private connectingPeers: Set<string> = new Set();
+  // Creating a peer awaits an ICE-server fetch, so our own connectToPeer and an
+  // incoming offer can both be inside that await for the same name — and both
+  // used to build an RTCPeerConnection, the loser being overwritten in `peers`
+  // without ever being closed. The slot is now claimed synchronously and the
+  // second caller joins the in-flight creation instead.
+  private peerCreations: Map<string, Promise<PeerConnection>> = new Map();
+  // Identity of the claim currently owning each name, so a creation whose claim
+  // was dropped (peer left, session ended) can tell it is no longer wanted.
+  private peerClaimIds: Map<string, number> = new Map();
+  private nextClaimId = 1;
+  private disposed = false;
   // Buffer signals that arrive before the peer connection is created
   private pendingSignals: Map<string, SignalMessage[]> = new Map();
 
   // PTT state
   private pttHeld = false;
 
-  constructor(signaling: SignalingService, localName: string) {
+  /**
+   * Drives every peer's volume glide on a LOCAL clock.
+   *
+   * The glide used to advance one step per proximity update, which arrives only
+   * as fast as a round trip to the signaling server allows — so how quickly a
+   * peer faded out depended on the network, and in practice ran at about half
+   * the rate the smoothing was designed for. Stepping here instead makes the
+   * fade a fixed wall-clock duration, and keeps each individual step small
+   * enough to stay click-free.
+   */
+  private volumeGlideId: number | null = null;
+
+  /**
+   * How a peer connection is built. The default is the real one; tests/e2e
+   * substitutes a fake so two orchestrators can complete the real signaling
+   * handshake — through the real server — without WebRTC. Every creation path
+   * funnels through `createPeer`, so this one seam covers both the
+   * connectToPeer and incoming-offer routes.
+   */
+  private peerFactory: (remoteName: string) => Promise<PeerConnection>;
+
+  constructor(
+    signaling: SignalingService,
+    localName: string,
+    peerFactory: (remoteName: string) => Promise<PeerConnection> = PeerConnection.create,
+  ) {
     this.signaling = signaling;
     this.localName = localName;
+    this.peerFactory = peerFactory;
   }
 
   async initMicrophone(): Promise<void> {
@@ -159,6 +222,8 @@ export class AudioService {
     // Apply initial transmit state through the normal path so the first
     // [Audio] Local mic transmit log line is emitted.
     this.updateLocalTrackState();
+
+    this.startVolumeGlide();
 
     // Attach analysers to monitor whether the mic is actually producing audio
     // and whether the WebRTC-output stream contains audio. Reported every 2s.
@@ -210,6 +275,17 @@ export class AudioService {
     }, 2000) as unknown as number;
   }
 
+  /** 20 Hz: fast enough that a fade finishes promptly, slow enough to be cheap. */
+  private static readonly VOLUME_GLIDE_MS = 50;
+
+  private startVolumeGlide(): void {
+    if (this.volumeGlideId !== null) return;
+    this.volumeGlideId = window.setInterval(() => {
+      const now = performance.now();
+      for (const peer of this.peers.values()) peer.stepVolume(now);
+    }, AudioService.VOLUME_GLIDE_MS) as unknown as number;
+  }
+
   private isTransmitting(): boolean {
     if (this.selfMuted) return false;
     if (this.settings.inputMode === 'ptt') return this.pttHeld;
@@ -241,83 +317,173 @@ export class AudioService {
     }
   }
 
-  // Connect to a new peer
-  async connectToPeer(remoteName: string, isInitiator?: boolean): Promise<void> {
-    if (this.peers.has(remoteName) || this.connectingPeers.has(remoteName)) return;
-    this.connectingPeers.add(remoteName);
+  /**
+   * Get the connection for `remoteName`, creating it if nobody else already is.
+   * Exactly one RTCPeerConnection per name however many callers race, because
+   * the claim below is taken in the same synchronous run as the lookup.
+   *
+   * `created` is true only for the caller whose claim actually built the
+   * connection; that caller owns negotiation and nobody else may offer.
+   *
+   * `isInitiator` is honoured only by that claiming caller. Both call sites
+   * derive it as `localName < remoteName` (orchestrator.ts uses the identical
+   * comparison), so a value discarded here can never disagree with the one used.
+   */
+  private async ensurePeer(
+    remoteName: string,
+    isInitiator?: boolean,
+  ): Promise<{ peer: PeerConnection; created: boolean }> {
+    const existing = this.peers.get(remoteName);
+    if (existing) return { peer: existing, created: false };
+    const inFlight = this.peerCreations.get(remoteName);
+    if (inFlight) return { peer: await inFlight, created: false };
 
+    const claimId = this.nextClaimId++;
+    this.peerClaimIds.set(remoteName, claimId);
+    const creation = this.createPeer(remoteName, claimId, isInitiator);
+    this.peerCreations.set(remoteName, creation);
+    return { peer: await creation, created: true };
+  }
+
+  private async createPeer(
+    remoteName: string,
+    claimId: number,
+    isInitiator?: boolean,
+  ): Promise<PeerConnection> {
     console.log('[Audio] Connecting to peer:', remoteName);
-    let peer: PeerConnection;
     try {
-      peer = await PeerConnection.create(remoteName);
+      const peer = await this.peerFactory(remoteName);
+      // The connection can have become unwanted while we awaited the ICE fetch
+      // — the peer left, or the session ended. Both drop the claim, and a peer
+      // inserted after that point is one nobody will ever close.
+      if (this.disposed || this.peerClaimIds.get(remoteName) !== claimId) {
+        peer.close();
+        throw new PeerCreationAbandoned(remoteName);
+      }
       void peer.setOutputDevice(getStoredOutputDeviceId());
-    } catch (e) {
-      this.connectingPeers.delete(remoteName);
-      throw e;
-    }
-    this.peers.set(remoteName, peer);
-    this.connectingPeers.delete(remoteName);
+      this.peers.set(remoteName, peer);
 
-    if (this.outputStream) {
-      peer.addLocalStream(this.outputStream);
-    }
+      if (this.outputStream) {
+        peer.addLocalStream(this.outputStream);
+      }
 
-    peer.onIceCandidate = (candidate) => {
-      this.signaling.sendSignal({
-        type: 'ice-candidate',
-        from: this.localName,
-        to: remoteName,
-        payload: candidate.toJSON(),
-      });
-    };
-
-    // Initiator creates data channel + offer
-    const shouldInitiate = isInitiator ?? (this.localName < remoteName);
-
-    // Auto-recover from ICE failure. Only the original initiator re-issues
-    // the offer (with iceRestart=true) so we don't both restart and race.
-    // The other side just handles the incoming offer via the normal flow.
-    if (shouldInitiate) {
-      peer.onIceFailed = () => {
-        peer.createOffer({ iceRestart: true })
-          .then((offer) => {
-            console.log('[Audio] Sending ICE-restart offer to:', remoteName);
-            this.signaling.sendSignal({
-              type: 'offer',
-              from: this.localName,
-              to: remoteName,
-              payload: offer,
-            });
-          })
-          .catch((e) => console.warn('[Audio] ICE-restart offer failed for', remoteName, e));
+      peer.onIceCandidate = (candidate) => {
+        this.signaling.sendSignal({
+          type: 'ice-candidate',
+          from: this.localName,
+          to: remoteName,
+          payload: candidate.toJSON(),
+        });
       };
-    }
 
-    if (shouldInitiate) {
-      console.log('[Audio] Creating offer (initiator) to:', remoteName);
-      try {
-        const offer = await peer.createOffer();
+      // Auto-recover from ICE failure. Only the original initiator re-issues
+      // the offer (with iceRestart=true) so we don't both restart and race.
+      // The other side just handles the incoming offer via the normal flow.
+      // Wired here rather than in connectToPeer so a peer that arrived via an
+      // incoming offer is covered too.
+      const shouldInitiate = isInitiator ?? (this.localName < remoteName);
+      if (shouldInitiate) {
+        peer.onIceFailed = () => this.sendIceRestartOffer(remoteName, peer);
+      }
+
+      // Drain here, not in connectToPeer: a peer born from an incoming offer
+      // has buffered candidates too, and is the path that never drained them.
+      this.flushPendingSignals(remoteName);
+      return peer;
+    } finally {
+      // Release only our own claim — an abandoned creation must not clobber the
+      // claim of the connection that replaced it.
+      if (this.peerClaimIds.get(remoteName) === claimId) {
+        this.peerCreations.delete(remoteName);
+        this.peerClaimIds.delete(remoteName);
+      }
+    }
+  }
+
+  private sendIceRestartOffer(remoteName: string, peer: PeerConnection): void {
+    // Defensive: a closure left over from a previous connection to the same
+    // name must not renegotiate the one that replaced it.
+    if (this.peers.get(remoteName) !== peer) return;
+    peer.createOffer({ iceRestart: true })
+      .then((offer) => {
+        console.log('[Audio] Sending ICE-restart offer to:', remoteName);
         this.signaling.sendSignal({
           type: 'offer',
           from: this.localName,
           to: remoteName,
           payload: offer,
         });
-      } catch (e) {
-        console.error('[Audio] Failed to create offer for:', remoteName, e);
-        this.peers.delete(remoteName);
-        peer.close();
-      }
-    }
+      })
+      .catch((e) => console.warn('[Audio] ICE-restart offer failed for', remoteName, e));
+  }
 
-    // Flush any signals that arrived before this peer was created
+  private bufferSignal(signal: SignalMessage): void {
+    let pending = this.pendingSignals.get(signal.from);
+    if (!pending) {
+      pending = [];
+      this.pendingSignals.set(signal.from, pending);
+    }
+    // Drop the newest rather than shifting the oldest out: host and
+    // server-reflexive candidates arrive first and are the ones that carry a
+    // connection between two players on the same NAT.
+    if (pending.length >= MAX_PENDING_SIGNALS) return;
+    pending.push(signal);
+    if (pending.length === MAX_PENDING_SIGNALS) {
+      console.warn('[Audio] Pending signal buffer full for', signal.from,
+        '— dropping further signals until the peer exists');
+    }
+  }
+
+  private flushPendingSignals(remoteName: string): void {
     const pending = this.pendingSignals.get(remoteName);
-    if (pending) {
-      this.pendingSignals.delete(remoteName);
-      for (const sig of pending) {
-        this.handleSignal(sig).catch(e =>
-          console.error('[Audio] Failed to replay buffered signal:', sig.type, e));
+    if (!pending) return;
+    this.pendingSignals.delete(remoteName);
+    // INVARIANT: replays are dispatched fire-and-forget and createPeer must
+    // never await them. A replay runs through handleSignal, which is what is
+    // waiting on this creation — awaiting it here would wait on ourselves.
+    for (const sig of pending) {
+      this.handleSignal(sig).catch(e =>
+        console.error('[Audio] Failed to replay buffered signal:', sig.type, e));
+    }
+  }
+
+  // Connect to a new peer
+  async connectToPeer(remoteName: string, isInitiator?: boolean): Promise<void> {
+    let peer: PeerConnection;
+    let created: boolean;
+    try {
+      ({ peer, created } = await this.ensurePeer(remoteName, isInitiator));
+    } catch (e) {
+      if (e instanceof PeerCreationAbandoned) {
+        console.log('[Audio] Peer creation abandoned (left or session ended):', remoteName);
+        return;
       }
+      // A genuine failure must keep propagating: the orchestrator drops its
+      // peerState on a throw and retries on the next position broadcast.
+      throw e;
+    }
+    // Someone else's claim built this connection and owns its negotiation.
+    if (!created) return;
+    // disconnectPeer is synchronous and can have run in the gap since the
+    // creation resolved; offering now would go to a player who has left.
+    if (this.peers.get(remoteName) !== peer) return;
+
+    const shouldInitiate = isInitiator ?? (this.localName < remoteName);
+    if (!shouldInitiate) return;
+
+    console.log('[Audio] Creating offer (initiator) to:', remoteName);
+    try {
+      const offer = await peer.createOffer();
+      this.signaling.sendSignal({
+        type: 'offer',
+        from: this.localName,
+        to: remoteName,
+        payload: offer,
+      });
+    } catch (e) {
+      console.error('[Audio] Failed to create offer for:', remoteName, e);
+      if (this.peers.get(remoteName) === peer) this.dropPeer(remoteName);
+      else peer.close();
     }
   }
 
@@ -325,28 +491,14 @@ export class AudioService {
   async handleSignal(signal: SignalMessage): Promise<void> {
     console.log('[Audio] Received signal:', signal.type, 'from:', signal.from);
     try {
-      let peer = this.peers.get(signal.from);
-
       if (signal.type === 'offer') {
-        if (!peer) {
+        const { peer, created } = await this.ensurePeer(signal.from);
+        if (created) {
           // Peer is reaching us first via the signaling channel — orchestrator's
           // "Peer joined" log only fires once their first position broadcast
           // arrives, which can be seconds later (or never if they're idle in
           // base). Log here so the join is always traceable in diagnostics.
           console.log('[Audio] Peer created via incoming offer: ' + signal.from);
-          peer = await PeerConnection.create(signal.from);
-          void peer.setOutputDevice(getStoredOutputDeviceId());
-          this.peers.set(signal.from, peer);
-          if (this.outputStream) peer.addLocalStream(this.outputStream);
-
-          peer.onIceCandidate = (candidate) => {
-            this.signaling.sendSignal({
-              type: 'ice-candidate',
-              from: this.localName,
-              to: signal.from,
-              payload: candidate.toJSON(),
-            });
-          };
         }
         const answer = await peer.handleOffer(signal.payload);
         this.signaling.sendSignal({
@@ -355,30 +507,50 @@ export class AudioService {
           to: signal.from,
           payload: answer,
         });
-      } else if (signal.type === 'answer' && peer) {
+        return;
+      }
+
+      const peer = this.peers.get(signal.from);
+      if (!peer) {
+        // Buffer signals that arrive before the peer connection is created;
+        // whichever path creates it replays them.
+        this.bufferSignal(signal);
+        return;
+      }
+      if (signal.type === 'answer') {
         await peer.handleAnswer(signal.payload);
-      } else if (signal.type === 'ice-candidate' && peer) {
+      } else if (signal.type === 'ice-candidate') {
         await peer.addIceCandidate(signal.payload);
-      } else if (!peer && (signal.type === 'answer' || signal.type === 'ice-candidate')) {
-        // Buffer signals that arrive before the peer connection is created
-        let pending = this.pendingSignals.get(signal.from);
-        if (!pending) {
-          pending = [];
-          this.pendingSignals.set(signal.from, pending);
-        }
-        pending.push(signal);
       }
     } catch (e) {
+      if (e instanceof PeerCreationAbandoned) {
+        console.log('[Audio] Peer creation abandoned (left or session ended):', signal.from);
+        return;
+      }
       console.error('[Audio] Signal handling failed:', signal.type, 'from:', signal.from, e);
     }
   }
 
   disconnectPeer(remoteName: string): void {
-    const peer = this.peers.get(remoteName);
+    this.dropPeer(remoteName);
+  }
+
+  /**
+   * Close the connection for `name` and forget every per-name collection keyed
+   * on it, so nothing (least of all a previous connection's ICE candidates)
+   * outlives it into the next connection to the same player.
+   */
+  private dropPeer(name: string): void {
+    const peer = this.peers.get(name);
     if (peer) {
       peer.close();
-      this.peers.delete(remoteName);
+      this.peers.delete(name);
     }
+    // Dropping the claim is what tells a creation still awaiting its ICE fetch
+    // to abandon rather than land in `peers` after we stopped caring.
+    this.peerCreations.delete(name);
+    this.peerClaimIds.delete(name);
+    this.pendingSignals.delete(name);
   }
 
   applyPeerVolumes(volumes: Record<string, number>): void {
@@ -589,6 +761,13 @@ export class AudioService {
   }
 
   cleanup(): void {
+    // Set first: a creation still awaiting its ICE fetch checks this and closes
+    // itself instead of inserting into a map nobody will iterate again.
+    this.disposed = true;
+    this.peerCreations.clear();
+    this.peerClaimIds.clear();
+    this.pendingSignals.clear();
+
     // The level monitor is a bare setInterval that closes over the analyser
     // nodes. Before v0.5.8 nothing ever cleared it, so every game left another
     // 2s logging loop running against a closed AudioContext for the lifetime of
@@ -597,6 +776,10 @@ export class AudioService {
     if (this.levelMonitorId !== null) {
       clearInterval(this.levelMonitorId);
       this.levelMonitorId = null;
+    }
+    if (this.volumeGlideId !== null) {
+      clearInterval(this.volumeGlideId);
+      this.volumeGlideId = null;
     }
     this.micLevelAnalyser = null;
     this.outputLevelAnalyser = null;

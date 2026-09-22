@@ -2,6 +2,14 @@ import type { WebSocket } from 'ws';
 import type { ClientInfo } from './types.js';
 import type { TieredRoomClient } from './volumes.js';
 
+/** Outcome of a `join`. `evicted` is set when the name was already taken. */
+export interface JoinResult {
+  /** Peer names already in the room, excluding any entry this join evicted. */
+  peers: string[];
+  /** The previous holder of this name, already removed from room state. */
+  evicted?: ClientInfo;
+}
+
 export class RoomManager {
   /** roomId → set of ClientInfo */
   private rooms = new Map<string, ClientInfo[]>();
@@ -9,39 +17,75 @@ export class RoomManager {
   private clients = new Map<WebSocket, ClientInfo>();
 
   /**
-   * Add a client to a room. Returns list of existing peer names (before this join).
+   * Add a client to a room. Returns the existing peer names (before this join)
+   * plus any client evicted because it held the same name.
+   *
    * `team` is v0.3+ — when omitted the client is treated as legacy v0.2 and
    * `computeTieredVolumes` falls back to team-blind 1200u behavior.
    */
-  join(roomId: string, name: string, ws: WebSocket, team?: 'ORDER' | 'CHAOS'): string[] {
+  join(roomId: string, name: string, ws: WebSocket, team?: 'ORDER' | 'CHAOS'): JoinResult {
     const existing = this.rooms.get(roomId) ?? [];
+
+    // One entry per name per room is an invariant the rest of this file relies
+    // on: `findInRoom` resolves the FIRST match, so a second entry under a name
+    // black-holes every `signal` addressed to it. The newest socket wins —
+    // duplicates come from a player reconnecting, whose previous socket is by
+    // then half-open and cannot be distinguished from a live one in time.
+    // Removing the old entry here (rather than on its eventual close) is what
+    // stops that close from broadcasting a `peer_left` for a name that is
+    // still in the room: `leave` will find nothing to remove.
+    let evicted: ClientInfo | undefined;
+    const dupIdx = existing.findIndex(c => c.name === name);
+    if (dupIdx !== -1) {
+      evicted = existing[dupIdx];
+      existing.splice(dupIdx, 1);
+      this.clients.delete(evicted.ws);
+    }
+
     const existingNames = existing.map(c => c.name);
 
-    const info: ClientInfo = { roomId, name, ws, team };
+    const info: ClientInfo = {
+      roomId,
+      name,
+      ws,
+      // Carry the evicted entry's state forward: a reconnecting player keeps
+      // their last known position and team, so cross-team peers don't lose
+      // them from the volume response for the tick before the first `coords`.
+      team: team ?? evicted?.team,
+      position: evicted?.position,
+      camera: evicted?.camera,
+    };
     existing.push(info);
     this.rooms.set(roomId, existing);
     this.clients.set(ws, info);
 
-    return existingNames;
+    return { peers: existingNames, evicted };
   }
 
-  /** Remove a client. Returns their info, or undefined if not found. */
-  leave(ws: WebSocket): { roomId: string; name: string } | undefined {
+  /**
+   * Remove a client. Returns their info plus the clients still in the room
+   * (empty when that was the last one), or undefined if the ws held no entry —
+   * which is also the case for a socket that was evicted by a later join.
+   */
+  leave(ws: WebSocket): { roomId: string; name: string; remaining: ClientInfo[] } | undefined {
     const info = this.clients.get(ws);
     if (!info) return undefined;
 
     this.clients.delete(ws);
 
     const room = this.rooms.get(info.roomId);
+    let remaining: ClientInfo[] = [];
     if (room) {
       const idx = room.indexOf(info);
       if (idx !== -1) room.splice(idx, 1);
       if (room.length === 0) {
         this.rooms.delete(info.roomId);
+      } else {
+        remaining = room.slice();
       }
     }
 
-    return { roomId: info.roomId, name: info.name };
+    return { roomId: info.roomId, name: info.name, remaining };
   }
 
   /** Get all peer names in a room. */
@@ -59,7 +103,10 @@ export class RoomManager {
     return room.filter(c => c.ws !== ws);
   }
 
-  /** Find a specific client in a room by name. */
+  /**
+   * Find a specific client in a room by name. Names are unique within a room
+   * (see `join`), so the first match is the only one.
+   */
   findInRoom(roomId: string, name: string): ClientInfo | undefined {
     const room = this.rooms.get(roomId);
     if (!room) return undefined;
@@ -72,12 +119,61 @@ export class RoomManager {
   }
 
   /**
+   * Update a client's team without re-joining. No-op if the ws isn't in a room.
+   * Lets the handler refresh team on a repeated `join` without mutating what
+   * `getClientInfo` handed back.
+   */
+  setTeam(ws: WebSocket, team: 'ORDER' | 'CHAOS'): void {
+    const info = this.clients.get(ws);
+    if (!info) return;
+    info.team = team;
+  }
+
+  /**
    * Record a client's latest XY position. No-op if the ws isn't in a room.
    */
   setPosition(ws: WebSocket, x: number, y: number): void {
     const info = this.clients.get(ws);
     if (!info) return;
     info.position = { x, y, updatedMs: Date.now() };
+  }
+
+  /**
+   * Record a client's latest camera centre ("voice on camera", #36). No-op if
+   * the ws isn't in a room.
+   */
+  setCamera(ws: WebSocket, x: number, y: number): void {
+    const info = this.clients.get(ws);
+    if (!info) return;
+    info.camera = { x, y, updatedMs: Date.now() };
+  }
+
+  /**
+   * Forget a client's camera centre. Called whenever a `coords` arrives
+   * WITHOUT one, which is how a client says "voice on camera is off" — so
+   * toggling the setting off takes effect on the next position tick rather
+   * than after the staleness window.
+   */
+  clearCamera(ws: WebSocket): void {
+    const info = this.clients.get(ws);
+    if (!info) return;
+    info.camera = undefined;
+  }
+
+  /**
+   * Forget a client's position without disconnecting them. They stay in the
+   * room and keep being heard by teammates, who are not scored on distance;
+   * cross-team peers stop hearing them at once rather than after the staleness
+   * window, because the client has told us the position is no longer true.
+   */
+  clearPosition(ws: WebSocket): void {
+    const info = this.clients.get(ws);
+    if (!info) return;
+    info.position = undefined;
+    // The camera goes with it. Disowning the position means "peers must stop
+    // hearing me"; leaving a camera behind would keep a consenting peer
+    // hearing them at it, which is the same phantom audio by another route.
+    info.camera = undefined;
   }
 
   /**
@@ -120,6 +216,7 @@ export class RoomManager {
       name: c.name,
       team: c.team,
       position: c.position,
+      camera: c.camera,
     }));
   }
 

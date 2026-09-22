@@ -1,0 +1,55 @@
+// Validation for the `join` handshake. Everything here runs on values that came
+// straight out of `JSON.parse`, so nothing may be assumed about their type — a
+// truthiness check alone lets `{"room":123,"name":{}}` into room state, where a
+// non-string name breaks name-keyed signal routing for the whole room.
+
+export const MAX_NAME_LEN = 64;
+export const MAX_ROOM_ID_LEN = 64;
+
+/**
+ * Room ids the server will accept. `generateRoomId` (src/core/room.ts) emits
+ * base36, and no UI anywhere lets a player type a room id, so this is far wider
+ * than any real client needs; it exists to keep control characters and
+ * unbounded strings out of log lines and room keys. Deliberately permissive so
+ * a self-hoster running a modified client isn't locked out by it.
+ */
+export const ROOM_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
+
+// C0 controls, DEL and C1 controls. A Riot ID cannot contain these, and they
+// would corrupt any log line or console output carrying the name.
+const CONTROL_CHARS_RE = /[\x00-\x1F\x7F-\x9F]/;
+
+export type JoinValidation =
+  | { ok: true; room: string; name: string }
+  | { ok: false; error: string };
+
+/**
+ * Validate a `join`'s room and name.
+ *
+ * The name is accepted or rejected verbatim — never trimmed, case-folded or
+ * unicode-normalised. The client's identity IS the raw string (`riotId`, see
+ * orchestrator.ts): it is what `signal` messages are addressed to and what the
+ * `localName < remoteName` initiator election compares. A server that stored a
+ * normalised variant would make `findInRoom` miss and break signaling for
+ * anyone whose name differs from its normal form — indistinguishable, from the
+ * user's side, from the duplicate-name bug this validation ships alongside.
+ * Riot IDs are unicode, so there is no charset restriction on names either.
+ */
+export function validateJoin(room: unknown, name: unknown): JoinValidation {
+  if (typeof room !== 'string') return { ok: false, error: 'join requires room as a string' };
+  if (typeof name !== 'string') return { ok: false, error: 'join requires name as a string' };
+
+  if (!ROOM_ID_RE.test(room)) {
+    return { ok: false, error: `join room must be 1-${MAX_ROOM_ID_LEN} characters of [A-Za-z0-9._:-]` };
+  }
+
+  if (name.length === 0) return { ok: false, error: 'join name must not be empty' };
+  if (name.length > MAX_NAME_LEN) {
+    return { ok: false, error: `join name must be at most ${MAX_NAME_LEN} characters` };
+  }
+  if (CONTROL_CHARS_RE.test(name)) {
+    return { ok: false, error: 'join name must not contain control characters' };
+  }
+
+  return { ok: true, room, name };
+}
