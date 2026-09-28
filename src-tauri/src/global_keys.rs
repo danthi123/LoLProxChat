@@ -16,12 +16,17 @@
 //!      on the dedicated thread so this is safe in practice; we wrap it in
 //!      an UnsafeCell + manual `unsafe impl Sync` to satisfy the type
 //!      checker for the static.
-//!   4. Caps Lock LED workaround: after acting on a Caps Lock event we send
-//!      synthetic key-down+up via SendInput to flip the LED back, so the
-//!      keyboard light doesn't toggle on every PTT press.
+//!   4. Caps Lock workaround (#27): Windows toggles Caps Lock once per
+//!      press, on the key-down transition only. When Caps Lock is the PTT
+//!      bind we send one synthetic press via SendInput on that same down
+//!      edge to cancel it, so a PTT press leaves Caps Lock (and its LED)
+//!      exactly as it found it. `CAPS_HELD` keeps typematic repeats from
+//!      firing a second, uncancelled flip. The decision itself lives in
+//!      `key_decision` so it can be unit-tested off-Windows.
 
+use crate::key_decision::{self, Decision, Edge, Emit, VK_CAPITAL};
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
@@ -35,17 +40,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
-const VK_CAPITAL: u32 = 0x14;
-
 /// Currently-bound PTT virtual-key code. Default = Caps Lock. (v0.5.6 tried
 /// defaulting to unbound to stop PTT eating the Caps Lock key, but that left
 /// push-to-talk users unable to transmit — no key bound — so v0.5.7 restored
-/// the Caps Lock default. A migration that fixes the key capture without
-/// stranding PTT users is the proper follow-up. See #27.)
+/// the Caps Lock default. See #27; note 4 above covers how the key is left
+/// alone without unbinding it.)
 static PTT_VK: AtomicU32 = AtomicU32::new(VK_CAPITAL);
 
 /// Currently-bound toggle-self-mute virtual-key code. 0 = unbound.
 static TOGGLE_VK: AtomicU32 = AtomicU32::new(0);
+
+/// True while Caps Lock is physically held down. Only ever touched from the
+/// hook thread; the atomic is for the `static`, not for contention.
+static CAPS_HELD: AtomicBool = AtomicBool::new(false);
 
 /// Channel into the tokio worker that actually emits Tauri events. The hook
 /// proc only ever does a non-blocking `send` on this — no allocations, no
@@ -77,47 +84,50 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     if code >= 0 {
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
 
-        // Ignore synthetic / injected events so our own SendInput-based
-        // Caps Lock LED workaround doesn't recursively re-enter the hook
-        // (would produce 2-3 spurious PttDown/PttUp pairs per physical
-        // keypress). LLKHF_INJECTED = 0x10 in KBDLLHOOKSTRUCT.flags.
-        if kb.flags.0 & 0x10 != 0 {
-            return CallNextHookEx(*HOOK.0.get(), code, wparam, lparam);
-        }
+        // Synthetic / injected events (our own Caps Lock flip among them) must
+        // not re-enter the decision — see key_decision::decide.
+        // LLKHF_INJECTED = 0x10 in KBDLLHOOKSTRUCT.flags.
+        let injected = kb.flags.0 & 0x10 != 0;
 
         let msg = wparam.0 as u32;
-        let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-        let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+        let edge = if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+            Edge::Down
+        } else if msg == WM_KEYUP || msg == WM_SYSKEYUP {
+            Edge::Up
+        } else {
+            Edge::Other
+        };
 
-        let ptt = PTT_VK.load(Ordering::Relaxed);
-        let toggle = TOGGLE_VK.load(Ordering::Relaxed);
+        let Decision { emit, flip_caps, caps_held } = key_decision::decide(
+            kb.vkCode,
+            edge,
+            PTT_VK.load(Ordering::Relaxed),
+            TOGGLE_VK.load(Ordering::Relaxed),
+            injected,
+            CAPS_HELD.load(Ordering::Relaxed),
+        );
+        CAPS_HELD.store(caps_held, Ordering::Relaxed);
 
         if let Some(tx) = EVENT_TX.get() {
-            if kb.vkCode == ptt {
-                if is_down {
-                    let _ = tx.send(KeyEvent::PttDown);
-                } else if is_up {
-                    let _ = tx.send(KeyEvent::PttUp);
-                }
-                // LED flip-back: send synthetic down+up to cancel the OS's
-                // pending toggle of the Caps Lock light. Has to fire on BOTH
-                // edges — pressing AND releasing the key both toggle the LED.
-                // The injected-filter above keeps this from recursing.
-                if ptt == VK_CAPITAL && (is_down || is_up) {
-                    flip_caps_lock_back();
-                }
-            } else if toggle != 0 && kb.vkCode == toggle && is_down {
-                let _ = tx.send(KeyEvent::ToggleMute);
+            match emit {
+                Emit::PttDown => { let _ = tx.send(KeyEvent::PttDown); }
+                Emit::PttUp => { let _ = tx.send(KeyEvent::PttUp); }
+                Emit::ToggleMute => { let _ = tx.send(KeyEvent::ToggleMute); }
+                Emit::None => {}
             }
+        }
+
+        if flip_caps {
+            flip_caps_lock_back();
         }
     }
     CallNextHookEx(*HOOK.0.get(), code, wparam, lparam)
 }
 
-/// Send synthetic Caps Lock down+up via SendInput. The OS toggled the LED
-/// when the user physically pressed Caps Lock; this synthetic press toggles
-/// it right back, so the keyboard light stays in whatever state it was
-/// before PTT started. Standard Discord trick.
+/// Send synthetic Caps Lock down+up via SendInput — one full press, so one
+/// toggle. The OS toggles Caps Lock when the user physically presses the key;
+/// this cancels that, leaving the state and the LED where they were before
+/// PTT started. Only ever called on a down edge (see `key_decision::decide`).
 unsafe fn flip_caps_lock_back() {
     let inputs = [
         INPUT {
@@ -154,6 +164,9 @@ pub fn setup_hook(app: AppHandle) {
     let (tx, mut rx) = mpsc::unbounded_channel::<KeyEvent>();
     let _ = EVENT_TX.set(tx);
 
+    // Cloned before the emit task below takes ownership of `app`.
+    let app_for_hook = app.clone();
+
     // Drain the channel on the tokio runtime and emit Tauri events.
     // We preserve the existing `global_shortcut` event name + string payload
     // contract that src/background/background.ts already listens for, so no
@@ -171,15 +184,31 @@ pub fn setup_hook(app: AppHandle) {
 
     // Dedicated OS thread with its own message pump. SetWindowsHookExW
     // requires this — tokio worker threads don't pump messages.
-    std::thread::spawn(|| unsafe {
+    std::thread::spawn(move || unsafe {
         let h = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("[global_keys] SetWindowsHookExW failed: {:?}", e);
+                crate::rust_log(
+                    &app_for_hook,
+                    format!(
+                        "global_keys: SetWindowsHookExW FAILED: {e:?} — push-to-talk and the \
+                         mute hotkey will not work"
+                    ),
+                );
                 return;
             }
         };
         *HOOK.0.get() = h;
+        // The binds can't be reported here: the overlay pushes any stored
+        // ones well after setup, so PTT_VK/TOGGLE_VK still hold the compiled
+        // defaults. set_ptt_key/set_toggle_key log the real ones when they
+        // arrive.
+        crate::rust_log(
+            &app_for_hook,
+            "global_keys: WH_KEYBOARD_LL hook installed; PTT default=CapsLock until the \
+             overlay pushes the stored bind",
+        );
 
         let mut msg = MSG::default();
         // GetMessageW returns BOOL; the hook fires on its own off the
@@ -192,15 +221,20 @@ pub fn setup_hook(app: AppHandle) {
     });
 }
 
-/// JS-callable: rebind the PTT key by Win32 virtual-key code.
+/// JS-callable: rebind the PTT key by Win32 virtual-key code. The raw VK is
+/// logged (not a name) so the log never disagrees with `core/keymap.ts`,
+/// which owns the human-readable table. `app` is injected by Tauri and is
+/// invisible to the JS call shape.
 #[tauri::command]
-pub fn set_ptt_key(vk: u32) {
+pub fn set_ptt_key(app: tauri::AppHandle, vk: u32) {
     PTT_VK.store(vk, Ordering::Relaxed);
+    crate::rust_log(&app, format!("global_keys: PTT rebound to VK 0x{vk:02X}"));
 }
 
 /// JS-callable: rebind the toggle-self-mute key by Win32 virtual-key code.
 /// Pass 0 to unbind.
 #[tauri::command]
-pub fn set_toggle_key(vk: u32) {
+pub fn set_toggle_key(app: tauri::AppHandle, vk: u32) {
     TOGGLE_VK.store(vk, Ordering::Relaxed);
+    crate::rust_log(&app, format!("global_keys: toggle-mute rebound to VK 0x{vk:02X}"));
 }

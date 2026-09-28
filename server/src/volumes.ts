@@ -11,6 +11,19 @@ const DEBUG_VOLUMES = process.env.DEBUG_VOLUMES === '1';
 // enemy fades in (very faintly) about when they'd enter your vision and grows
 // louder as they close. Game units (Summoner's Rift is ~14870x14980).
 const MAX_HEARING_RANGE = 1350;
+
+// Inside this radius an enemy is simply audible, with no distance attenuation
+// at all. It sits just past the distance two ranged laners hold against each
+// other, because the pure-falloff curve put a normal ranged trade at roughly
+// half volume while a melee trade sat near full — so the people the feature is
+// for could not hold a conversation in lane without walking into each other.
+//
+// This is deliberately NOT a change to what is audible: MAX_HEARING_RANGE is
+// the compliance boundary (see docs/compliance.md) and is untouched. The only
+// thing that changes is loudness inside a radius a player could already hear
+// across. It also narrows the volume side channel rather than widening it —
+// inside the plateau, volume no longer encodes distance at all.
+const FULL_VOLUME_RANGE = 900;
 // Max age of an encrypted position blob the server will accept before
 // rejecting it as stale. Tuned to absorb common Windows-clock drift
 // (NTP service can lag 10-30s in the wild — we saw this in issue #7
@@ -39,6 +52,16 @@ export interface VolumeRequestV2 {
   // enemies) instead of always at full volume. Per-user preference; optional for
   // backward compatibility — absent means global/full (the default, #22).
   allyProximity?: boolean;
+  // IGNORED since v0.5.9, and kept only so the shape of what older clients
+  // send is documented where someone will find it.
+  //
+  // "Voice on camera" (#36) used to work by letting the request name the point
+  // it wanted to hear from, which let a client listen in on players who had
+  // never turned the feature on. The camera is now published to room state
+  // over `coords` like any other position, read from there for the requester
+  // as well, and only used when both players in a pair have published one.
+  // See computeTieredVolumes.
+  listenPosition?: { x: number; y: number };
 }
 
 export interface VolumeResponse {
@@ -58,6 +81,12 @@ export interface VolumeResponse {
 const STALE_POSITION_MS = 5_000;
 
 // ---------- helpers ----------
+
+function isFinitePoint(p: unknown): p is { x: number; y: number } {
+  return !!p && typeof p === 'object' &&
+    typeof (p as any).x === 'number' && typeof (p as any).y === 'number' &&
+    isFinite((p as any).x) && isFinite((p as any).y);
+}
 
 function hexToBytes(hex: string): Uint8Array {
   const bytes = new Uint8Array(hex.length / 2);
@@ -84,9 +113,9 @@ async function importKey(hexKey: string): Promise<CryptoKey> {
 
 export function calculateVolume(distance: number): number {
   if (distance >= MAX_HEARING_RANGE) return 0.0;
-  if (distance <= 0) return 1.0;
-  // Quadratic falloff — more generous in the mid-range than the previous
-  // logarithmic curve. At MAX/2: log gave ~0.38, quadratic gives 0.75.
+  if (distance <= FULL_VOLUME_RANGE) return 1.0;
+  // Quadratic falloff across the outer band only, so an enemy still fades
+  // rather than cutting out at the edge of the radius.
   //
   // Reverted v0.1.26 quantization (5 buckets) + ±5% jitter in v0.1.33:
   // The bucket transitions produced audible "cliffs" in real gameplay,
@@ -97,8 +126,8 @@ export function calculateVolume(distance: number): number {
   // boundaries. Reverted to continuous output; client-side EMA handles
   // transitions naturally. See docs/threat-model.md Part 1 for the
   // updated mitigation table.
-  const normalized = distance / MAX_HEARING_RANGE;
-  return Math.max(0, 1 - normalized * normalized);
+  const t = (distance - FULL_VOLUME_RANGE) / (MAX_HEARING_RANGE - FULL_VOLUME_RANGE);
+  return Math.max(0, 1 - t * t);
 }
 
 export async function encryptPosition(
@@ -251,6 +280,31 @@ export interface TieredRoomClient {
   name: string;
   team?: 'ORDER' | 'CHAOS';
   position?: { x: number; y: number; updatedMs: number };
+  /** Camera centre, present only while the client has voice on camera ON. */
+  camera?: { x: number; y: number; updatedMs: number };
+}
+
+/**
+ * Closest approach between two sets of points: the smallest distance from any
+ * point in `a` to any point in `b`.
+ *
+ * Used with the requester's listening points on one side and the peer's
+ * champion on the other. With voice on camera off on either side that is just
+ * champion-to-champion; with it on for BOTH, the requester listens from its
+ * champion and its camera, and hears the peer if either is close enough.
+ */
+export function closestApproach(
+  a: readonly { x: number; y: number }[],
+  b: readonly { x: number; y: number }[],
+): number {
+  let best = Infinity;
+  for (const p of a) {
+    for (const q of b) {
+      const d = Math.hypot(p.x - q.x, p.y - q.y);
+      if (d < best) best = d;
+    }
+  }
+  return best;
 }
 
 /**
@@ -297,6 +351,9 @@ export function computeTieredVolumes(
   const range = MAX_HEARING_RANGE;
 
   const cutoff = Date.now() - STALE_POSITION_MS;
+  // Our own camera, read from room state rather than from the request. A
+  // stale one counts as absent, the same as a stale position.
+  const myCamera = me.camera && me.camera.updatedMs >= cutoff ? me.camera : undefined;
   const peerVolumes: Record<string, number> = {};
   const trace: string[] = [];
 
@@ -306,8 +363,12 @@ export function computeTieredVolumes(
     if (!legacy && peer.team === me.team && !body.allyProximity) {
       // Global ally voice (default): always full volume, no proximity. We even
       // skip the staleness check — an ally in SCANNING / long-hold hasn't
-      // reported coords recently but is still actively transmitting audio, and a
-      // truly-gone peer is removed by RoomManager.leave on socket close.
+      // reported coords recently but is still actively transmitting audio. What
+      // makes that safe is that a truly-gone peer is removed from room state:
+      // RoomManager.leave on a clean close, and the WebSocket heartbeat
+      // (server/src/heartbeat.ts) for a half-open socket that never fires one.
+      // Without the heartbeat this branch holds a vanished ally at 1.0 for as
+      // long as the OS takes to time the TCP connection out.
       // (When the requester opts into allyProximity, allies fall through to the
       // distance falloff below, exactly like cross-team peers.)
       peerVolumes[peer.name] = 1.0;
@@ -324,20 +385,45 @@ export function computeTieredVolumes(
       continue;
     }
 
-    const dx = body.myPosition.x - peer.position.x;
-    const dy = body.myPosition.y - peer.position.y;
-    const dist = Math.sqrt(dx * dx + dy * dy);
+    // "Voice on camera" (#36) is an opt-in BETWEEN TWO PLAYERS, not a setting
+    // one of them applies to the other. Both sides have to be publishing a
+    // camera for the requester's camera to count; if this peer has the setting
+    // off, their camera is absent from room state and the pair is scored
+    // champion-to-champion — so a player who leaves it off can only be heard
+    // by someone actually near them on the map.
+    //
+    // It is one-way: your camera is a point you listen FROM, never a point you
+    // are heard at, so the peer is always scored at their champion. Panning
+    // onto a fight lets you hear it without the people in it hearing you; they
+    // hear you only if their own camera is on you. A v0.5.9 test build made it
+    // two-way, and players testing it found hearing someone who happened to
+    // glance at you unpredictable — being heard is anchored to where your
+    // champion stands.
+    //
+    // The requester's own camera is read from ROOM STATE, not the request, so
+    // a client cannot listen from a point without having published it — which
+    // is also what makes publishing it the opt-in. A request cannot assert a
+    // listening point of its own (the old `listenPosition` field is ignored).
+    const bothOptedIn = !!myCamera && !!peer.camera &&
+      peer.camera.updatedMs >= cutoff;
+    const myPoints = bothOptedIn ? [body.myPosition, myCamera!] : [body.myPosition];
+    const peerPoints = [peer.position];
+
+    const dist = closestApproach(myPoints, peerPoints);
     if (dist >= range) {
       if (DEBUG_VOLUMES) trace.push(peer.name + '[cross team=' + peer.team + ' dist=' + Math.round(dist) + ' >= range=' + range + ']=skip');
       continue;
     }
     peerVolumes[peer.name] = calculateVolume(dist);
-    if (DEBUG_VOLUMES) trace.push(peer.name + '[cross team=' + peer.team + ' dist=' + Math.round(dist) + ']=' + calculateVolume(dist).toFixed(2));
+    if (DEBUG_VOLUMES) trace.push(peer.name + '[cross team=' + peer.team + (bothOptedIn ? ' camera' : '') + ' dist=' + Math.round(dist) + ']=' + calculateVolume(dist).toFixed(2));
   }
 
   if (DEBUG_VOLUMES) {
+    const listenTag = myCamera
+      ? ' myCamera=(' + Math.round(myCamera.x) + ',' + Math.round(myCamera.y) + ')'
+      : '';
     console.log('[volumes] req me=' + JSON.stringify(me.name) +
-      ' team=' + me.team + ' legacy=' + legacy + ' range=' + range +
+      ' team=' + me.team + ' legacy=' + legacy + ' range=' + range + listenTag +
       ' | ' + (trace.length ? trace.join(' ') : '(no peers)'));
   }
 

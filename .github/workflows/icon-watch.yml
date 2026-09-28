@@ -34,14 +34,54 @@ jobs:
       - name: Scrape latest icons (Community Dragon)
         run: npm run update-icons
 
+      # What the scrape is compared against matters. Comparing against main
+      # alone meant that once a refresh PR was open and unmerged, every daily
+      # run saw the same "change" main was still missing, retrained, and
+      # force-pushed the branch again — a "pushed 1 commit" notification a day
+      # for as long as the PR sat there, and a new PR per game patch on top.
+      # So the baseline is the newest open refresh PR's manifest when there is
+      # one, and main's otherwise.
+      - name: Find the open refresh PR, if any
+        id: open
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Only this repo's own branches: on a public repo anyone can open a
+          # PR from a fork with a branch of the same name.
+          gh pr list --state open --json number,headRefName,createdAt,isCrossRepository \
+            --jq '[.[] | select((.isCrossRepository | not) and (.headRefName | startswith("auto/icon-refresh-")))] | sort_by(.createdAt)' > open-prs.json
+          cat open-prs.json
+          LATEST=$(node -e "const p=require('./open-prs.json'); process.stdout.write(p.length ? p[p.length-1].headRefName : '')")
+          echo "branch=$LATEST" >> "$GITHUB_OUTPUT"
+          if [ -n "$LATEST" ]; then
+            git fetch --depth=1 origin "$LATEST"
+            git show "FETCH_HEAD:models/champion-icons-manifest.json" > baseline-manifest.json
+            # The PR's version bump was computed from main as it was then. Once
+            # main moves past it the PR conflicts (and resolving it carelessly
+            # rolls the version back), so rebuild it even with no icon change.
+            ver() { sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1; }
+            PR_VER=$(git show "FETCH_HEAD:src-tauri/Cargo.toml" | ver)
+            MAIN_VER=$(ver < src-tauri/Cargo.toml)
+            NEWER=$(printf '%s\n%s\n' "$MAIN_VER" "$PR_VER" | sort -V | tail -1)
+            if [ "$PR_VER" = "$MAIN_VER" ] || [ "$NEWER" != "$PR_VER" ]; then
+              echo "stale=true" >> "$GITHUB_OUTPUT"
+              echo "open PR is at $PR_VER, main is at $MAIN_VER - will rebuild it"
+            fi
+          else
+            git show "HEAD:models/champion-icons-manifest.json" > baseline-manifest.json
+          fi
+
       - name: Detect icon-set change
         id: diff
+        env:
+          STALE: ${{ steps.open.outputs.stale }}
         run: |
           # Trigger only when a champion or skin is ADDED/REMOVED — not on icon
           # byte-hash churn. Community Dragon periodically re-encodes the PNGs
           # (same pixels, different bytes), which would otherwise churn nearly
           # every hash and open a spurious retrain PR + release.
-          if node scripts/icon-set-changed.mjs; then
+          if [ "$STALE" = "true" ] \
+             || node scripts/icon-set-changed.mjs baseline-manifest.json models/champion-icons-manifest.json; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -103,4 +143,24 @@ jobs:
           gh pr create --base main --head "$BRANCH" \
             --title "Refresh champion classifier — game patch ${PATCH} (v${APP})" \
             --body-file pr-body.md \
-            || gh pr edit "$BRANCH" --body-file pr-body.md
+            || gh pr edit "$BRANCH" \
+                 --title "Refresh champion classifier — game patch ${PATCH} (v${APP})" \
+                 --body-file pr-body.md
+
+      # One refresh PR at a time. Each retrains from scratch on the full icon
+      # set, so a newer one contains everything an older one did; leaving the
+      # older ones open is just a queue nobody will merge. Runs on every run,
+      # not only after a retrain, so a backlog is cleared on the next run.
+      - name: Close superseded refresh PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANGED: ${{ steps.diff.outputs.changed }}
+          PATCH: ${{ steps.meta.outputs.patch }}
+          LATEST: ${{ steps.open.outputs.branch }}
+        run: |
+          if [ "$CHANGED" = "true" ]; then KEEP="auto/icon-refresh-${PATCH}"; else KEEP="$LATEST"; fi
+          [ -n "$KEEP" ] || { echo "no refresh PR to keep; nothing to close"; exit 0; }
+          NEW=$(gh pr view "$KEEP" --json number --jq .number)
+          for OLD in $(node -e "for (const p of require('./open-prs.json')) if (p.headRefName !== process.argv[1]) console.log(p.number)" "$KEEP"); do
+            gh pr close "$OLD" --delete-branch --comment "Superseded by #${NEW}, which retrains on the full current icon set."
+          done

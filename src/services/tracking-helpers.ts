@@ -44,27 +44,60 @@ export interface BlobScoreInputs {
   clsScore: number;
   /** 0..1 heuristic on how many "white" (champion-mark) pixels surround the blob. */
   whiteScore: number;
-  /** 0..1, lower if the blob is suspiciously close to a known ally peer. */
-  peerScore: number;
 }
 
 /**
  * Composite score for a candidate blob. When the classifier is loaded we
  * weight its confidence heavily; without it, position dominates.
+ *
+ * The trailing division renormalizes away a fourth term — a peer-avoidance
+ * penalty against known ally positions — that scored a constant 1.0 for every
+ * candidate from the v0.2 server-side-positions refactor onward, because no
+ * peer coordinates have reached a client since. They are not coming back:
+ * docs/threat-model.md, "Why clients are not told ally positions", records why
+ * the server must not hand them out. Spelled as a division rather than
+ * pre-divided decimals so the surviving weights keep their ratios to each
+ * other exactly, which is what makes the removal leave every ranking alone.
  */
 export function computeBlobScore(s: BlobScoreInputs, hasClassifier: boolean): number {
   return hasClassifier
-    ? s.posScore * 0.35 + s.clsScore * 0.30 + s.whiteScore * 0.20 + s.peerScore * 0.15
-    : s.posScore * 0.45 + s.peerScore * 0.30 + s.whiteScore * 0.25;
+    ? (s.posScore * 0.35 + s.clsScore * 0.30 + s.whiteScore * 0.20) / 0.85
+    : (s.posScore * 0.45 + s.whiteScore * 0.25) / 0.70;
 }
 
 /** Minimum classifier confidence to follow a blob during Phase 1 tracking. */
 export const CLS_FOLLOW_THRESHOLD = 0.2;
 
+/**
+ * Radius (in minimap px) around the predicted position inside which frame-to-frame
+ * *continuity* outranks classifier identity — the classifier follow-threshold is
+ * not applied to a blob this close.
+ *
+ * Why this exists (v0.5.8, NotOtakuu's 2026-09-12 log): the 172-class classifier
+ * returns raw≈0 for some champions at some minimap scales (his Twisted Fate scored
+ * 0.000 every frame). The Phase-1 veto below then rejected the very blob we had
+ * locked onto one tick earlier, sitting 0 px from the prediction, so the tracker
+ * fell into a permanent lock → hold → forced-reacquire → lock cycle and the
+ * broadcast position froze at the lock point. That froze his coords at the
+ * fountain, which made every enemy fall outside MAX_HEARING_RANGE — the
+ * user-visible symptom was "allies are perfect, enemies are way too quiet".
+ *
+ * A blob one icon-diameter from where we predicted the icon would be IS the icon;
+ * no classifier opinion should override that. Identity still gates the far field,
+ * where a wrong pick means clinging to a minion wave or a turret (issue #13).
+ *
+ * This completes Phase A item 2 of docs/plans/2026-06-03-cv-tracking-research.md
+ * ("loosen the over-strict v0.3 gates that gate on classifier confidence"). The
+ * sibling gate on the SCANNING→LOCKED transition was already reverted in v0.3.1;
+ * this one was missed.
+ */
+export function computeNearFieldPx(expectedIconDiam: number): number {
+  return Math.max(10, Math.round(expectedIconDiam));
+}
+
 export interface ScoreFns {
   cls: (b: Blob) => number;
   white: (b: Blob) => number;
-  peer: (b: Blob) => number;
 }
 
 export interface ScoredBlob {
@@ -74,8 +107,17 @@ export interface ScoredBlob {
 
 /**
  * Phase 1: pick the best teal blob within jump range of the predicted
- * position. Returns null if no candidate scored above the (classifier-gated)
- * follow threshold.
+ * position.
+ *
+ * The classifier follow-threshold gates the FAR field only. A blob within
+ * `nearFieldPx` of either the predicted position or our last known position is
+ * followed on positional continuity alone, whatever the classifier thinks of it
+ * (see computeNearFieldPx). Beyond that radius the classifier still has to vouch
+ * for the blob, which is what keeps a long hold from snapping the dot onto a
+ * minion wave.
+ *
+ * Returns null when no candidate is in range, or when every in-range candidate
+ * is in the far field and below the follow threshold.
  */
 export function pickBestBlobInRange(
   tealBlobs: Blob[],
@@ -84,24 +126,34 @@ export function pickBestBlobInRange(
   maxJumpPx: number,
   hasClassifier: boolean,
   scoreFns: ScoreFns,
+  nearFieldPx = 0,
 ): ScoredBlob | null {
   const maxJumpSq = maxJumpPx * maxJumpPx;
+  const nearFieldSq = nearFieldPx * nearFieldPx;
   let best: ScoredBlob | null = null;
 
   for (const b of tealBlobs) {
     const dxLast = b.cx - lastReg.x;
     const dyLast = b.cy - lastReg.y;
-    if (dxLast * dxLast + dyLast * dyLast > maxJumpSq) continue;
+    const distLastSq = dxLast * dxLast + dyLast * dyLast;
+    if (distLastSq > maxJumpSq) continue;
 
     const dxPred = b.cx - predicted.x;
     const dyPred = b.cy - predicted.y;
-    const posScore = 1 - (dxPred * dxPred + dyPred * dyPred) / maxJumpSq;
+    const distPredSq = dxPred * dxPred + dyPred * dyPred;
+    const posScore = 1 - distPredSq / maxJumpSq;
+
+    // Near field is measured against whichever reference is more forgiving:
+    // `predicted` covers smooth movement, `lastReg` covers a standing champion
+    // whose velocity EMA hasn't decayed to zero yet.
+    // Strict `<` so the default nearFieldPx=0 disables the exemption entirely.
+    const isNearField = Math.min(distPredSq, distLastSq) < nearFieldSq;
 
     const clsScore = scoreFns.cls(b);
-    if (hasClassifier && clsScore < CLS_FOLLOW_THRESHOLD) continue;
+    if (hasClassifier && !isNearField && clsScore < CLS_FOLLOW_THRESHOLD) continue;
 
     const score = computeBlobScore(
-      { posScore, clsScore, whiteScore: scoreFns.white(b), peerScore: scoreFns.peer(b) },
+      { posScore, clsScore, whiteScore: scoreFns.white(b) },
       hasClassifier,
     );
     if (!best || score > best.score) best = { blob: b, score };
@@ -128,6 +180,123 @@ export function pickClassifierReacquisition(
   return best;
 }
 
+// ---------- an enemy icon drawn over ours ----------
+
+/**
+ * How close an enemy icon's centre has to be to our icon for the two to be
+ * overlapping: one icon diameter.
+ *
+ * Measured from where we last SAW ours, which is not our icon's centre. While
+ * an enemy icon slides over ours, what the tracker follows on the last visible
+ * frames is the uncovered crescent, whose centroid sits on the far side from
+ * the enemy — in simulation the enemy's centre was ~0.6 of an icon away when
+ * ours finally vanished.
+ *
+ * An icon is ~1300 game units across at common minimap scales, so proximity
+ * alone is weak evidence; what gates an occlusion is our icon having visibly
+ * shrunk under the enemy's before it vanished (COVERED_PIXEL_FRACTION).
+ */
+export function computeOcclusionRadiusPx(expectedIconDiam: number): number {
+  return Math.max(10, Math.round(expectedIconDiam));
+}
+
+/**
+ * Our icon counts as partly covered when an enemy icon overlaps it and fewer
+ * than this fraction of its usual pixels are showing. An enemy icon centred a
+ * full 0.8 icon away hides about a fifth of our ring, so 0.7 needs a real
+ * overlap, not two icons touching.
+ */
+export const COVERED_PIXEL_FRACTION = 0.7;
+
+/**
+ * How long an occlusion survives frames with no enemy icon on the anchor.
+ * Two red icons that touch merge into one blob wider than the icon filter
+ * allows, so in a 2v1 the covering icon can drop out of detection for a few
+ * frames while nothing has actually changed.
+ */
+export const OCCLUDER_GRACE_MS = 500;
+
+/**
+ * The longest one occlusion may keep our position alive. An enemy standing on
+ * us for this long in a real fight is rare; an enemy standing on the spot we
+ * teleported away from while we were covered is the case this bounds.
+ * It is a single budget per lost-icon episode, not per enemy.
+ */
+export const MAX_OCCLUDED_MS = 10_000;
+
+/**
+ * The enemy icon most likely to be drawn over ours, or null if none is close
+ * enough to be.
+ *
+ * When two champions are in melee range their minimap icons overlap, and the
+ * one drawn on top hides the other's border. If ours is underneath, the
+ * tracker sees no teal blob where we were — which looks exactly like the
+ * champion having gone somewhere else, and used to be treated that way: two
+ * seconds of it and the orchestrator disowned our position, cutting us out of
+ * the audio of the very enemy we were fighting. A red icon sitting on our last
+ * position is the positive evidence that we are still there, underneath it.
+ */
+export function findOccluder(
+  enemyBlobs: Blob[],
+  at: { x: number; y: number },
+  expectedIconDiam: number,
+): { x: number; y: number } | null {
+  const radius = computeOcclusionRadiusPx(expectedIconDiam);
+  const singleMax = expectedIconDiam * 1.6;
+  let best: { x: number; y: number } | null = null;
+  let bestDist = Infinity;
+  for (const b of enemyBlobs) {
+    const bw = b.maxX - b.minX + 1;
+    const bh = b.maxY - b.minY + 1;
+    let point: { x: number; y: number };
+    let dist: number;
+    if (bw <= singleMax && bh <= singleMax) {
+      // One icon: overlapping means centres within one diameter.
+      point = { x: b.cx, y: b.cy };
+      dist = Math.hypot(b.cx - at.x, b.cy - at.y);
+      if (dist > radius) continue;
+    } else {
+      // Two or more enemy icons touching, merged into one blob (a 2v1). Its
+      // centroid can sit between them, so measure to the blob's extent
+      // instead, and treat the nearest part of it as the covering icon. The
+      // extent alone is not enough: a diagonal pair's bounding box has an
+      // empty corner that reaches ~2 icons from either of them, so the
+      // centroid must also be close — within 1.5 icons, which a pair with one
+      // of its icons actually on us always is.
+      point = {
+        x: Math.max(b.minX, Math.min(b.maxX, at.x)),
+        y: Math.max(b.minY, Math.min(b.maxY, at.y)),
+      };
+      dist = Math.hypot(point.x - at.x, point.y - at.y);
+      if (dist > radius / 2) continue;
+      if (Math.hypot(b.cx - at.x, b.cy - at.y) > expectedIconDiam * 1.5) continue;
+    }
+    if (dist < bestDist) {
+      best = point;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
+
+/**
+ * Red blobs that could be enemy icons covering ours: the icon filter's ring
+ * test, but admitting blobs up to ~2.6 icons across. Two enemy icons that
+ * touch merge into one such blob, which filterIconBlobs rejects as too big —
+ * so without this a 2v1 dive, the commonest way to be covered, got no
+ * protection at all. Filled shapes (structures, minion clumps) still fail the
+ * fill-ratio test.
+ */
+export function isPossibleOccluder(b: Blob, expectedIconDiam: number): boolean {
+  if (b.color !== 'red' || b.pixels < 15) return false;
+  if (b.fillRatio > 0.40 || b.fillRatio < 0.08) return false;
+  const bw = b.maxX - b.minX + 1;
+  const bh = b.maxY - b.minY + 1;
+  const lo = expectedIconDiam * 0.6;
+  const hi = expectedIconDiam * 2.6;
+  return bw >= lo && bh >= lo && bw <= hi && bh <= hi;
+}
+
 // ---------- v0.3 tracking tweaks (driven by IXAM's v0.1.33 issue #7 logs) ----------
 
 /**
@@ -138,6 +307,47 @@ export function pickClassifierReacquisition(
  * orchestrator was sending phantom coords; 5s is the budget for "tracking
  * should have recovered by now or it's time to start over."
  */
+/**
+ * Why the tracker is holding instead of following a blob frame to frame.
+ *
+ * 'no-blobs' — the minimap had no own-team icons at all. A real game always
+ *   draws four allies there, so this says the capture failed or something
+ *   covered the minimap, NOT that we moved.
+ * 'no-match' — icons were present and none was us. This one does say we
+ *   moved; a recall is the case that matters.
+ *
+ * `null` means not holding.
+ */
+export type HoldReason = 'no-blobs' | 'no-match' | null;
+
+/**
+ * How long a hold may run before the position we are still broadcasting stops
+ * being worth anything to our peers, by hold reason.
+ *
+ * These are deliberately different. Disowning our coordinates cuts us out of
+ * every cross-team peer's audio instantly, so the cost of being too eager is
+ * a player going silent mid-sentence while standing right next to someone —
+ * which is what real logs showed: four disowns in forty seconds, each cutting
+ * 1-4s of audio, every one of them a 'no-blobs' hold the tracker recovered
+ * from on its own. The cost of being too patient is a few extra seconds of
+ * audio after a recall. For a voice app the second is much the cheaper
+ * mistake, but only where the position is actually likely to still be right.
+ */
+export const DISOWN_AFTER_SEC: Record<Exclude<HoldReason, null>, number> = {
+  // Held position is probably still correct — wait until the tracker itself
+  // gives up (FORCED_REACQUIRE_HOLD_MS) rather than cutting audio early.
+  'no-blobs': 5,
+  // We have positive evidence we are not where we say we are. Cut fast.
+  'no-match': 2,
+};
+
+/** Seconds of hold after which we stop vouching for our last position. */
+export function disownAfterSec(reason: HoldReason): number {
+  // No reason recorded (a hold that predates the distinction, or a tracker
+  // state we do not model) falls back to the cautious value.
+  return reason ? DISOWN_AFTER_SEC[reason] : DISOWN_AFTER_SEC['no-match'];
+}
+
 export const FORCED_REACQUIRE_HOLD_MS = 5000;
 
 export function shouldForceReacquisition(holdStartMs: number, nowMs: number): boolean {
@@ -162,4 +372,158 @@ export function shouldForceReacquisition(holdStartMs: number, nowMs: number): bo
  */
 export function nextClassifierEma(currentEma: number, raw: number, decay: number): number {
   return currentEma * decay + raw * (1 - decay);
+}
+
+// ---------- v0.5.8: camera viewport centre (issue #36, "voice on camera") ----------
+
+/**
+ * Locate the centre of League's camera-viewport rectangle on the minimap, in
+ * region-relative pixels. Returns null when no plausible rectangle is visible.
+ *
+ * Input is the `viewportMask` built by TrackingService.buildWhiteMasks — white
+ * pixels that belong to long straight runs, which on the minimap is the camera
+ * rectangle (the short diagonal movement-path line is deliberately excluded).
+ *
+ * Method: a rectangle outline puts a lot of marked pixels in exactly four
+ * lines — its top and bottom rows, and its left and right columns. So rows
+ * holding at least `minRunPx` marked pixels are the horizontal edges, columns
+ * holding at least `minRunPx` are the vertical edges, and the centre is the
+ * midpoint between the outermost of each. Taking edges this way rather than a
+ * raw bounding box keeps a stray run elsewhere on the minimap from dragging the
+ * centre off the rectangle.
+ *
+ * Both edge pairs must be present and separated by a plausible fraction of the
+ * minimap, so a rectangle clipped by the edge of the map (camera panned into a
+ * corner) reports null instead of a centre that is off by half its width. The
+ * caller falls back to the champion's own position in that case.
+ */
+/**
+ * Why a frame produced no camera centre. A bare null tells a bug report nothing:
+ * "the rectangle was not readable" covers both "no bright pixels survived the
+ * white threshold at all" and "the rectangle was found but looked implausible",
+ * which need opposite fixes.
+ */
+export type ViewportMiss =
+  | 'no-marked-pixels'
+  | 'no-opposing-edges'
+  | 'span-too-large'
+  | 'edges-disagree';
+
+export interface ViewportResult {
+  centre: { cx: number; cy: number } | null;
+  miss?: ViewportMiss;
+  /** Marked pixels seen, so a threshold problem is distinguishable from a shape one. */
+  markedPixels: number;
+}
+
+export function computeViewportCenter(
+  viewportMask: Uint8Array,
+  width: number,
+  height: number,
+  minRunPx = 12,
+): { cx: number; cy: number } | null {
+  return describeViewportCenter(viewportMask, width, height, minRunPx).centre;
+}
+
+export function describeViewportCenter(
+  viewportMask: Uint8Array,
+  width: number,
+  height: number,
+  minRunPx = 12,
+): ViewportResult {
+  if (width <= 0 || height <= 0 || viewportMask.length < width * height) {
+    return { centre: null, miss: 'no-marked-pixels', markedPixels: 0 };
+  }
+
+  const rowCounts = new Uint32Array(height);
+  const colCounts = new Uint32Array(width);
+  for (let y = 0; y < height; y++) {
+    const rowBase = y * width;
+    for (let x = 0; x < width; x++) {
+      if (viewportMask[rowBase + x] === 1) {
+        rowCounts[y]++;
+        colCounts[x]++;
+      }
+    }
+  }
+
+  // A real camera box covers a meaningful slice of the map but never most of
+  // it. Anything outside this band is noise (or the whole minimap border got
+  // marked) and reports null so the caller falls back to the champion position.
+  const MIN_SPAN_FRACTION = 0.04;
+  const MAX_SPAN_FRACTION = 0.70;
+
+  let markedPixels = 0;
+  for (let y = 0; y < height; y++) markedPixels += rowCounts[y];
+  if (markedPixels === 0) return { centre: null, miss: 'no-marked-pixels', markedPixels };
+
+  const rows = findOpposingEdges(rowCounts, minRunPx, height * MIN_SPAN_FRACTION);
+  const cols = findOpposingEdges(colCounts, minRunPx, width * MIN_SPAN_FRACTION);
+  if (!rows || !cols) return { centre: null, miss: 'no-opposing-edges', markedPixels };
+
+  const spanX = cols.far - cols.near;
+  const spanY = rows.far - rows.near;
+  if (spanX > width * MAX_SPAN_FRACTION || spanY > height * MAX_SPAN_FRACTION) {
+    return { centre: null, miss: 'span-too-large', markedPixels };
+  }
+
+  // Consistency: the horizontal edges should be about as long as the box is
+  // wide, and the vertical edges about as tall as it is high. A pairing that
+  // fails this is two unrelated runs, not one rectangle.
+  if (!spansAgree(rows.strength, spanX) || !spansAgree(cols.strength, spanY)) {
+    return { centre: null, miss: 'edges-disagree', markedPixels };
+  }
+
+  return {
+    centre: { cx: (cols.near + cols.far) / 2, cy: (rows.near + rows.far) / 2 },
+    markedPixels,
+  };
+}
+
+/**
+ * Given per-row (or per-column) counts of marked pixels, find the two opposing
+ * edges of the rectangle: the strongest line, and the strongest line at least
+ * `minSeparation` away from it.
+ *
+ * Picking by strength rather than by "outermost line over the threshold" is
+ * what keeps an unrelated straight run elsewhere on the minimap from being
+ * mistaken for an edge — the rectangle's own edges are far denser than stray
+ * marks. The second edge additionally has to be comparable in length to the
+ * first, since both sides of a rectangle are the same length.
+ */
+function findOpposingEdges(
+  counts: Uint32Array,
+  minRunPx: number,
+  minSeparation: number,
+): { near: number; far: number; strength: number } | null {
+  let primary = -1;
+  for (let i = 0; i < counts.length; i++) {
+    if (primary < 0 || counts[i] > counts[primary]) primary = i;
+  }
+  if (primary < 0 || counts[primary] < minRunPx) return null;
+
+  let secondary = -1;
+  for (let i = 0; i < counts.length; i++) {
+    if (Math.abs(i - primary) < minSeparation) continue;
+    if (counts[i] < minRunPx) continue;
+    if (secondary < 0 || counts[i] > counts[secondary]) secondary = i;
+  }
+  if (secondary < 0) return null;
+
+  // Opposite edges of a rectangle are equal length; allow half, for an edge
+  // partially hidden behind an icon or clipped by the minimap border.
+  if (counts[secondary] * 2 < counts[primary]) return null;
+
+  return {
+    near: Math.min(primary, secondary),
+    far: Math.max(primary, secondary),
+    strength: counts[secondary],
+  };
+}
+
+/** Whether an edge's pixel length is consistent with the box's opposite span. */
+function spansAgree(edgeLength: number, span: number): boolean {
+  if (span <= 0) return false;
+  const ratio = edgeLength / span;
+  return ratio >= 0.5 && ratio <= 2.0;
 }

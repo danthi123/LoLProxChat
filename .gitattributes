@@ -4,3 +4,8 @@
 *.yml  text eol=lf
 *.yaml text eol=lf
 *.sh   text eol=lf
+
+# Source is UTF-8 text, never binary. A stray control byte inside a string
+# literal otherwise pushes a file past git's binary sniff, so it diffs as
+# `Binary files differ` and neither review nor grep can see the change.
+*.ts   text

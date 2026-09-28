@@ -32,3 +32,4 @@ logs.txt
 
 # scratch analysis / contact-sheet images from CV debugging
 /_*.png
+tests/cv/fixtures-real/

@@ -1,7 +1,16 @@
 import { invoke } from '@tauri-apps/api/core';
 import { Position, MapType, MAP_DIMENSIONS } from '../core/types';
-import { getMinimapBounds, MinimapBounds } from '../core/map-calibration';
-import { ChampionClassifier } from './champion-classifier';
+import { CaptureFrame, decodeCaptureFrame } from '../core/capture-frame';
+import '../core/window-globals';
+import {
+  getCaptureBoundsForRect,
+  getMinimapRegionForRect,
+  minimapRegionFitsCapture,
+  MinimapBounds,
+  ScreenRect,
+} from '../core/map-calibration';
+import { BlobScorer } from './champion-classifier';
+import { FrameSource, TauriFrameSource } from './frame-source';
 import {
   computeMaxJumpPx,
   computeReacquireThreshold,
@@ -12,7 +21,16 @@ import {
   // (v0.3.1 reverted the classifier-confidence-dependent ones — see below)
   nextClassifierEma,
   shouldForceReacquisition,
+  computeNearFieldPx,
+  describeViewportCenter,
+  ViewportMiss,
+  HoldReason,
   FORCED_REACQUIRE_HOLD_MS,
+  findOccluder,
+  isPossibleOccluder,
+  MAX_OCCLUDED_MS,
+  COVERED_PIXEL_FRACTION,
+  OCCLUDER_GRACE_MS,
 } from './tracking-helpers';
 
 export enum TrackingState {
@@ -21,21 +39,29 @@ export enum TrackingState {
   DEAD = 'dead',
 }
 
+// The panel is a ~240px column, so these stay short; the full geometry goes to
+// the log instead. They are the only signal a user without Debug on ever sees
+// for a capture geometry we refused, and the refusal never clears itself.
+export const WARN_MINIMAP_TOO_LARGE = "Minimap too large to capture — lower MinimapScale in League's HUD.";
+export const WARN_CALIBRATION_OUTSIDE_CAPTURE = 'Calibrated minimap is outside the capture area — recalibrate.';
+
 import type { Blob } from './blob-types';
 
 export class TrackingService {
   private state: TrackingState = TrackingState.SCANNING;
-  private canvas: HTMLCanvasElement;
-  private ctx: CanvasRenderingContext2D;
   readonly captureBounds: MinimapBounds;
-  private screenWidth: number;
-  private screenHeight: number;
+  private gameRect: ScreenRect;
   private mapType: MapType;
-  private intervalId: number | null = null;
+  private frameSource: FrameSource;
+  // Node and the DOM disagree on what setInterval hands back, and tests/cv runs
+  // the real scan loop under node.
+  private intervalId: ReturnType<typeof setInterval> | null = null;
   private onPositionUpdate: ((pos: Position) => void) | null = null;
 
   // Minimap region (detected or set by calibration/config)
   private minimapRegion: { x: number; y: number; width: number; height: number } | null = null;
+  /** Panel-facing reason the minimap region was refused, or null. */
+  private geometryRefusal: string | null = null;
   private userMinimapRegion: { x: number; y: number; width: number; height: number } | null = null;
   private configMinimapScale: number | null = null;
 
@@ -50,10 +76,6 @@ export class TrackingService {
   private velocityX = 0;
   private velocityY = 0;
 
-  // Known peer positions in region-relative pixel coordinates (from signaling broadcasts)
-  // Used as soft penalty: blobs near a known peer are less likely to be "self"
-  private peerPixelPositions: { x: number; y: number }[] = [];
-
   // Frame counter during SCANNING (warmup before lock-on)
   private scanFrameCount = 0;
 
@@ -62,7 +84,7 @@ export class TrackingService {
   private lastDebugImageMs = 0;
 
   // Champion classifier (ONNX model)
-  private classifier: ChampionClassifier | null = null;
+  private classifier: BlobScorer | null = null;
   // Cached classifier scores per blob (refreshed periodically, not every frame)
   private classifierScores: Map<string, number> = new Map();
   // EMA-smoothed classifier scores to dampen single-frame misclassifications
@@ -82,25 +104,56 @@ export class TrackingService {
   private lastDtSec = 1 / 8; // seconds between this tick and the previous one
   private scanStartMs = 0;
   private holdStartMs = 0;
+  // Why the current hold started. 'no-blobs' means the minimap showed no
+  // own-team icons at all this frame; 'no-match' means icons were there but
+  // none of them was us. The distinction matters to the orchestrator: see
+  // getHoldReason().
+  private holdReason: HoldReason = null;
+  // Occlusion (an enemy icon drawn over ours) — see occlusionStep().
+  // occludedSinceMs is when the current episode started, or 0 if there has been
+  // none since our icon was last found; an episode that ends without our icon
+  // coming back leaves it set, which stops a second one starting.
+  private occludedSinceMs = 0;
+  private occluded = false;
+  // Region px. Fixed for the whole episode: where the covering icon was when
+  // ours vanished. We report this, not wherever that enemy goes next.
+  private occlusionAnchor: { x: number; y: number } | null = null;
+  private occluderLastSeenMs = 0;
+  // Typical pixel count of our icon when nothing overlaps it (EMA), and whether
+  // the last frame we saw it on showed it overlapped AND shrunk — the signature
+  // of an icon being covered, as opposed to vanishing whole (recall, teleport).
+  private fullIconPixels = 0;
+  // Same, for the bounding box — what coverCorrectedCentre measures against.
+  private fullIconW = 0;
+  private fullIconH = 0;
+  private lastSeenPartlyCovered = false;
+  private lastSeenPixels: number | null = null;
+  // This frame's red blobs that could be enemy icons over ours — looser than
+  // the icon filter, see isPossibleOccluder.
+  private occluderBlobs: Blob[] = [];
   // When we successfully tracked a blob that moved >3px from last tick.
   // Used to make Phase 2 re-acquisition stricter when stationary, so we don't
   // teleport the tracking dot onto a minion wave / turret if the icon flickers.
   private lastMovementMs = 0;
   private static readonly TUNED_FPS = 8;
 
+  // Repeated capture failures are logged at most once per distinct message
+  // per 5s — see logCaptureError.
+  private lastCaptureError = '';
+  private lastCaptureErrorMs = 0;
+  // Frame size we last tried to recover from by re-pushing the capture bounds.
+  private lastFrameSizeResync = '';
+
   // Diagnostics
   private lockedTickCount = 0;
   private diagCounter = 0;
+  private scanFps = 30;
 
-  constructor(screenWidth: number, screenHeight: number, mapType: MapType) {
-    this.screenWidth = screenWidth;
-    this.screenHeight = screenHeight;
-    this.captureBounds = getMinimapBounds(screenWidth, screenHeight);
+  constructor(gameRect: ScreenRect, mapType: MapType, frameSource: FrameSource = new TauriFrameSource()) {
+    this.gameRect = gameRect;
+    this.captureBounds = getCaptureBoundsForRect(gameRect);
     this.mapType = mapType;
-    this.canvas = document.createElement('canvas');
-    this.canvas.width = this.captureBounds.width;
-    this.canvas.height = this.captureBounds.height;
-    this.ctx = this.canvas.getContext('2d', { willReadFrequently: true })!;
+    this.frameSource = frameSource;
   }
 
   /** Send capture bounds to the Tauri backend for screen capture cropping */
@@ -117,6 +170,46 @@ export class TrackingService {
 
   getState(): TrackingState { return this.state; }
   getLastPosition(): Position | null { return this.lastPosition; }
+
+  /**
+   * Centre of League's camera viewport in game coordinates, or null when the
+   * rectangle isn't currently identifiable on the minimap. Independent of the
+   * tracking state machine — this is where the player is LOOKING, not where
+   * their champion is. See docs/compliance.md for why the two are kept apart.
+   */
+  getCameraPosition(): Position | null { return this.cameraPosition; }
+
+  /** Why the camera rectangle was not found this frame, with the pixel count
+   *  that separates "nothing passed the white threshold" from "wrong shape". */
+  getCameraMiss(): { reason: ViewportMiss; markedPixels: number } | null {
+    return this.cameraMiss ? { reason: this.cameraMiss, markedPixels: this.cameraMarkedPixels } : null;
+  }
+
+  /**
+   * Enable/disable camera-viewport detection. Off costs nothing — the scan is
+   * two extra passes over the mask per frame, so it only runs when someone is
+   * actually listening from their camera. Driven by the orchestrator so the
+   * tracker doesn't need to know about user preferences.
+   */
+  setCameraTracking(enabled: boolean): void {
+    if (this.cameraTrackingEnabled === enabled) return;
+    this.cameraTrackingEnabled = enabled;
+    if (!enabled) this.cameraPosition = null;
+  }
+
+  private updateCameraPosition(
+    viewportMask: Uint8Array,
+    region: { x: number; y: number; width: number; height: number },
+  ): void {
+    if (!this.cameraTrackingEnabled) return;
+    const result = describeViewportCenter(viewportMask, region.width, region.height);
+    this.cameraMiss = result.miss ?? null;
+    this.cameraMarkedPixels = result.markedPixels;
+    const centre = result.centre;
+    this.cameraPosition = centre
+      ? this.pixelToGamePosition(region.x + centre.cx, region.y + centre.cy, region)
+      : null;
+  }
 
   // Single chokepoint for lastPosition writes so we can flag impossible
   // jumps (recall/TP is fine; CV mis-tracking the icon to a wrong location
@@ -158,6 +251,23 @@ export class TrackingService {
     return this.holdStartMs > 0 ? (performance.now() - this.holdStartMs) / 1000 : 0;
   }
 
+  /**
+   * Why the tracker is currently holding, or null if it is tracking normally.
+   *
+   * 'no-blobs' — not a single own-team icon was found on the minimap. In a
+   * real game four allies are always drawn there, so this cannot mean we
+   * moved; it means the capture failed or something covered the minimap (the
+   * shop, the scoreboard, a full-screen death cam). The last position is
+   * still very likely correct.
+   *
+   * 'no-match' — icons were present and none of them matched us. That IS a
+   * movement signal: a recall is the case that matters, an instant teleport
+   * the tracker cannot follow.
+   */
+  getHoldReason(): HoldReason {
+    return this.holdStartMs > 0 ? this.holdReason : null;
+  }
+
   /** Get the minimap bounds in screen coordinates */
   getDetectedMinimapScreenBounds(): { screenX: number; screenY: number; screenWidth: number; screenHeight: number } | null {
     if (!this.minimapRegion) return null;
@@ -169,38 +279,45 @@ export class TrackingService {
     };
   }
 
+  /** The game window's client rect that all capture geometry derives from. */
+  getGameRect(): ScreenRect { return this.gameRect; }
+
   /**
-   * Set the minimap region from League's MinimapScale config value (0.0 - 3.0).
-   * Calibrated from real measurements:
-   *   1080p: scale 0 → 200px, scale 3 → 420px
-   *   1440p: scale 0 → 280px, scale 3 → 560px
-   * Formula: minimapSize = (h*2/9 - 40) + scale * (h/18 + 40/3)
+   * Why the current minimap region was refused, in words short enough for the
+   * overlay panel — or null when there is nothing to say.
+   */
+  getGeometryRefusal(): string | null { return this.geometryRefusal; }
+
+  /**
+   * Set the minimap region from League's MinimapScale config value.
+   * The size formula and its calibration live in core/map-calibration.ts.
    */
   setMinimapScaleFromConfig(scale: number): void {
     this.configMinimapScale = scale;
 
-    const h = this.screenHeight;
-    const base = h * 2 / 9 - 40;          // size at scale 0
-    const rate = h / 18 + 40 / 3;         // additional size per scale unit
-    const minimapSize = Math.round(base + scale * rate);
+    const region = getMinimapRegionForRect(this.gameRect, scale, this.captureBounds);
 
-    // The minimap is anchored to the bottom-right of the screen.
-    const screenMinimapX = this.screenWidth - minimapSize;
-    const screenMinimapY = this.screenHeight - minimapSize;
-    const region = {
-      x: screenMinimapX - this.captureBounds.x,
-      y: screenMinimapY - this.captureBounds.y,
-      width: minimapSize,
-      height: minimapSize,
-    };
-
-    this.minimapRegion = region;
-    this.expectedIconDiam = Math.round(minimapSize * 0.087);
-    console.log('[Tracking] Minimap from config: scale=' + scale +
-      ' size=' + minimapSize + 'px' +
-      ' screenPos=(' + screenMinimapX + ',' + screenMinimapY + ')' +
-      ' region=' + JSON.stringify(region) +
-      ' iconDiam=' + this.expectedIconDiam);
+    if (!minimapRegionFitsCapture(region, this.captureBounds)) {
+      // Scanning a region we can only see part of would index the frame out of
+      // bounds in createMask, which wraps into the previous scanline rather
+      // than failing. Refuse instead.
+      console.error('[Tracking] MinimapScale ' + scale + ' needs a ' + region.width +
+        'px minimap but the capture square is only ' + this.captureBounds.width + 'px' +
+        ' (gameRect=' + JSON.stringify(this.gameRect) + ') — tracking cannot run');
+      this.geometryRefusal = WARN_MINIMAP_TOO_LARGE;
+      this.minimapRegion = null;
+      this.expectedIconDiam = 0;
+    } else {
+      this.geometryRefusal = null;
+      this.minimapRegion = region;
+      this.expectedIconDiam = Math.round(region.width * 0.087);
+      console.log('[Tracking] Minimap from config: scale=' + scale +
+        ' size=' + region.width + 'px' +
+        ' screenPos=(' + (this.captureBounds.x + region.x) + ',' + (this.captureBounds.y + region.y) + ')' +
+        ' gameRect=' + JSON.stringify(this.gameRect) +
+        ' region=' + JSON.stringify(region) +
+        ' iconDiam=' + this.expectedIconDiam);
+    }
 
     this.state = TrackingState.SCANNING;
     this.lastPixelPos = null;
@@ -208,15 +325,38 @@ export class TrackingService {
     this.scanFrameCount = 0;
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
+    this.holdReason = null;
+    this.resetOcclusion();
+    this.fullIconPixels = 0;
   }
 
+  /**
+   * Manual calibration. `region` is CAPTURE-RELATIVE (the orchestrator subtracts
+   * `captureBounds` before calling), so it is only valid while captureBounds
+   * stays put — which it does today, being fixed at construction. Anything that
+   * later re-anchors captureBounds mid-session must clear `userMinimapRegion`
+   * too, or the stored region will point at the wrong pixels.
+   */
   setMinimapRegion(region: { x: number; y: number; width: number; height: number } | null): void {
-    this.userMinimapRegion = region;
-    if (region) {
+    // A hand-drawn region gets the same fit check as a config-derived one: the
+    // out-of-bounds indexing in createMask does not care which produced it.
+    if (region && !minimapRegionFitsCapture(region, this.captureBounds)) {
+      console.error('[Tracking] Calibrated region ' + JSON.stringify(region) +
+        ' does not fit the ' + this.captureBounds.width + 'px capture square' +
+        ' (gameRect=' + JSON.stringify(this.gameRect) + ') — tracking cannot run');
+      this.geometryRefusal = WARN_CALIBRATION_OUTSIDE_CAPTURE;
+      this.userMinimapRegion = null;
+      this.minimapRegion = null;
+      this.expectedIconDiam = 0;
+    } else if (region) {
+      this.geometryRefusal = null;
+      this.userMinimapRegion = region;
       this.minimapRegion = region;
       this.expectedIconDiam = Math.round(region.width * 0.087);
       console.log('[Tracking] Minimap set by calibration:', JSON.stringify(region), 'iconDiam:', this.expectedIconDiam);
     } else {
+      this.geometryRefusal = null;
+      this.userMinimapRegion = null;
       this.minimapRegion = null;
     }
     this.state = TrackingState.SCANNING;
@@ -225,56 +365,18 @@ export class TrackingService {
     this.scanFrameCount = 0;
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
+    this.holdReason = null;
+    this.resetOcclusion();
+    this.fullIconPixels = 0;
   }
 
   loadChampionTemplate(_championName: string): void {
     console.log('[Tracking] Using color filter + blob detection');
   }
 
-  setClassifier(classifier: ChampionClassifier): void {
+  setClassifier(classifier: BlobScorer): void {
     this.classifier = classifier;
     console.log('[Tracking] Champion classifier set');
-  }
-
-  /**
-   * Update known peer positions (from signaling broadcasts).
-   * Converts game-unit positions to region-relative minimap pixel coordinates.
-   * These are used as a soft penalty: blobs near a known peer are less likely to be "self".
-   */
-  setPeerGamePositions(positions: Position[]): void {
-    if (!this.minimapRegion) {
-      this.peerPixelPositions = [];
-      return;
-    }
-    const dims = MAP_DIMENSIONS[this.mapType];
-    const region = this.minimapRegion;
-    this.peerPixelPositions = positions
-      .filter(p => p.x > 0 && p.y > 0)
-      .map(p => ({
-        x: (p.x / dims.width) * region.width,
-        y: ((dims.height - p.y) / dims.height) * region.height,
-      }));
-  }
-
-  /**
-   * Score how close a blob is to any known peer position.
-   * Returns 0.0 if right on top of a peer, 1.0 if far from all peers.
-   * Used as a soft factor in blob scoring — NOT a hard exclusion.
-   */
-  private peerAvoidanceScore(blob: Blob): number {
-    if (this.peerPixelPositions.length === 0) return 1.0;
-    const threshold = this.expectedIconDiam * 1.5; // within 1.5 icon diameters
-    const thresholdSq = threshold * threshold;
-    let minDistSq = Infinity;
-    for (const pp of this.peerPixelPositions) {
-      const dx = blob.cx - pp.x;
-      const dy = blob.cy - pp.y;
-      const distSq = dx * dx + dy * dy;
-      if (distSq < minDistSq) minDistSq = distSq;
-    }
-    if (minDistSq >= thresholdSq) return 1.0;
-    // Linear falloff: 0 at distance 0, 1 at threshold
-    return Math.sqrt(minDistSq) / threshold;
   }
 
   /**
@@ -284,7 +386,7 @@ export class TrackingService {
    */
   private async updateClassifierScores(
     tealBlobs: Blob[],
-    imageData: ImageData,
+    frame: CaptureFrame,
     region: { x: number; y: number; width: number; height: number },
   ): Promise<void> {
     if (!this.classifier || !this.classifier.isLoaded()) return;
@@ -297,7 +399,7 @@ export class TrackingService {
     }));
 
     try {
-      const rawScores = await this.classifier.scoreBlobsForLocalChampion(imageData, crops);
+      const rawScores = await this.classifier.scoreBlobsForLocalChampion(frame, crops);
 
       // Normalize scores across blobs: the model may have low absolute confidence
       // but still correctly RANK blobs. Normalizing makes relative differences useful.
@@ -390,18 +492,23 @@ export class TrackingService {
     return bestScore;
   }
 
+  /** Current scan rate in FPS, so callers can skip a no-op restart. */
+  getScanFps(): number { return this.scanFps; }
+
   start(onPositionUpdate: (pos: Position) => void, fps: number = 30): void {
     this.onPositionUpdate = onPositionUpdate;
+    this.scanFps = fps;
     const intervalMs = Math.max(1, Math.round(1000 / fps));
     const now = performance.now();
     this.lastTickMs = now;
     this.scanStartMs = now;
     this.holdStartMs = 0;
+    this.holdReason = null;
     this.lastDebugImageMs = 0;
     this.lastClassifierRunMs = 0;
     this.lastClassifierLogMs = 0;
     this.tickRunning = false;
-    this.intervalId = window.setInterval(() => this.tick(), intervalMs);
+    this.intervalId = setInterval(() => { void this.tick(); }, intervalMs);
   }
 
   stop(): void {
@@ -415,6 +522,16 @@ export class TrackingService {
     if (this.state === TrackingState.DEAD) return;
     this.deathPosition = this.lastPosition;
     this.state = TrackingState.DEAD;
+    // Died while covered (common: melee fights are where icons overlap). The
+    // episode would otherwise freeze here — nothing is re-evaluated while DEAD
+    // — and keep our position owned at the killer's feet until respawn. Hand
+    // the time back to an ordinary hold from when our icon vanished, which is
+    // exactly what happens to a death that was not covered.
+    if (this.occluded) {
+      this.holdStartMs = this.occludedSinceMs;
+      this.holdReason = 'no-match';
+      this.occluded = false;
+    }
   }
 
   onRespawn(): void {
@@ -426,6 +543,8 @@ export class TrackingService {
     this.scanFrameCount = 0;
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
+    this.holdReason = null;
+    this.resetOcclusion();
   }
 
   // --- Color classification ---
@@ -441,8 +560,8 @@ export class TrackingService {
 
   // --- Binary mask creation from minimap region ---
 
-  private createMask(imageData: ImageData, region: { x: number; y: number; width: number; height: number }): Uint8Array {
-    const { data, width } = imageData;
+  private createMask(frame: CaptureFrame, region: { x: number; y: number; width: number; height: number }): Uint8Array {
+    const { data, width } = frame;
     const w = region.width;
     const h = region.height;
     const mask = new Uint8Array(w * h);
@@ -562,6 +681,16 @@ export class TrackingService {
 
   // Cached viewport mask (white pixels that are part of long straight runs)
   private viewportMask: Uint8Array | null = null;
+  // Centre of the camera viewport rectangle in game coords (#36), refreshed
+  // every tick while enabled. null when no plausible rectangle was found this
+  // frame, or when camera tracking is off.
+  private cameraTrackingEnabled = false;
+  private cameraPosition: Position | null = null;
+  // Why the last frame produced no camera centre, for the panel/log. A bare
+  // "not readable" cannot distinguish a white-threshold problem from a
+  // shape-plausibility one, and those need opposite fixes.
+  private cameraMiss: ViewportMiss | null = null;
+  private cameraMarkedPixels = 0;
 
   /**
    * Build a mask of white pixels, marking those that belong to the camera viewport
@@ -569,10 +698,10 @@ export class TrackingService {
    * Viewport edges are long straight lines (15+ pixels); the movement path line is short/diagonal.
    */
   private buildWhiteMasks(
-    imageData: ImageData,
+    frame: CaptureFrame,
     region: { x: number; y: number; width: number; height: number },
   ): { whiteMask: Uint8Array; viewportMask: Uint8Array } {
-    const { data, width: imgW } = imageData;
+    const { data, width: imgW } = frame;
     const w = region.width;
     const h = region.height;
     const whiteMask = new Uint8Array(w * h);
@@ -688,7 +817,7 @@ export class TrackingService {
 
   private generateFilteredImage(
     mask: Uint8Array, w: number, h: number, blobs: Blob[],
-    imageData?: ImageData, region?: { x: number; y: number; width: number; height: number },
+    frame?: CaptureFrame, region?: { x: number; y: number; width: number; height: number },
   ): string {
     if (!this.debugCanvas || this.debugCanvas.width !== w || this.debugCanvas.height !== h) {
       this.debugCanvas = document.createElement('canvas');
@@ -707,12 +836,12 @@ export class TrackingService {
         img.data[pi] = 0; img.data[pi + 1] = 220; img.data[pi + 2] = 180; img.data[pi + 3] = 200;
       } else if (mask[i] === 2) {
         img.data[pi] = 255; img.data[pi + 1] = 50; img.data[pi + 2] = 50; img.data[pi + 3] = 200;
-      } else if (imageData && region) {
+      } else if (frame && region) {
         // Show non-viewport white pixels as yellow (movement path line)
-        const srcIdx = ((region.y + Math.floor(i / w)) * imageData.width + (region.x + (i % w))) * 4;
-        const r = imageData.data[srcIdx];
-        const g = imageData.data[srcIdx + 1];
-        const b = imageData.data[srcIdx + 2];
+        const srcIdx = ((region.y + Math.floor(i / w)) * frame.width + (region.x + (i % w))) * 4;
+        const r = frame.data[srcIdx];
+        const g = frame.data[srcIdx + 1];
+        const b = frame.data[srcIdx + 2];
         if (r > 200 && g > 200 && b > 200 && this.viewportMask && this.viewportMask[i] === 0) {
           img.data[pi] = 255; img.data[pi + 1] = 255; img.data[pi + 2] = 0; img.data[pi + 3] = 220;
         }
@@ -751,8 +880,16 @@ export class TrackingService {
 
   // --- Main tick ---
 
-  private tick(): void {
+  /**
+   * One scan frame. Public, and returns its promise, so a caller can step the
+   * pipeline deterministically a frame at a time (tests/cv); in the app the
+   * interval installed by start() is the only caller and ignores the promise.
+   */
+  async tick(): Promise<void> {
     if (this.state === TrackingState.DEAD) {
+      // Ahead of the tick guard and the dt bookkeeping on purpose: there is
+      // nothing on screen to track, so a dead champion should cost no capture —
+      // and the overlay still needs a position every tick while you wait.
       if (this.deathPosition && this.onPositionUpdate) {
         this.onPositionUpdate(this.deathPosition);
       }
@@ -768,80 +905,134 @@ export class TrackingService {
     this.lastDtSec = (tickNow - this.lastTickMs) / 1000;
     this.lastTickMs = tickNow;
 
-    invoke<{ data_url: string; width: number; height: number }>('capture_minimap')
-      .then((result) => {
-        const img = new Image();
-        img.onload = () => {
-          try {
-            this.ctx.drawImage(img, 0, 0);
-            const imageData = this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
+    try {
+      const buffer = await this.frameSource.capture();
+      try {
+        this.processFrame(buffer);
+      } catch (err) {
+        // Kept separate from the capture failure below: "the backend couldn't
+        // grab the screen" and "the frame it grabbed isn't one we can use"
+        // have nothing in common except the symptom.
+        this.logCaptureError('[Tracking] frame decode failed:', err);
+      }
+    } catch (err) {
+      this.logCaptureError('[Tracking] capture_minimap failed:', err);
+    } finally {
+      this.tickRunning = false;
+    }
+  }
 
-            // Minimap region is set from game.cfg config (or manual calibration).
-            // No CV-based auto-detection needed.
-            if (!this.minimapRegion && this.userMinimapRegion) {
-              this.minimapRegion = this.userMinimapRegion;
-              this.expectedIconDiam = Math.round(this.minimapRegion.width * 0.087);
-            }
+  /**
+   * The tick runs at up to 60 Hz and core/logging.ts turns every console.error
+   * into a flushed file write, so a persistent failure (bounds off-screen, game
+   * gone, a frame we can't use) must not be logged per frame.
+   */
+  private logCaptureError(label: string, err: unknown): void {
+    const msg = label + ' ' + String(err);
+    const now = performance.now();
+    if (msg === this.lastCaptureError && now - this.lastCaptureErrorMs < 5000) return;
+    this.lastCaptureError = msg;
+    this.lastCaptureErrorMs = now;
+    console.error(label, err);
+  }
 
-            if (!this.minimapRegion) return;
+  /** Debug toggle lives on `window` — see core/window-globals.ts. */
+  private debugOn(): boolean {
+    return typeof window !== 'undefined' && window.__lolproxchat_debug_enabled === true;
+  }
 
-            // Create filtered mask and find blobs
-            const region = this.minimapRegion;
-            let mask = this.createMask(imageData, region);
-            mask = this.dilate(mask, region.width, region.height);
-            const allBlobs = this.findBlobs(mask, region.width, region.height);
-            const iconBlobs = this.filterIconBlobs(allBlobs);
+  private processFrame(buffer: ArrayBuffer): void {
+    const frame = decodeCaptureFrame(buffer);
 
-            // Regenerate the debug-mode filtered image at 5Hz (scan-rate independent).
-            // This is what makes the debug overlay feel "live" without paying the
-            // canvas-encode cost on every tick.
-            const nowMs = performance.now();
-            if (nowMs - this.lastDebugImageMs >= 200) {
-              this.lastDebugImageMs = nowMs;
-              this.filteredImageUrl = this.generateFilteredImage(mask, region.width, region.height, iconBlobs, imageData, region);
-            }
+    // Every CV read is indexed against captureBounds, not against the frame, so
+    // a frame of a different size would shear createMask's row stride: reads
+    // run off the end of each row, the mask comes back all zeros, and tracking
+    // sits in SCANNING with nothing to show for it. Refuse it instead, and
+    // re-push the bounds once per distinct bad size — that is the only recovery
+    // available from here, and doing it unconditionally would be a 30 Hz IPC loop.
+    if (frame.width !== this.captureBounds.width || frame.height !== this.captureBounds.height) {
+      const size = frame.width + 'x' + frame.height;
+      if (this.lastFrameSizeResync !== size) {
+        this.lastFrameSizeResync = size;
+        this.initCaptureBounds().catch((err) => {
+          this.logCaptureError('[Tracking] capture bounds resync failed:', err);
+        });
+      }
+      throw new Error('capture frame is ' + size + ' but capture bounds are ' +
+        this.captureBounds.width + 'x' + this.captureBounds.height);
+    }
+    this.lastFrameSizeResync = '';
 
-            this.diagCounter++;
+    // Minimap region is set from game.cfg config (or manual calibration).
+    // No CV-based auto-detection needed.
+    if (!this.minimapRegion && this.userMinimapRegion) {
+      this.minimapRegion = this.userMinimapRegion;
+      this.expectedIconDiam = Math.round(this.minimapRegion.width * 0.087);
+    }
 
-            // Build white pixel masks (separating movement path from viewport rectangle)
-            const { whiteMask, viewportMask } = this.buildWhiteMasks(imageData, region);
+    if (!this.minimapRegion) return;
 
-            // Run classifier at most every 500ms (scan-rate independent)
-            const tealBlobs = iconBlobs.filter(b => b.color === 'teal');
-            if (
-              this.classifier &&
-              tealBlobs.length > 0 &&
-              !this.classifierRunning &&
-              nowMs - this.lastClassifierRunMs >= 500
-            ) {
-              this.classifierRunning = true;
-              this.lastClassifierRunMs = nowMs;
-              this.updateClassifierScores(tealBlobs, imageData, region).finally(() => {
-                this.classifierRunning = false;
-              });
-            }
+    // Create filtered mask and find blobs
+    const region = this.minimapRegion;
+    let mask = this.createMask(frame, region);
+    mask = this.dilate(mask, region.width, region.height);
+    const allBlobs = this.findBlobs(mask, region.width, region.height);
+    const iconBlobs = this.filterIconBlobs(allBlobs);
+    this.occluderBlobs = allBlobs.filter(b => isPossibleOccluder(b, this.expectedIconDiam));
 
-            if (this.state === TrackingState.SCANNING) {
-              this.handleScanning(iconBlobs, whiteMask, viewportMask, region);
-            } else if (this.state === TrackingState.LOCKED) {
-              this.handleLocked(iconBlobs, whiteMask, viewportMask, region);
-            }
-          } finally {
-            this.tickRunning = false;
-          }
-        };
-        img.onerror = () => { this.tickRunning = false; };
-        img.src = result.data_url;
-      })
-      .catch((err) => {
-        console.error('[Tracking] capture_minimap failed:', err);
-        this.tickRunning = false;
+    // Regenerate the debug-mode filtered image at 5Hz (scan-rate independent).
+    // This is what makes the debug overlay feel "live" without paying the
+    // canvas-encode cost on every tick.
+    //
+    // Only while Debug is on: generateFilteredImage ends in a PNG encode, and
+    // the orchestrator re-serialises whatever it produced over the Tauri event
+    // bus at the scan rate, where overlay.ts drops it unless Debug is on.
+    const nowMs = performance.now();
+    if (this.debugOn()) {
+      if (nowMs - this.lastDebugImageMs >= 200) {
+        this.lastDebugImageMs = nowMs;
+        this.filteredImageUrl = this.generateFilteredImage(mask, region.width, region.height, iconBlobs, frame, region);
+      }
+    } else if (this.filteredImageUrl !== null) {
+      this.filteredImageUrl = null;
+    }
+
+    this.diagCounter++;
+
+    // Build white pixel masks (separating movement path from viewport rectangle)
+    const { whiteMask, viewportMask } = this.buildWhiteMasks(frame, region);
+
+    // Camera viewport centre → game coords, for "voice on camera" (#36).
+    // Cheap (two counting passes over a mask we already built) and
+    // independent of lock state, so it keeps working while the tracker
+    // is SCANNING.
+    this.updateCameraPosition(viewportMask, region);
+
+    // Run classifier at most every 500ms (scan-rate independent)
+    const tealBlobs = iconBlobs.filter(b => b.color === 'teal');
+    if (
+      this.classifier &&
+      tealBlobs.length > 0 &&
+      !this.classifierRunning &&
+      nowMs - this.lastClassifierRunMs >= 500
+    ) {
+      this.classifierRunning = true;
+      this.lastClassifierRunMs = nowMs;
+      this.updateClassifierScores(tealBlobs, frame, region).finally(() => {
+        this.classifierRunning = false;
       });
+    }
+
+    if (this.state === TrackingState.SCANNING) {
+      this.handleScanning(iconBlobs, whiteMask, viewportMask, region);
+    } else if (this.state === TrackingState.LOCKED) {
+      this.handleLocked(iconBlobs, whiteMask, viewportMask, region);
+    }
   }
 
   /**
    * Scan: initial identification of the local player's teal blob.
-   * Uses a unified composite score (classifier, peer avoidance, movement path, ring quality).
+   * Uses a unified composite score (classifier, movement path, ring quality).
    * Only used once at game start (or after respawn). Once locked, we never return to SCANNING —
    * instead we hold position and re-acquire via classifier.
    */
@@ -871,20 +1062,44 @@ export class TrackingService {
 
     let bestBlob = tealBlobs[0];
     let bestScore = -Infinity;
+    // Per-term breakdown of the winner, for the lock-on log. Issue #13 is
+    // diagnosed from user logs, and a composite alone cannot tell us whether
+    // the classifier or the white-pixel heuristic chose the blob.
+    let bestTerms = '';
 
-    for (const b of tealBlobs) {
-      const peerScore = this.peerAvoidanceScore(b);
+    // The classifier only earns its 0.45 weight if it actually discriminated
+    // this frame. updateClassifierScores() zeroes every blob when no raw score
+    // clears MIN_RAW_THRESHOLD, and the model genuinely returns ~0 for some
+    // champions at some minimap scales (NotOtakuu's Twisted Fate log). Scoring
+    // against an all-zero classifier just scales every candidate down by the
+    // same 0.45 while distorting the weights of the signals that DO have
+    // something to say, so fall back to the no-classifier weighting instead.
+    const clsScores = tealBlobs.map(b => this.getClassifierScore(b));
+    const classifierUsable = hasClassifier && clsScores.some(s => s > 0);
+
+    for (let i = 0; i < tealBlobs.length; i++) {
+      const b = tealBlobs[i];
       const whiteScore = this.whitePixelScore(b, whiteMask, viewportMask, region.width, region.height);
-      const clsScore = this.getClassifierScore(b);
+      const clsScore = clsScores[i];
       const ringScore = Math.min(1, b.pixels * (1 - b.fillRatio) / 200);
 
-      const score = hasClassifier
-        ? clsScore * 0.45 + whiteScore * 0.25 + peerScore * 0.20 + ringScore * 0.10
-        : peerScore * 0.40 + whiteScore * 0.35 + ringScore * 0.25;
+      // The divisions renormalize away a peer-avoidance term that held 0.20
+      // (resp. 0.40) here and scored a constant 1.0 for every candidate, since
+      // no peer coordinates have reached a client since the v0.2 server-side-
+      // positions refactor — see computeBlobScore and docs/threat-model.md,
+      // "Why clients are not told ally positions". Dividing rather than
+      // pre-computing the decimals keeps the surviving weights in exactly the
+      // ratios this scoring has always used.
+      const score = classifierUsable
+        ? (clsScore * 0.45 + whiteScore * 0.25 + ringScore * 0.10) / 0.80
+        : (whiteScore * 0.35 + ringScore * 0.25) / 0.60;
 
       if (score > bestScore) {
         bestScore = score;
         bestBlob = b;
+        bestTerms = 'cls=' + clsScore.toFixed(2) +
+          ' white=' + whiteScore.toFixed(2) +
+          ' ring=' + ringScore.toFixed(2);
       }
     }
 
@@ -895,7 +1110,7 @@ export class TrackingService {
     // position. The classifier still contributes to the composite score above;
     // it's just no longer a veto. The whole classifier-confidence path is being
     // replaced by template matching in v0.4 (docs/plans/2026-06-03-cv-tracking-research.md).
-    this.lockOnBlob(bestBlob, 'composite(score=' + bestScore.toFixed(2) + ')');
+    this.lockOnBlob(bestBlob, 'composite(score=' + bestScore.toFixed(2) + ' ' + bestTerms + ')');
   }
 
   /** Lock onto a teal blob as the local player */
@@ -912,6 +1127,8 @@ export class TrackingService {
     this.scanFrameCount = 0;
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
+    this.holdReason = null;
+    this.resetOcclusion();
     // Treat the moment of lock as a "movement" so Phase 2 doesn't start in
     // stationary-stickiness mode before we've seen any real movement.
     this.lastMovementMs = performance.now();
@@ -954,20 +1171,29 @@ export class TrackingService {
         'ms — forcing re-acquisition (back to SCANNING)');
       this.state = TrackingState.SCANNING;
       this.holdStartMs = 0;
+      this.holdReason = null;
+      this.resetOcclusion();
       this.scanFrameCount = 0;
       this.scanStartMs = performance.now();
       return;
     }
 
     const tealBlobs = iconBlobs.filter(b => b.color === 'teal');
+    const redBlobs = this.occluderBlobs;
     const hasClassifier = !!(this.classifier && this.classifier.isLoaded());
+    const lastRegion = {
+      x: this.lastPixelPos.x - this.minimapRegion.x,
+      y: this.lastPixelPos.y - this.minimapRegion.y,
+    };
 
-    // No teal blobs at all — extrapolate position using decaying velocity
+    // No teal blobs at all — extrapolate position using decaying velocity,
+    // unless an enemy icon sitting on us explains why ours is not visible.
     if (tealBlobs.length === 0) {
+      if (this.occlusionStep(redBlobs, lastRegion)) return;
       if (this.lockedTickCount === 0) {
-        console.log('[Tracking] Extrapolating position (no teal blobs)');
+        console.log('[Tracking] Extrapolating position (no teal blobs) ' + this.describeLoss(tealBlobs, redBlobs, lastRegion));
       }
-      this.extrapolatePosition(region);
+      this.extrapolatePosition(region, 'no-blobs');
       return;
     }
 
@@ -985,15 +1211,26 @@ export class TrackingService {
     const scoreFns: ScoreFns = {
       cls: (b) => this.getClassifierScore(b),
       white: (b) => this.whitePixelScore(b, whiteMask, viewportMask, region.width, region.height),
-      peer: (b) => this.peerAvoidanceScore(b),
     };
 
-    // Phase 1: nearest in-range blob with composite scoring
-    const phase1 = pickBestBlobInRange(tealBlobs, lastReg, predicted, maxJumpPx, hasClassifier, scoreFns);
+    // Phase 1: nearest in-range blob with composite scoring. Blobs inside the
+    // near-field radius are followed on continuity alone — the classifier only
+    // gates candidates further out (see computeNearFieldPx).
+    const phase1 = pickBestBlobInRange(
+      tealBlobs, lastReg, predicted, maxJumpPx, hasClassifier, scoreFns,
+      computeNearFieldPx(this.expectedIconDiam),
+    );
+
+    // Covered by an enemy icon: we have not gone anywhere, so do not go looking
+    // for ourselves across the map. Real logs showed Phase 2 doing exactly that
+    // mid-fight — a confident classifier hit on some other teal blob 3000-7000
+    // units away, which put us out of range of the enemy we were standing on.
+    if (!phase1 && this.occlusionStep(redBlobs, lastRegion)) return;
 
     // Phase 2: classifier-based long-range reacquire if Phase 1 found nothing
     if (!phase1 && hasClassifier) {
       if (this.holdStartMs === 0) this.holdStartMs = performance.now();
+      this.holdReason = 'no-match';
       const stationarySec = this.lastMovementMs > 0 ? (now - this.lastMovementMs) / 1000 : 0;
       const reacquireThreshold = computeReacquireThreshold(stationarySec, holdSec);
       const phase2 = pickClassifierReacquisition(tealBlobs, reacquireThreshold, scoreFns.cls);
@@ -1006,14 +1243,15 @@ export class TrackingService {
     // Phase 3: no blob matched at all — extrapolate
     if (!phase1) {
       if (this.lockedTickCount === 0) {
-        console.log('[Tracking] Extrapolating position (no match in range)');
+        console.log('[Tracking] Extrapolating position (no match in range) ' +
+          this.describeLoss(tealBlobs, redBlobs, lastReg, maxJumpPx));
         this.holdStartMs = performance.now();
       }
-      this.extrapolatePosition(region);
+      this.extrapolatePosition(region, 'no-match');
       return;
     }
 
-    this.finalizeLockedFrame(phase1.blob, lastReg, holdSec);
+    this.finalizeLockedFrame(phase1.blob, lastReg, holdSec, redBlobs);
   }
 
   /** Phase 2 success path: snap position, reset velocity, log, fire callback. */
@@ -1024,6 +1262,7 @@ export class TrackingService {
     this.lastPixelPos = { x: cx, y: cy };
     const newPos = this.pixelToGamePosition(cx, cy, this.minimapRegion);
     this.setLastPosition(newPos, 'classifier-reacquire');
+    this.resetOcclusion();
     this.velocityX = 0;
     this.velocityY = 0;
     this.lockedTickCount++;
@@ -1040,25 +1279,28 @@ export class TrackingService {
     blob: Blob,
     lastReg: { x: number; y: number },
     holdSec: number,
+    redBlobs: Blob[],
   ): void {
     if (!this.minimapRegion) return;
     if (this.lockedTickCount > 0) {
       console.log('[Tracking] Resumed tracking after hold (' + holdSec.toFixed(2) + 's)');
     }
 
-    const cx = this.minimapRegion.x + blob.cx;
-    const cy = this.minimapRegion.y + blob.cy;
+    const occluder = findOccluder(redBlobs, { x: blob.cx, y: blob.cy }, this.expectedIconDiam);
+    const centre = occluder ? this.coverCorrectedCentre(blob, occluder, redBlobs) : { x: blob.cx, y: blob.cy };
+    const cx = this.minimapRegion.x + centre.x;
+    const cy = this.minimapRegion.y + centre.y;
 
     // Velocity EMA — preserve per-frame-at-8-FPS behavior across scan rates.
     // weight_old = 0.5^(TUNED_FPS * dt); at 8 FPS dt=0.125 → weight_old = 0.5.
     const velWeightOld = Math.pow(0.5, TrackingService.TUNED_FPS * this.lastDtSec);
     const velWeightNew = 1 - velWeightOld;
-    this.velocityX = this.velocityX * velWeightOld + (blob.cx - lastReg.x) * velWeightNew;
-    this.velocityY = this.velocityY * velWeightOld + (blob.cy - lastReg.y) * velWeightNew;
+    this.velocityX = this.velocityX * velWeightOld + (centre.x - lastReg.x) * velWeightNew;
+    this.velocityY = this.velocityY * velWeightOld + (centre.y - lastReg.y) * velWeightNew;
 
     // Track real movement so Phase 2 can prefer stationary "stickiness".
-    const moveDx = blob.cx - lastReg.x;
-    const moveDy = blob.cy - lastReg.y;
+    const moveDx = centre.x - lastReg.x;
+    const moveDy = centre.y - lastReg.y;
     if (moveDx * moveDx + moveDy * moveDy > 9 /* 3px */) {
       this.lastMovementMs = performance.now();
     }
@@ -1067,6 +1309,10 @@ export class TrackingService {
     this.setLastPosition(this.pixelToGamePosition(cx, cy, this.minimapRegion), 'locked-track');
     this.lockedTickCount = 0;
     this.holdStartMs = 0;
+    this.holdReason = null;
+    this.endOcclusion();
+    // After endOcclusion, which clears the coverage flag this sets.
+    this.noteIconCoverage(blob, !!occluder);
 
     if (this.onPositionUpdate && this.lastPosition) {
       this.onPositionUpdate(this.lastPosition);
@@ -1074,13 +1320,225 @@ export class TrackingService {
   }
 
   /**
+   * Record how much of our icon is showing, on every frame we find it.
+   *
+   * A covered icon disappears gradually: as an enemy icon slides over it, the
+   * visible part of our ring shrinks for a few frames before the blob detector
+   * loses it. A recall or teleport removes a full-size icon in one frame. That
+   * difference is the evidence occlusionStep() needs; an enemy merely being
+   * near the spot where we vanished is not — it was what the first version of
+   * this used, and adversarial review showed it re-owning recalled positions.
+   */
+  private noteIconCoverage(blob: Blob, overlapping: boolean): void {
+    this.lastSeenPixels = blob.pixels;
+    // Learn our icon's usual size only from blobs that look like ONE whole
+    // icon. An ally's icon merged with ours doubles the count, and an inflated
+    // baseline makes any nearby enemy look like it is covering us — hence the
+    // size and 1.3x caps. An icon cut off by the minimap's edge (the fountain
+    // sits in a corner) is the opposite problem: learnt from, it drags the
+    // baseline down, the 1.3x cap then refuses every full-size frame after,
+    // and no real cover ever looks shrunk enough. So edge-touching blobs are
+    // not learnt from at all.
+    const bw = blob.maxX - blob.minX + 1;
+    const bh = blob.maxY - blob.minY + 1;
+    const region = this.minimapRegion;
+    const atEdge = !!region && (blob.minX <= 1 || blob.minY <= 1 ||
+      blob.maxX >= region.width - 2 || blob.maxY >= region.height - 2);
+    const singleIcon = !atEdge &&
+      bw <= this.expectedIconDiam * 1.2 && bh <= this.expectedIconDiam * 1.2 &&
+      (this.fullIconPixels === 0 || blob.pixels <= this.fullIconPixels * 1.3);
+    if (!overlapping && singleIcon) {
+      const ema = (v: number, x: number) => (v > 0 ? v * 0.9 + x * 0.1 : x);
+      this.fullIconPixels = ema(this.fullIconPixels, blob.pixels);
+      this.fullIconW = ema(this.fullIconW, bw);
+      this.fullIconH = ema(this.fullIconH, bh);
+    }
+    this.lastSeenPartlyCovered = overlapping && this.fullIconPixels > 0 &&
+      blob.pixels < this.fullIconPixels * COVERED_PIXEL_FRACTION;
+  }
+
+  /**
+   * What the tracker could see when it lost us, for the log. One line per
+   * hold, only at its start. Real logs said only "no match in range", which
+   * left a 6-second dropout in a v0.5.9 test game unexplained: nothing
+   * recorded whether our icon was covered, too far to accept, or gone.
+   */
+  private describeLoss(
+    tealBlobs: Blob[], redBlobs: Blob[], lastReg: { x: number; y: number }, maxJumpPx?: number,
+  ): string {
+    const near = (b: Blob) => Math.hypot(b.cx - lastReg.x, b.cy - lastReg.y);
+    const fmt = (b: Blob) => '(' + b.cx.toFixed(0) + ',' + b.cy.toFixed(0) + ' d=' + near(b).toFixed(0) +
+      ' ' + (b.maxX - b.minX + 1) + 'x' + (b.maxY - b.minY + 1) + ' px=' + b.pixels + ')';
+    const closest = (bs: Blob[]) => [...bs].sort((a, b) => near(a) - near(b)).slice(0, 3).map(fmt).join(' ') || 'none';
+    return '| last=(' + lastReg.x.toFixed(0) + ',' + lastReg.y.toFixed(0) + ')' +
+      (maxJumpPx !== undefined ? ' jump=' + maxJumpPx : '') +
+      ' iconDiam=' + this.expectedIconDiam +
+      ' lastSeen: px=' + (this.lastSeenPixels ?? '?') + '/' + this.fullIconPixels.toFixed(0) +
+      (this.lastSeenPartlyCovered ? ' partly-covered' : '') +
+      ' | teal: ' + closest(tealBlobs) + ' | red: ' + closest(redBlobs);
+  }
+
+  /**
+   * Where our icon's centre really is, when an enemy icon covers part of it.
+   *
+   * The blob is only the uncovered part of our ring, so its centroid sits on
+   * the side away from the enemy — measured on the real minimap at up to ~270
+   * game units. The other client makes the same error the other way, so a pair
+   * actually ~650 apart read as ~1200 and dropped to half volume just before
+   * their icons overlapped fully. The side facing away from the enemy is the
+   * part still showing, so per axis, if the blob has lost width (or height),
+   * measure one full icon in from that far edge instead. Capped at half an
+   * icon of correction.
+   *
+   * Left alone, per axis, whenever which side is covered is not clear —
+   * review showed the correction then doubling the error instead of removing
+   * it: the occluder point is within 2px of our centroid on that axis (the
+   * case for two merged enemy icons), another enemy icon within reach sits on
+   * the other side (it may be drawn UNDER ours, and the nearest red blob is
+   * not necessarily the one on top), or our icon touches the minimap border,
+   * which clips it for a reason that has nothing to do with cover.
+   *
+   * Limit: an enemy approaching diagonally eats the ring's corner first, and
+   * the bounding box only loses width or height late, so this corrects little
+   * of a diagonal approach — no worse than uncorrected, but not much better.
+   */
+  private coverCorrectedCentre(
+    blob: Blob, occluder: { x: number; y: number }, redBlobs: Blob[],
+  ): { x: number; y: number } {
+    const reach = this.expectedIconDiam * 1.6;
+    const nearby = redBlobs.filter(b => Math.hypot(b.cx - blob.cx, b.cy - blob.cy) <= reach);
+    const region = this.minimapRegion!;
+    const axis = (
+      lo: number, hi: number, c: number, full: number, towards: number,
+      others: number[], limit: number,
+    ): number => {
+      const size = hi - lo + 1;
+      if (full <= 0 || size >= full * 0.9) return c;
+      if (lo <= 1 || hi >= limit - 2) return c;
+      if (Math.abs(towards - c) < 2) return c;
+      const side = Math.sign(towards - c);
+      if (others.some(o => Math.sign(o - c) === -side && Math.abs(o - c) >= 2)) return c;
+      const fromFarEdge = side > 0 ? lo + (full - 1) / 2 : hi - (full - 1) / 2;
+      const maxShift = full / 2;
+      return Math.max(c - maxShift, Math.min(c + maxShift, fromFarEdge));
+    };
+    return {
+      x: axis(blob.minX, blob.maxX, blob.cx, this.fullIconW, occluder.x, nearby.map(b => b.cx), region.width),
+      y: axis(blob.minY, blob.maxY, blob.cy, this.fullIconH, occluder.y, nearby.map(b => b.cy), region.height),
+    };
+  }
+
+  /**
+   * Handle a frame where our icon was not found, if the reason is that an
+   * enemy icon is drawn over it. Returns true if it did.
+   *
+   * An episode STARTS only on the first frame our icon is missing, only if the
+   * last frame we saw it showed it partly covered (noteIconCoverage), and only
+   * once between sightings. Never partway through a hold: by then the hold may
+   * be a recall the orchestrator has already disowned.
+   *
+   * It CONTINUES while an enemy icon stays within one icon of the anchor —
+   * where the covering icon was at the start — tolerating OCCLUDER_GRACE_MS of
+   * frames with no enemy icon there (two red icons touching merge into one blob
+   * the detector rejects), up to MAX_OCCLUDED_MS for the whole episode.
+   */
+  private occlusionStep(redBlobs: Blob[], lastReg: { x: number; y: number }): boolean {
+    const now = performance.now();
+
+    if (!this.occluded) {
+      const firstLostFrame = this.holdStartMs === 0 && this.lockedTickCount === 0;
+      if (!firstLostFrame || this.occludedSinceMs > 0 || !this.lastSeenPartlyCovered) return false;
+      const occluder = findOccluder(redBlobs, lastReg, this.expectedIconDiam);
+      if (!occluder) return false;
+      this.occluded = true;
+      this.occludedSinceMs = now;
+      this.occluderLastSeenMs = now;
+      this.occlusionAnchor = occluder;
+      console.log('[Tracking] Own icon covered by an enemy icon — holding there until ours reappears');
+    } else {
+      if (now - this.occludedSinceMs > MAX_OCCLUDED_MS) {
+        return this.stopOccluded('the ' + (MAX_OCCLUDED_MS / 1000) + 's cap');
+      }
+      if (findOccluder(redBlobs, this.occlusionAnchor!, this.expectedIconDiam)) {
+        this.occluderLastSeenMs = now;
+      } else if (now - this.occluderLastSeenMs > OCCLUDER_GRACE_MS) {
+        return this.stopOccluded('no enemy icon left on the spot');
+      }
+    }
+    this.holdOccluded();
+    return true;
+  }
+
+  /** End an occlusion episode without our icon having come back. */
+  private stopOccluded(why: string): false {
+    this.occluded = false;
+    console.log('[Tracking] Stopped treating own icon as covered (' + why + ') — holding as lost');
+    return false;
+  }
+
+  /**
+   * Our icon is hidden under an enemy's: report the anchor as our position.
+   *
+   * Deliberately NOT a hold. A hold is the tracker admitting it does not know
+   * where we are, and the orchestrator disowns our position two seconds into
+   * one — which is right after a recall and exactly wrong here, where it cut
+   * the two players in a fight out of each other's audio every time their
+   * icons overlapped. Clearing holdStartMs keeps the disown clock, and the
+   * forced re-acquisition at FORCED_REACQUIRE_HOLD_MS, from running.
+   *
+   * The anchor does not move. Following the covering icon instead was tried
+   * and, when we had in fact recalled or teleported from under it, carried our
+   * reported position across the map with that enemy for the full cap.
+   */
+  private holdOccluded(): void {
+    if (!this.minimapRegion || !this.occlusionAnchor) return;
+    // Counts as a held frame for logging, so reappearing logs "Resumed".
+    this.lockedTickCount++;
+    this.holdStartMs = 0;
+    this.holdReason = null;
+    this.velocityX = 0;
+    this.velocityY = 0;
+
+    const cx = this.minimapRegion.x + this.occlusionAnchor.x;
+    const cy = this.minimapRegion.y + this.occlusionAnchor.y;
+    this.lastPixelPos = { x: cx, y: cy };
+    this.setLastPosition(this.pixelToGamePosition(cx, cy, this.minimapRegion), 'occluded');
+    if (this.onPositionUpdate && this.lastPosition) {
+      this.onPositionUpdate(this.lastPosition);
+    }
+  }
+
+  private endOcclusion(): void {
+    if (this.occluded) {
+      console.log('[Tracking] Own icon uncovered after ' +
+        ((performance.now() - this.occludedSinceMs) / 1000).toFixed(2) + 's');
+    }
+    this.resetOcclusion();
+  }
+
+  /** Forget any occlusion state — on a fresh lock, re-acquire, respawn or rescan. */
+  private resetOcclusion(): void {
+    this.occluded = false;
+    this.occludedSinceMs = 0;
+    this.occlusionAnchor = null;
+    this.lastSeenPartlyCovered = false;
+  }
+
+  /**
    * Extrapolate position using decaying velocity when tracking is lost.
    * Velocity fades out over ~1 second of wall-clock time, regardless of scan rate.
    * Position is clamped to minimap bounds to prevent drifting off-map.
    */
-  private extrapolatePosition(region: { x: number; y: number; width: number; height: number }): void {
+  private extrapolatePosition(
+    region: { x: number; y: number; width: number; height: number },
+    reason: Exclude<HoldReason, null>,
+  ): void {
     this.lockedTickCount++;
     if (this.holdStartMs === 0) this.holdStartMs = performance.now();
+    // 'no-match' is the stronger signal and wins for the rest of the hold: if
+    // icons came back and still none of them was us, we moved, whatever the
+    // first frame of the hold looked like.
+    if (reason === 'no-match' || this.holdReason === null) this.holdReason = reason;
 
     // Cap velocity to a physically-plausible magnitude before applying. The
     // velocity-EMA in handleLocked can latch onto huge values when the tracked

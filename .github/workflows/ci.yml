@@ -26,6 +26,11 @@ jobs:
       - run: npm ci
       - name: Type-check
         run: npx tsc --noEmit
+      - name: Type-check tests
+        # tsconfig.json covers only src/, so until this step existed not one
+        # test file was ever type-checked. tsconfig.test.json widens rootDir to
+        # the repo root, which is what stops TS6059 firing per test file.
+        run: npx tsc -p tsconfig.test.json --noEmit
       - name: Build
         run: npm run build:prod
       - name: Test
@@ -49,3 +54,88 @@ jobs:
         run: npm run build
       - name: Test
         run: npm test
+
+  # Two Orchestrator-level clients against the real built server. Separate from
+  # the two jobs above, and non-blocking, so a slow or flaky session test can
+  # never mask the fast signal — the lifecycle transitions it would otherwise be
+  # the only cover for are duplicated in the fast suite on purpose.
+  #
+  # That duplication now covers the anti-cheat invariant too. compliance.e2e.test.ts
+  # sweeps a live session for leaked coordinates, but a continue-on-error job
+  # cannot stop a leak from merging, and promoting a server-spawning polling
+  # suite to a required check would import its flakiness into the merge gate
+  # instead. The same invariant is asserted as exact wire key sets in the
+  # blocking `server` job — server/tests/rooms.test.ts (every frame the handler
+  # emits) and server/tests/volumes.test.ts (the /compute-volumes response).
+  #
+  # node 24, unlike the 20 the other jobs use, because the suite drives the real
+  # SignalingService over the WebSocket client that only became a stable global
+  # in node 22 — which is what lets it run with no new dependency in
+  # package.json at all.
+  #
+  # The cargo job below is windows-only by necessity: src-tauri depends on the
+  # `windows` crate unconditionally with no cfg gating anywhere in src-tauri/src,
+  # so it cannot build on ubuntu, and cross-checking from linux dies in `ring`'s
+  # build script for want of MSVC's lib.exe.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Install server dependencies
+        run: npm ci
+        working-directory: server
+      - name: Build server
+        # global-setup hard-fails on a dist older than src rather than testing
+        # stale code, so this step is a prerequisite, not a convenience.
+        run: npm run build
+        working-directory: server
+      - name: End-to-end session tests
+        run: npx jest --config jest.e2e.config.js
+
+  # Compiles and tests the Rust the other jobs cannot touch. Until this existed,
+  # every line under src-tauri/ shipped having been read but never compiled —
+  # and the crate holds the screen capture, the keyboard hook and the updater.
+  #
+  # `npm run build:prod` is a prerequisite rather than a convenience:
+  # tauri::generate_context!() resolves frontendDist ("../dist") at COMPILE time,
+  # so the macro fails outright without a built frontend.
+  rust:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - name: Build frontend
+        run: npm run build:prod
+      - name: Check
+        run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+      - name: Test
+        # key_decision.rs and the capture/geometry helpers carry #[cfg(test)]
+        # modules that no runner has ever executed.
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Build exe
+        # The only way to validate this app is to play a game with it, so every
+        # PR leaves behind something a tester can actually run. --no-bundle
+        # matches release.yml: the raw exe, no installer.
+        run: npx tauri build --no-bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lolproxchat-exe-${{ github.sha }}
+          path: src-tauri/target/release/lolproxchat.exe
+          if-no-files-found: error
+          retention-days: 14

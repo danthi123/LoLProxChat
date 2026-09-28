@@ -24,6 +24,13 @@ export class VolumeClient {
    *
    * `allyProximity` opts the caller into hearing teammates by distance (the same
    * falloff as enemies) instead of always-full volume (#22).
+   *
+   * There is deliberately no camera argument. "Voice on camera" (#36) used to
+   * send a `listenPosition` here, which let the request name a point to hear
+   * from without publishing it — so it worked against players who had never
+   * opted in. The camera now goes to room state over `coords` and the server
+   * reads ours from there, so it cannot be asserted per-request. See
+   * signaling.sendCoords.
    */
   async computeVolumes(
     myPosition: Position,
