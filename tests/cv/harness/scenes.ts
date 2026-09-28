@@ -16,6 +16,7 @@ import {
   minionCluster,
   movementPath,
   ring,
+  BACKGROUND,
   RED,
   TEAL,
 } from './frames';
@@ -52,6 +53,12 @@ export interface SceneSpec {
   minions?: Point[];
   turrets?: Point[];
   camera?: { x: number; y: number; w: number; h: number } | null;
+  /**
+   * Enemy icons drawn OVER the local champion's, opaque — the way League draws
+   * one icon on top of another when two champions stand together. Unlike
+   * `enemies`, these can cover part or all of the self icon.
+   */
+  enemiesOnTop?: Point[];
 }
 
 export interface RenderedScene {
@@ -80,6 +87,11 @@ export function renderScene(spec: SceneSpec): RenderedScene {
       movementPath(f, ox + spec.self.x, oy + spec.self.y, ICON_DIAM, spec.selfTrail.x, spec.selfTrail.y);
     }
     ring(f, ox + spec.self.x, oy + spec.self.y, ICON_DIAM, TEAL);
+  }
+  for (const p of spec.enemiesOnTop ?? []) {
+    // The portrait is opaque: blank out everything under the icon, then its border.
+    disc(f, ox + p.x, oy + p.y, ICON_DIAM / 2, BACKGROUND);
+    ring(f, ox + p.x, oy + p.y, ICON_DIAM, RED);
   }
 
   return { frame: encodeFrame(f), truth: spec.self ?? null };

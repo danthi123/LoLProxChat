@@ -26,6 +26,11 @@ import {
   ViewportMiss,
   HoldReason,
   FORCED_REACQUIRE_HOLD_MS,
+  findOccluder,
+  isPossibleOccluder,
+  MAX_OCCLUDED_MS,
+  COVERED_PIXEL_FRACTION,
+  OCCLUDER_GRACE_MS,
 } from './tracking-helpers';
 
 export enum TrackingState {
@@ -104,6 +109,28 @@ export class TrackingService {
   // none of them was us. The distinction matters to the orchestrator: see
   // getHoldReason().
   private holdReason: HoldReason = null;
+  // Occlusion (an enemy icon drawn over ours) — see occlusionStep().
+  // occludedSinceMs is when the current episode started, or 0 if there has been
+  // none since our icon was last found; an episode that ends without our icon
+  // coming back leaves it set, which stops a second one starting.
+  private occludedSinceMs = 0;
+  private occluded = false;
+  // Region px. Fixed for the whole episode: where the covering icon was when
+  // ours vanished. We report this, not wherever that enemy goes next.
+  private occlusionAnchor: { x: number; y: number } | null = null;
+  private occluderLastSeenMs = 0;
+  // Typical pixel count of our icon when nothing overlaps it (EMA), and whether
+  // the last frame we saw it on showed it overlapped AND shrunk — the signature
+  // of an icon being covered, as opposed to vanishing whole (recall, teleport).
+  private fullIconPixels = 0;
+  // Same, for the bounding box — what coverCorrectedCentre measures against.
+  private fullIconW = 0;
+  private fullIconH = 0;
+  private lastSeenPartlyCovered = false;
+  private lastSeenPixels: number | null = null;
+  // This frame's red blobs that could be enemy icons over ours — looser than
+  // the icon filter, see isPossibleOccluder.
+  private occluderBlobs: Blob[] = [];
   // When we successfully tracked a blob that moved >3px from last tick.
   // Used to make Phase 2 re-acquisition stricter when stationary, so we don't
   // teleport the tracking dot onto a minion wave / turret if the icon flickers.
@@ -299,6 +326,8 @@ export class TrackingService {
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
     this.holdReason = null;
+    this.resetOcclusion();
+    this.fullIconPixels = 0;
   }
 
   /**
@@ -337,6 +366,8 @@ export class TrackingService {
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
     this.holdReason = null;
+    this.resetOcclusion();
+    this.fullIconPixels = 0;
   }
 
   loadChampionTemplate(_championName: string): void {
@@ -491,6 +522,16 @@ export class TrackingService {
     if (this.state === TrackingState.DEAD) return;
     this.deathPosition = this.lastPosition;
     this.state = TrackingState.DEAD;
+    // Died while covered (common: melee fights are where icons overlap). The
+    // episode would otherwise freeze here — nothing is re-evaluated while DEAD
+    // — and keep our position owned at the killer's feet until respawn. Hand
+    // the time back to an ordinary hold from when our icon vanished, which is
+    // exactly what happens to a death that was not covered.
+    if (this.occluded) {
+      this.holdStartMs = this.occludedSinceMs;
+      this.holdReason = 'no-match';
+      this.occluded = false;
+    }
   }
 
   onRespawn(): void {
@@ -503,6 +544,7 @@ export class TrackingService {
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
     this.holdReason = null;
+    this.resetOcclusion();
   }
 
   // --- Color classification ---
@@ -936,6 +978,7 @@ export class TrackingService {
     mask = this.dilate(mask, region.width, region.height);
     const allBlobs = this.findBlobs(mask, region.width, region.height);
     const iconBlobs = this.filterIconBlobs(allBlobs);
+    this.occluderBlobs = allBlobs.filter(b => isPossibleOccluder(b, this.expectedIconDiam));
 
     // Regenerate the debug-mode filtered image at 5Hz (scan-rate independent).
     // This is what makes the debug overlay feel "live" without paying the
@@ -1085,6 +1128,7 @@ export class TrackingService {
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
     this.holdReason = null;
+    this.resetOcclusion();
     // Treat the moment of lock as a "movement" so Phase 2 doesn't start in
     // stationary-stickiness mode before we've seen any real movement.
     this.lastMovementMs = performance.now();
@@ -1127,19 +1171,27 @@ export class TrackingService {
         'ms — forcing re-acquisition (back to SCANNING)');
       this.state = TrackingState.SCANNING;
       this.holdStartMs = 0;
-    this.holdReason = null;
+      this.holdReason = null;
+      this.resetOcclusion();
       this.scanFrameCount = 0;
       this.scanStartMs = performance.now();
       return;
     }
 
     const tealBlobs = iconBlobs.filter(b => b.color === 'teal');
+    const redBlobs = this.occluderBlobs;
     const hasClassifier = !!(this.classifier && this.classifier.isLoaded());
+    const lastRegion = {
+      x: this.lastPixelPos.x - this.minimapRegion.x,
+      y: this.lastPixelPos.y - this.minimapRegion.y,
+    };
 
-    // No teal blobs at all — extrapolate position using decaying velocity
+    // No teal blobs at all — extrapolate position using decaying velocity,
+    // unless an enemy icon sitting on us explains why ours is not visible.
     if (tealBlobs.length === 0) {
+      if (this.occlusionStep(redBlobs, lastRegion)) return;
       if (this.lockedTickCount === 0) {
-        console.log('[Tracking] Extrapolating position (no teal blobs)');
+        console.log('[Tracking] Extrapolating position (no teal blobs) ' + this.describeLoss(tealBlobs, redBlobs, lastRegion));
       }
       this.extrapolatePosition(region, 'no-blobs');
       return;
@@ -1169,6 +1221,12 @@ export class TrackingService {
       computeNearFieldPx(this.expectedIconDiam),
     );
 
+    // Covered by an enemy icon: we have not gone anywhere, so do not go looking
+    // for ourselves across the map. Real logs showed Phase 2 doing exactly that
+    // mid-fight — a confident classifier hit on some other teal blob 3000-7000
+    // units away, which put us out of range of the enemy we were standing on.
+    if (!phase1 && this.occlusionStep(redBlobs, lastRegion)) return;
+
     // Phase 2: classifier-based long-range reacquire if Phase 1 found nothing
     if (!phase1 && hasClassifier) {
       if (this.holdStartMs === 0) this.holdStartMs = performance.now();
@@ -1185,14 +1243,15 @@ export class TrackingService {
     // Phase 3: no blob matched at all — extrapolate
     if (!phase1) {
       if (this.lockedTickCount === 0) {
-        console.log('[Tracking] Extrapolating position (no match in range)');
+        console.log('[Tracking] Extrapolating position (no match in range) ' +
+          this.describeLoss(tealBlobs, redBlobs, lastReg, maxJumpPx));
         this.holdStartMs = performance.now();
       }
       this.extrapolatePosition(region, 'no-match');
       return;
     }
 
-    this.finalizeLockedFrame(phase1.blob, lastReg, holdSec);
+    this.finalizeLockedFrame(phase1.blob, lastReg, holdSec, redBlobs);
   }
 
   /** Phase 2 success path: snap position, reset velocity, log, fire callback. */
@@ -1203,6 +1262,7 @@ export class TrackingService {
     this.lastPixelPos = { x: cx, y: cy };
     const newPos = this.pixelToGamePosition(cx, cy, this.minimapRegion);
     this.setLastPosition(newPos, 'classifier-reacquire');
+    this.resetOcclusion();
     this.velocityX = 0;
     this.velocityY = 0;
     this.lockedTickCount++;
@@ -1219,25 +1279,28 @@ export class TrackingService {
     blob: Blob,
     lastReg: { x: number; y: number },
     holdSec: number,
+    redBlobs: Blob[],
   ): void {
     if (!this.minimapRegion) return;
     if (this.lockedTickCount > 0) {
       console.log('[Tracking] Resumed tracking after hold (' + holdSec.toFixed(2) + 's)');
     }
 
-    const cx = this.minimapRegion.x + blob.cx;
-    const cy = this.minimapRegion.y + blob.cy;
+    const occluder = findOccluder(redBlobs, { x: blob.cx, y: blob.cy }, this.expectedIconDiam);
+    const centre = occluder ? this.coverCorrectedCentre(blob, occluder, redBlobs) : { x: blob.cx, y: blob.cy };
+    const cx = this.minimapRegion.x + centre.x;
+    const cy = this.minimapRegion.y + centre.y;
 
     // Velocity EMA — preserve per-frame-at-8-FPS behavior across scan rates.
     // weight_old = 0.5^(TUNED_FPS * dt); at 8 FPS dt=0.125 → weight_old = 0.5.
     const velWeightOld = Math.pow(0.5, TrackingService.TUNED_FPS * this.lastDtSec);
     const velWeightNew = 1 - velWeightOld;
-    this.velocityX = this.velocityX * velWeightOld + (blob.cx - lastReg.x) * velWeightNew;
-    this.velocityY = this.velocityY * velWeightOld + (blob.cy - lastReg.y) * velWeightNew;
+    this.velocityX = this.velocityX * velWeightOld + (centre.x - lastReg.x) * velWeightNew;
+    this.velocityY = this.velocityY * velWeightOld + (centre.y - lastReg.y) * velWeightNew;
 
     // Track real movement so Phase 2 can prefer stationary "stickiness".
-    const moveDx = blob.cx - lastReg.x;
-    const moveDy = blob.cy - lastReg.y;
+    const moveDx = centre.x - lastReg.x;
+    const moveDy = centre.y - lastReg.y;
     if (moveDx * moveDx + moveDy * moveDy > 9 /* 3px */) {
       this.lastMovementMs = performance.now();
     }
@@ -1247,10 +1310,218 @@ export class TrackingService {
     this.lockedTickCount = 0;
     this.holdStartMs = 0;
     this.holdReason = null;
+    this.endOcclusion();
+    // After endOcclusion, which clears the coverage flag this sets.
+    this.noteIconCoverage(blob, !!occluder);
 
     if (this.onPositionUpdate && this.lastPosition) {
       this.onPositionUpdate(this.lastPosition);
     }
+  }
+
+  /**
+   * Record how much of our icon is showing, on every frame we find it.
+   *
+   * A covered icon disappears gradually: as an enemy icon slides over it, the
+   * visible part of our ring shrinks for a few frames before the blob detector
+   * loses it. A recall or teleport removes a full-size icon in one frame. That
+   * difference is the evidence occlusionStep() needs; an enemy merely being
+   * near the spot where we vanished is not — it was what the first version of
+   * this used, and adversarial review showed it re-owning recalled positions.
+   */
+  private noteIconCoverage(blob: Blob, overlapping: boolean): void {
+    this.lastSeenPixels = blob.pixels;
+    // Learn our icon's usual size only from blobs that look like ONE whole
+    // icon. An ally's icon merged with ours doubles the count, and an inflated
+    // baseline makes any nearby enemy look like it is covering us — hence the
+    // size and 1.3x caps. An icon cut off by the minimap's edge (the fountain
+    // sits in a corner) is the opposite problem: learnt from, it drags the
+    // baseline down, the 1.3x cap then refuses every full-size frame after,
+    // and no real cover ever looks shrunk enough. So edge-touching blobs are
+    // not learnt from at all.
+    const bw = blob.maxX - blob.minX + 1;
+    const bh = blob.maxY - blob.minY + 1;
+    const region = this.minimapRegion;
+    const atEdge = !!region && (blob.minX <= 1 || blob.minY <= 1 ||
+      blob.maxX >= region.width - 2 || blob.maxY >= region.height - 2);
+    const singleIcon = !atEdge &&
+      bw <= this.expectedIconDiam * 1.2 && bh <= this.expectedIconDiam * 1.2 &&
+      (this.fullIconPixels === 0 || blob.pixels <= this.fullIconPixels * 1.3);
+    if (!overlapping && singleIcon) {
+      const ema = (v: number, x: number) => (v > 0 ? v * 0.9 + x * 0.1 : x);
+      this.fullIconPixels = ema(this.fullIconPixels, blob.pixels);
+      this.fullIconW = ema(this.fullIconW, bw);
+      this.fullIconH = ema(this.fullIconH, bh);
+    }
+    this.lastSeenPartlyCovered = overlapping && this.fullIconPixels > 0 &&
+      blob.pixels < this.fullIconPixels * COVERED_PIXEL_FRACTION;
+  }
+
+  /**
+   * What the tracker could see when it lost us, for the log. One line per
+   * hold, only at its start. Real logs said only "no match in range", which
+   * left a 6-second dropout in a v0.5.9 test game unexplained: nothing
+   * recorded whether our icon was covered, too far to accept, or gone.
+   */
+  private describeLoss(
+    tealBlobs: Blob[], redBlobs: Blob[], lastReg: { x: number; y: number }, maxJumpPx?: number,
+  ): string {
+    const near = (b: Blob) => Math.hypot(b.cx - lastReg.x, b.cy - lastReg.y);
+    const fmt = (b: Blob) => '(' + b.cx.toFixed(0) + ',' + b.cy.toFixed(0) + ' d=' + near(b).toFixed(0) +
+      ' ' + (b.maxX - b.minX + 1) + 'x' + (b.maxY - b.minY + 1) + ' px=' + b.pixels + ')';
+    const closest = (bs: Blob[]) => [...bs].sort((a, b) => near(a) - near(b)).slice(0, 3).map(fmt).join(' ') || 'none';
+    return '| last=(' + lastReg.x.toFixed(0) + ',' + lastReg.y.toFixed(0) + ')' +
+      (maxJumpPx !== undefined ? ' jump=' + maxJumpPx : '') +
+      ' iconDiam=' + this.expectedIconDiam +
+      ' lastSeen: px=' + (this.lastSeenPixels ?? '?') + '/' + this.fullIconPixels.toFixed(0) +
+      (this.lastSeenPartlyCovered ? ' partly-covered' : '') +
+      ' | teal: ' + closest(tealBlobs) + ' | red: ' + closest(redBlobs);
+  }
+
+  /**
+   * Where our icon's centre really is, when an enemy icon covers part of it.
+   *
+   * The blob is only the uncovered part of our ring, so its centroid sits on
+   * the side away from the enemy — measured on the real minimap at up to ~270
+   * game units. The other client makes the same error the other way, so a pair
+   * actually ~650 apart read as ~1200 and dropped to half volume just before
+   * their icons overlapped fully. The side facing away from the enemy is the
+   * part still showing, so per axis, if the blob has lost width (or height),
+   * measure one full icon in from that far edge instead. Capped at half an
+   * icon of correction.
+   *
+   * Left alone, per axis, whenever which side is covered is not clear —
+   * review showed the correction then doubling the error instead of removing
+   * it: the occluder point is within 2px of our centroid on that axis (the
+   * case for two merged enemy icons), another enemy icon within reach sits on
+   * the other side (it may be drawn UNDER ours, and the nearest red blob is
+   * not necessarily the one on top), or our icon touches the minimap border,
+   * which clips it for a reason that has nothing to do with cover.
+   *
+   * Limit: an enemy approaching diagonally eats the ring's corner first, and
+   * the bounding box only loses width or height late, so this corrects little
+   * of a diagonal approach — no worse than uncorrected, but not much better.
+   */
+  private coverCorrectedCentre(
+    blob: Blob, occluder: { x: number; y: number }, redBlobs: Blob[],
+  ): { x: number; y: number } {
+    const reach = this.expectedIconDiam * 1.6;
+    const nearby = redBlobs.filter(b => Math.hypot(b.cx - blob.cx, b.cy - blob.cy) <= reach);
+    const region = this.minimapRegion!;
+    const axis = (
+      lo: number, hi: number, c: number, full: number, towards: number,
+      others: number[], limit: number,
+    ): number => {
+      const size = hi - lo + 1;
+      if (full <= 0 || size >= full * 0.9) return c;
+      if (lo <= 1 || hi >= limit - 2) return c;
+      if (Math.abs(towards - c) < 2) return c;
+      const side = Math.sign(towards - c);
+      if (others.some(o => Math.sign(o - c) === -side && Math.abs(o - c) >= 2)) return c;
+      const fromFarEdge = side > 0 ? lo + (full - 1) / 2 : hi - (full - 1) / 2;
+      const maxShift = full / 2;
+      return Math.max(c - maxShift, Math.min(c + maxShift, fromFarEdge));
+    };
+    return {
+      x: axis(blob.minX, blob.maxX, blob.cx, this.fullIconW, occluder.x, nearby.map(b => b.cx), region.width),
+      y: axis(blob.minY, blob.maxY, blob.cy, this.fullIconH, occluder.y, nearby.map(b => b.cy), region.height),
+    };
+  }
+
+  /**
+   * Handle a frame where our icon was not found, if the reason is that an
+   * enemy icon is drawn over it. Returns true if it did.
+   *
+   * An episode STARTS only on the first frame our icon is missing, only if the
+   * last frame we saw it showed it partly covered (noteIconCoverage), and only
+   * once between sightings. Never partway through a hold: by then the hold may
+   * be a recall the orchestrator has already disowned.
+   *
+   * It CONTINUES while an enemy icon stays within one icon of the anchor —
+   * where the covering icon was at the start — tolerating OCCLUDER_GRACE_MS of
+   * frames with no enemy icon there (two red icons touching merge into one blob
+   * the detector rejects), up to MAX_OCCLUDED_MS for the whole episode.
+   */
+  private occlusionStep(redBlobs: Blob[], lastReg: { x: number; y: number }): boolean {
+    const now = performance.now();
+
+    if (!this.occluded) {
+      const firstLostFrame = this.holdStartMs === 0 && this.lockedTickCount === 0;
+      if (!firstLostFrame || this.occludedSinceMs > 0 || !this.lastSeenPartlyCovered) return false;
+      const occluder = findOccluder(redBlobs, lastReg, this.expectedIconDiam);
+      if (!occluder) return false;
+      this.occluded = true;
+      this.occludedSinceMs = now;
+      this.occluderLastSeenMs = now;
+      this.occlusionAnchor = occluder;
+      console.log('[Tracking] Own icon covered by an enemy icon — holding there until ours reappears');
+    } else {
+      if (now - this.occludedSinceMs > MAX_OCCLUDED_MS) {
+        return this.stopOccluded('the ' + (MAX_OCCLUDED_MS / 1000) + 's cap');
+      }
+      if (findOccluder(redBlobs, this.occlusionAnchor!, this.expectedIconDiam)) {
+        this.occluderLastSeenMs = now;
+      } else if (now - this.occluderLastSeenMs > OCCLUDER_GRACE_MS) {
+        return this.stopOccluded('no enemy icon left on the spot');
+      }
+    }
+    this.holdOccluded();
+    return true;
+  }
+
+  /** End an occlusion episode without our icon having come back. */
+  private stopOccluded(why: string): false {
+    this.occluded = false;
+    console.log('[Tracking] Stopped treating own icon as covered (' + why + ') — holding as lost');
+    return false;
+  }
+
+  /**
+   * Our icon is hidden under an enemy's: report the anchor as our position.
+   *
+   * Deliberately NOT a hold. A hold is the tracker admitting it does not know
+   * where we are, and the orchestrator disowns our position two seconds into
+   * one — which is right after a recall and exactly wrong here, where it cut
+   * the two players in a fight out of each other's audio every time their
+   * icons overlapped. Clearing holdStartMs keeps the disown clock, and the
+   * forced re-acquisition at FORCED_REACQUIRE_HOLD_MS, from running.
+   *
+   * The anchor does not move. Following the covering icon instead was tried
+   * and, when we had in fact recalled or teleported from under it, carried our
+   * reported position across the map with that enemy for the full cap.
+   */
+  private holdOccluded(): void {
+    if (!this.minimapRegion || !this.occlusionAnchor) return;
+    // Counts as a held frame for logging, so reappearing logs "Resumed".
+    this.lockedTickCount++;
+    this.holdStartMs = 0;
+    this.holdReason = null;
+    this.velocityX = 0;
+    this.velocityY = 0;
+
+    const cx = this.minimapRegion.x + this.occlusionAnchor.x;
+    const cy = this.minimapRegion.y + this.occlusionAnchor.y;
+    this.lastPixelPos = { x: cx, y: cy };
+    this.setLastPosition(this.pixelToGamePosition(cx, cy, this.minimapRegion), 'occluded');
+    if (this.onPositionUpdate && this.lastPosition) {
+      this.onPositionUpdate(this.lastPosition);
+    }
+  }
+
+  private endOcclusion(): void {
+    if (this.occluded) {
+      console.log('[Tracking] Own icon uncovered after ' +
+        ((performance.now() - this.occludedSinceMs) / 1000).toFixed(2) + 's');
+    }
+    this.resetOcclusion();
+  }
+
+  /** Forget any occlusion state — on a fresh lock, re-acquire, respawn or rescan. */
+  private resetOcclusion(): void {
+    this.occluded = false;
+    this.occludedSinceMs = 0;
+    this.occlusionAnchor = null;
+    this.lastSeenPartlyCovered = false;
   }
 
   /**

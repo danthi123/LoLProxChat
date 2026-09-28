@@ -180,6 +180,123 @@ export function pickClassifierReacquisition(
   return best;
 }
 
+// ---------- an enemy icon drawn over ours ----------
+
+/**
+ * How close an enemy icon's centre has to be to our icon for the two to be
+ * overlapping: one icon diameter.
+ *
+ * Measured from where we last SAW ours, which is not our icon's centre. While
+ * an enemy icon slides over ours, what the tracker follows on the last visible
+ * frames is the uncovered crescent, whose centroid sits on the far side from
+ * the enemy — in simulation the enemy's centre was ~0.6 of an icon away when
+ * ours finally vanished.
+ *
+ * An icon is ~1300 game units across at common minimap scales, so proximity
+ * alone is weak evidence; what gates an occlusion is our icon having visibly
+ * shrunk under the enemy's before it vanished (COVERED_PIXEL_FRACTION).
+ */
+export function computeOcclusionRadiusPx(expectedIconDiam: number): number {
+  return Math.max(10, Math.round(expectedIconDiam));
+}
+
+/**
+ * Our icon counts as partly covered when an enemy icon overlaps it and fewer
+ * than this fraction of its usual pixels are showing. An enemy icon centred a
+ * full 0.8 icon away hides about a fifth of our ring, so 0.7 needs a real
+ * overlap, not two icons touching.
+ */
+export const COVERED_PIXEL_FRACTION = 0.7;
+
+/**
+ * How long an occlusion survives frames with no enemy icon on the anchor.
+ * Two red icons that touch merge into one blob wider than the icon filter
+ * allows, so in a 2v1 the covering icon can drop out of detection for a few
+ * frames while nothing has actually changed.
+ */
+export const OCCLUDER_GRACE_MS = 500;
+
+/**
+ * The longest one occlusion may keep our position alive. An enemy standing on
+ * us for this long in a real fight is rare; an enemy standing on the spot we
+ * teleported away from while we were covered is the case this bounds.
+ * It is a single budget per lost-icon episode, not per enemy.
+ */
+export const MAX_OCCLUDED_MS = 10_000;
+
+/**
+ * The enemy icon most likely to be drawn over ours, or null if none is close
+ * enough to be.
+ *
+ * When two champions are in melee range their minimap icons overlap, and the
+ * one drawn on top hides the other's border. If ours is underneath, the
+ * tracker sees no teal blob where we were — which looks exactly like the
+ * champion having gone somewhere else, and used to be treated that way: two
+ * seconds of it and the orchestrator disowned our position, cutting us out of
+ * the audio of the very enemy we were fighting. A red icon sitting on our last
+ * position is the positive evidence that we are still there, underneath it.
+ */
+export function findOccluder(
+  enemyBlobs: Blob[],
+  at: { x: number; y: number },
+  expectedIconDiam: number,
+): { x: number; y: number } | null {
+  const radius = computeOcclusionRadiusPx(expectedIconDiam);
+  const singleMax = expectedIconDiam * 1.6;
+  let best: { x: number; y: number } | null = null;
+  let bestDist = Infinity;
+  for (const b of enemyBlobs) {
+    const bw = b.maxX - b.minX + 1;
+    const bh = b.maxY - b.minY + 1;
+    let point: { x: number; y: number };
+    let dist: number;
+    if (bw <= singleMax && bh <= singleMax) {
+      // One icon: overlapping means centres within one diameter.
+      point = { x: b.cx, y: b.cy };
+      dist = Math.hypot(b.cx - at.x, b.cy - at.y);
+      if (dist > radius) continue;
+    } else {
+      // Two or more enemy icons touching, merged into one blob (a 2v1). Its
+      // centroid can sit between them, so measure to the blob's extent
+      // instead, and treat the nearest part of it as the covering icon. The
+      // extent alone is not enough: a diagonal pair's bounding box has an
+      // empty corner that reaches ~2 icons from either of them, so the
+      // centroid must also be close — within 1.5 icons, which a pair with one
+      // of its icons actually on us always is.
+      point = {
+        x: Math.max(b.minX, Math.min(b.maxX, at.x)),
+        y: Math.max(b.minY, Math.min(b.maxY, at.y)),
+      };
+      dist = Math.hypot(point.x - at.x, point.y - at.y);
+      if (dist > radius / 2) continue;
+      if (Math.hypot(b.cx - at.x, b.cy - at.y) > expectedIconDiam * 1.5) continue;
+    }
+    if (dist < bestDist) {
+      best = point;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
+
+/**
+ * Red blobs that could be enemy icons covering ours: the icon filter's ring
+ * test, but admitting blobs up to ~2.6 icons across. Two enemy icons that
+ * touch merge into one such blob, which filterIconBlobs rejects as too big —
+ * so without this a 2v1 dive, the commonest way to be covered, got no
+ * protection at all. Filled shapes (structures, minion clumps) still fail the
+ * fill-ratio test.
+ */
+export function isPossibleOccluder(b: Blob, expectedIconDiam: number): boolean {
+  if (b.color !== 'red' || b.pixels < 15) return false;
+  if (b.fillRatio > 0.40 || b.fillRatio < 0.08) return false;
+  const bw = b.maxX - b.minX + 1;
+  const bh = b.maxY - b.minY + 1;
+  const lo = expectedIconDiam * 0.6;
+  const hi = expectedIconDiam * 2.6;
+  return bw >= lo && bh >= lo && bw <= hi && bh <= hi;
+}
+
 // ---------- v0.3 tracking tweaks (driven by IXAM's v0.1.33 issue #7 logs) ----------
 
 /**

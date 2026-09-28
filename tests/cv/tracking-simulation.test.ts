@@ -18,7 +18,7 @@
 
 import { MAP_DIMENSIONS } from '../../src/core/types';
 import { TrackingState } from '../../src/services/tracking';
-import { FORCED_REACQUIRE_HOLD_MS } from '../../src/services/tracking-helpers';
+import { FORCED_REACQUIRE_HOLD_MS, MAX_OCCLUDED_MS } from '../../src/services/tracking-helpers';
 import { driveTracker, FRAME_MS, metrics, newTracker } from './harness/drive';
 import {
   IndiscriminateScorer,
@@ -687,5 +687,305 @@ describe('a recall', () => {
     );
     expect(suppressedAt).toBeGreaterThanOrEqual(0);
     expect(suppressedAt).toBeLessThan(firstAtBase);
+  });
+});
+
+describe('an enemy icon drawn over ours', () => {
+  // Two champions in melee range overlap on the minimap, and whichever icon is
+  // drawn on top hides the other's border. Real logs (v0.5.9, a 1v1 in the
+  // practice tool) showed both players' trackers losing their own icon this
+  // way several times a game, always mid-fight, and the orchestrator
+  // disowning the position two seconds in — so the two people fighting each
+  // other dropped out of each other's audio for 5-9 seconds at a time.
+  //
+  // Two earlier versions of the fix failed adversarial review, and several
+  // tests below are the scenarios that sank them: they took an enemy near the
+  // spot we vanished from as cover, followed that enemy, and so re-owned
+  // recalled positions for up to twelve seconds.
+  const E: Point = { x: 150, y: 140 };
+  const BACK = BACKDROP;
+
+  /** We walk into an enemy icon drawn over ours at `speed` px/frame, then stay under it. */
+  function slideUnder(speed: number, after: number, over: SceneSpec = BACK, dir: Point = { x: 1, y: 0 }): SceneSpec[] {
+    const specs: SceneSpec[] = [];
+    for (let d = 60; d > 0; d -= speed) {
+      specs.push({ ...over, self: { x: E.x - dir.x * d, y: E.y - dir.y * d }, selfTrail: { x: -dir.x, y: -dir.y }, enemiesOnTop: [E] });
+    }
+    for (let i = 0; i < after; i++) specs.push({ ...over, self: E, enemiesOnTop: [E] });
+    return specs;
+  }
+  const coveredFrames = <T,>(records: T[], n: number): T[] => records.slice(-n);
+  const covering = (l: string) => l.includes('Own icon covered by an enemy icon');
+
+  test.each([0.5, 1, 2])('holds under the enemy, never disowning, when we walk under it at %p px/frame', async (speed) => {
+    // 7.5s under: past both the 2s disown and the 5s forced re-acquisition.
+    const scenes = renderScenes(slideUnder(speed, 60));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(logs.some(covering)).toBe(true);
+    const tail = coveredFrames(records, 50);
+    expect(tail.every(r => r.holdSec === 0 && r.state === TrackingState.LOCKED)).toBe(true);
+    expect(tail.every(r => distance(r.px!, E) < 3)).toBe(true);
+    expect(logs.filter(l => l.includes('forcing re-acquisition'))).toHaveLength(0);
+  });
+
+  test('works in a 1v1, with no teal blob anywhere on the map', async () => {
+    const ONE_V_ONE: SceneSpec = { camera: BACK.camera };
+    const scenes = renderScenes(slideUnder(1, 40, ONE_V_ONE));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(coveredFrames(records, 30).every(r => r.holdSec === 0 && r.holdReason === null)).toBe(true);
+  });
+
+  test('does not go looking for us across the map while we are covered', async () => {
+    // A classifier certain about an ally far away. Without the occlusion
+    // check Phase 2 takes it; the real logs showed exactly this, cls=1.00 on a
+    // blob thousands of units away, in the middle of a fight.
+    const FAR_ALLY: Point = BACK.allies![1];
+    const specs = slideUnder(1, 40);
+    const scenes = renderScenes(specs);
+    let target: Point | null = null;
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new OracleScorer(() => target && toFramePoint(target)) });
+    const records: Awaited<ReturnType<typeof driveTracker>> = [];
+    for (let i = 0; i < scenes.length; i++) {
+      target = specs[i].self && distance(specs[i].self!, E) > ICON_DIAM ? specs[i].self! : FAR_ALLY;
+      records.push(...await driveTracker(h, [scenes[i]]));
+    }
+
+    expect(logs.some(l => l.includes('Re-acquired via classifier'))).toBe(false);
+    expect(distance(records[records.length - 1].px!, E) < 3).toBe(true);
+  });
+
+  test('picks our icon back up when it walks out from under', async () => {
+    const out = Array.from({ length: 16 }, (_, i) => ({
+      ...BACK, self: { x: E.x + 2 + i * 2, y: E.y }, selfTrail: { x: -1, y: 0 }, enemiesOnTop: [E],
+    }));
+    const scenes = renderScenes([...slideUnder(1, 16), ...out]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    const last = records[records.length - 1];
+    expect(distance(last.px!, last.truth!)).toBeLessThanOrEqual(3);
+    expect(logs.some(l => l.includes('Own icon uncovered after'))).toBe(true);
+  });
+
+  test('survives the covering icon dropping out of detection for a few frames', async () => {
+    // A second enemy brushing the first merges the two red rings into one blob
+    // the icon filter rejects. Nothing has changed underneath.
+    const blink = Array.from({ length: 3 }, () => ({ ...BACK, self: null, enemies: BACK.enemies }));
+    const scenes = renderScenes([...slideUnder(1, 12), ...blink, ...Array.from({ length: 24 }, () => ({ ...BACK, self: null, enemiesOnTop: [E] }))]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(coveredFrames(records, 30).every(r => r.holdSec === 0)).toBe(true);
+    expect(logs.some(l => l.includes('Stopped treating own icon as covered'))).toBe(false);
+  });
+
+  test('a recall beside an enemy is still disowned', async () => {
+    // Stood still for the 8s channel, then gone in one frame — with an enemy
+    // icon near enough to overlap where we were. A full-size icon vanishing
+    // at once is a teleport, not a cover.
+    const NEAR: Point = { x: E.x + ICON_DIAM * 0.6, y: E.y };
+    const stand = Array.from({ length: 64 }, () => ({ ...BACK, self: E, enemies: [...BACK.enemies!, NEAR] }));
+    const gone = Array.from({ length: 24 }, () => ({ ...BACK, self: null, enemies: [...BACK.enemies!, NEAR] }));
+    const scenes = renderScenes([...walk(16, { x: 120, y: 140 }, { x: 2, y: 0 }), ...stand, ...gone]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(logs.some(covering)).toBe(false);
+    expect(records[records.length - 1].holdSec).toBeGreaterThan(2);
+  });
+
+  test('an enemy passing over a standing recaller is not mistaken for cover when the recall lands', async () => {
+    // Review round two: an enemy drawn on top crosses our icon mid-channel,
+    // then stands close by (0.8 icon) as the recall completes. Its crossing
+    // shrank our visible icon for a moment; what matters is that the frame
+    // before we vanished showed it whole.
+    const pass = Array.from({ length: 16 }, (_, i) => ({
+      ...BACK, self: E, enemiesOnTop: [{ x: E.x - 30 + i * 4, y: E.y + ICON_DIAM * 0.5 }],
+    }));
+    const STAND: Point = { x: E.x + ICON_DIAM * 0.8, y: E.y };
+    const settle = Array.from({ length: 24 }, () => ({ ...BACK, self: E, enemiesOnTop: [STAND] }));
+    const gone = Array.from({ length: 24 }, () => ({ ...BACK, self: null, enemiesOnTop: [STAND] }));
+    const scenes = renderScenes([...walk(16, { x: 120, y: 140 }, { x: 2, y: 0 }), ...pass, ...settle, ...gone]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(logs.some(covering)).toBe(false);
+    expect(records[records.length - 1].holdSec).toBeGreaterThan(2);
+  });
+
+  test('if we do vanish from under an enemy, we stay where it was, not wherever it goes', async () => {
+    // Review round two: once covered, a recall or teleport from underneath is
+    // indistinguishable from staying put. What bounds it is that the reported
+    // position stays at the anchor, and the episode ends half a second after
+    // no enemy icon is left there — so the hold and the 2s disown follow.
+    const leave = Array.from({ length: 40 }, (_, i) => ({ ...BACK, self: null, enemiesOnTop: [{ x: E.x + i * 2, y: E.y }] }));
+    const scenes = renderScenes([...slideUnder(1, 8), ...leave]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    const after = records.slice(-40);
+    expect(after.every(r => distance(r.px!, E) < 3)).toBe(true);
+    expect(logs.some(l => l.includes('no enemy icon left on the spot'))).toBe(true);
+    // Enemy is a full icon off the anchor ~12 frames in; +0.5s grace; then a
+    // hold that has to pass 2s. 40 frames is 5s.
+    expect(records[records.length - 1].holdSec).toBeGreaterThan(2);
+  });
+
+  test('an enemy walking onto the spot partway through a hold does not end it', async () => {
+    // We vanished with nobody near (a recall, a teleport) and the hold is
+    // already running — perhaps already disowned.
+    const VANISH: Point = at(START, STEP, 15);
+    const late = Array.from({ length: 24 }, () => ({ ...BACK, self: null, enemiesOnTop: [VANISH] }));
+    const scenes = renderScenes([...walk(16), ...vanished(8), ...late]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(logs.some(covering)).toBe(false);
+    expect(records[records.length - 1].holdSec).toBeGreaterThan(3.5);
+  });
+
+  test('once the episode ends without ours reappearing, it cannot restart', async () => {
+    const away = Array.from({ length: 16 }, () => ({ ...BACK, self: null, enemies: BACK.enemies }));
+    const back = Array.from({ length: 16 }, () => ({ ...BACK, self: null, enemiesOnTop: [E] }));
+    const scenes = renderScenes([...slideUnder(1, 8), ...away, ...back]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(logs.filter(covering)).toHaveLength(1);
+    expect(records[records.length - 1].holdSec).toBeGreaterThan(2.5);
+  });
+
+  test.each([[{ x: 1, y: 0 }], [{ x: 0, y: 1 }]])(
+    'reports the true distance while the icons only partly overlap (approach %j)', async (dir) => {
+    // The uncovered part of our ring has its centroid pushed away from the
+    // enemy, on both clients; uncorrected this scene reads up to 6px (~330
+    // game units) long per side. tests/cv/real-art.test.ts checks the same on
+    // the real minimap. Not asserted for diagonal approaches: see the limit
+    // noted on coverCorrectedCentre.
+    const specs = slideUnder(1, 0, BACK, dir);
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    // From 8px in, ours is all but gone and the occlusion anchor takes over.
+    const partly = records.filter(r => r.truth && r.holdSec === 0 &&
+      distance(r.truth, E) > 8 && distance(r.truth, E) < ICON_DIAM * 0.9);
+    expect(partly.length).toBeGreaterThan(5);
+    // Uncorrected this reaches 6px; the first frame or two in, before our
+    // box has visibly narrowed, read up to 3.
+    for (const r of partly) {
+      expect(Math.abs(distance(r.px!, E) - distance(r.truth!, E))).toBeLessThanOrEqual(3);
+    }
+    expect(partly.filter(r => Math.abs(distance(r.px!, E) - distance(r.truth!, E)) > 1).length).toBeLessThanOrEqual(2);
+  });
+
+  test('does not correct towards an enemy icon when another sits on the other side', async () => {
+    // Review round five: a second enemy drawn UNDER ours on the uncovered side
+    // made the correction push the wrong way, doubling the error.
+    const UNDER: Point = { x: E.x - 30, y: E.y };
+    const specs = slideUnder(1, 0).map(sp => ({ ...sp, enemies: [...BACK.enemies!, UNDER] }));
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    const partly = records.filter(r => r.truth && r.holdSec === 0 &&
+      distance(r.truth, E) > 4 && distance(r.truth, E) < ICON_DIAM * 0.9);
+    // Where the correction would apply (10-19px in): never worse than the raw
+    // centroid, which peaks at 5.6px here; without the guard it reached 7.8.
+    const mid = partly.filter(r => distance(r.truth!, E) > 10 && distance(r.truth!, E) < 19);
+    expect(mid.length).toBeGreaterThan(5);
+    for (const r of mid) expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(5.7);
+  });
+
+  test('holds through a 2v1, where a second enemy icon merges with the covering one', async () => {
+    // Review round three: two touching red rings become one blob too big for
+    // the icon filter, and the fix used to see no occluder at all.
+    const B: Point = { x: E.x + ICON_DIAM * 0.8, y: E.y + 4 };
+    const specs = slideUnder(1, 40).map(sp => ({ ...sp, enemiesOnTop: [E, B] }));
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(logs.some(covering)).toBe(true);
+    expect(coveredFrames(records, 30).every(r => r.holdSec === 0)).toBe(true);
+  });
+
+  test('an ally icon overlapping ours does not skew what a covered icon looks like', async () => {
+    // Review round three: an ally walking stacked with us merged into our
+    // blob and inflated the learnt icon size, after which an enemy merely
+    // nearby looked like it was covering us — and a recall engaged.
+    const NEAR: Point = { x: E.x + ICON_DIAM * 0.83, y: E.y };
+    const withAlly = Array.from({ length: 40 }, () => ({ ...BACK, self: E, allies: [...BACK.allies!, { x: E.x + 3, y: E.y + 3 }] }));
+    const stand = Array.from({ length: 24 }, () => ({ ...BACK, self: E, enemies: [...BACK.enemies!, NEAR] }));
+    const gone = Array.from({ length: 24 }, () => ({ ...BACK, self: null, enemies: [...BACK.enemies!, NEAR] }));
+    const scenes = renderScenes([...walk(16, { x: 120, y: 140 }, { x: 2, y: 0 }), ...withAlly, ...stand, ...gone]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(logs.some(covering)).toBe(false);
+    expect(records[records.length - 1].holdSec).toBeGreaterThan(2);
+  });
+
+  test('an icon clipped at the minimap edge does not teach it a too-small icon', async () => {
+    // Review round four: learnt from a clipped icon (fountain is in a corner),
+    // the baseline stuck low and no later cover ever looked shrunk enough.
+    // No allies, so the clipped icon is the only thing to lock on to.
+    const SOLO: SceneSpec = { enemies: BACK.enemies, camera: BACK.camera };
+    const walkOut = Array.from({ length: 36 }, (_, i) => ({ ...SOLO, self: { x: 80 - i * 2, y: 140 }, selfTrail: { x: 1, y: 0 } }));
+    const EDGE = Array.from({ length: 80 }, () => ({ ...SOLO, self: { x: 8, y: 140 } }));
+    const walkIn = Array.from({ length: 30 }, (_, i) => ({ ...SOLO, self: { x: 8 + i * 2.5, y: 140 }, selfTrail: { x: -1, y: 0 } }));
+    const scenes = renderScenes([...walkOut, ...EDGE, ...walkIn, ...slideUnder(1, 30, SOLO)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(records[36 + 79].state).toBe(TrackingState.LOCKED);
+    expect(distance(records[36 + 79].px!, { x: 8, y: 140 })).toBeLessThan(6);
+    expect(logs.some(covering)).toBe(true);
+    expect(coveredFrames(records, 20).every(r => r.holdSec === 0)).toBe(true);
+  });
+
+  test('two enemy icons diagonally away from us do not keep an episode alive', async () => {
+    // Review round four: a merged pair's bounding box has an empty corner
+    // reaching ~2 icons out, which kept an episode running to the cap.
+    // Centres 1.66 and 1.75 icons off, touching each other; the merged
+    // blob's bounding-box corner is under half an icon from the anchor.
+    const PAIR: Point[] = [
+      { x: E.x + ICON_DIAM * 0.9, y: E.y + ICON_DIAM * 1.4 },
+      { x: E.x + ICON_DIAM * 1.6, y: E.y + ICON_DIAM * 0.7 },
+    ];
+    const leave = Array.from({ length: 40 }, () => ({ ...BACK, self: null, enemiesOnTop: PAIR }));
+    const scenes = renderScenes([...slideUnder(1, 8), ...leave]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(logs.some(l => l.includes('no enemy icon left on the spot'))).toBe(true);
+    expect(records[records.length - 1].holdSec).toBeGreaterThan(2);
+  });
+
+  test('dying while covered is disowned like any other death, not held until respawn', async () => {
+    // Review round three: nothing is re-evaluated while DEAD, so an episode
+    // in progress at death froze with the position owned at the killer's
+    // feet for the whole death timer.
+    const scenes = renderScenes(slideUnder(1, 8));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    await driveTracker(h, scenes);
+    expect(logs.some(covering)).toBe(true);
+
+    h.svc.onDeath();
+    jest.advanceTimersByTime(3000);
+    expect(h.svc.getHoldDurationSec()).toBeGreaterThan(2);
+    expect(h.svc.getHoldReason()).toBe('no-match');
+  });
+
+  test('gives up after MAX_OCCLUDED_MS and falls back to an ordinary hold', async () => {
+    const scenes = renderScenes(slideUnder(1, 100));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    expect(logs.some(l => l.includes('s cap'))).toBe(true);
+    expect(records[records.length - 1].holdSec).toBeGreaterThan(0);
+    expect(MAX_OCCLUDED_MS).toBe(10_000);
   });
 });
