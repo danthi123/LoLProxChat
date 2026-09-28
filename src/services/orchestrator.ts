@@ -577,12 +577,11 @@ export class Orchestrator {
     // wherever they are looking as well as from their champion.
     //
     // The camera goes to the server alongside the champion position, and the
-    // server reads BOTH of ours from room state when it answers us — so the
-    // point we hear from is the same stored point our peers are scored
-    // against. Listening from a camera therefore means being audible at it,
-    // and a peer who has the setting off publishes no camera, which makes ours
-    // count for nothing against them. Publishing it IS the opt-in; there is no
-    // separate flag on the wire.
+    // server reads ours from room state when it answers us, so we can only
+    // listen from a camera we have published. It is one-way — peers are scored
+    // at our champion, never at our camera — and a peer who has the setting
+    // off publishes no camera, which makes ours count for nothing against
+    // them. Publishing it IS the opt-in; there is no separate flag on the wire.
     //
     // When the rectangle isn't readable this frame we publish the champion
     // position as the camera rather than dropping the field, because dropping

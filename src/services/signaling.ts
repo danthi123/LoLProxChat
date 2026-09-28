@@ -222,9 +222,8 @@ export class SignalingService {
    *
    * `camera` is the centre of our in-game camera, sent only while the user has
    * "voice on camera" (#36) on. Its presence is the opt-in: the server stores
-   * it, uses it as one of our listening points, and scores peers against it as
-   * one of the points we are audible at — and only when the peer has published
-   * one too. Omitting it is how the client says the setting is off, which the
+   * it and uses it as one of our listening points — only against peers who
+   * have published one too, and never as a point we are heard at. Omitting it is how the client says the setting is off, which the
    * server acts on immediately rather than waiting for the value to age out.
    */
   sendCoords(x: number, y: number, stale = false, camera?: { x: number; y: number } | null): void {

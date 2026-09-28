@@ -25,11 +25,11 @@ export interface ClientMessage {
   //
   // Presence IS the consent flag, deliberately: there is no separate boolean
   // to assert. A client hears from its camera only by publishing that camera
-  // to the room, and the server scores peers against the published copy, so
-  // you cannot listen from a point without also being audible at it. Absent
-  // from every client before v0.5.9, and from every client whose user has the
-  // setting off — in both cases the pair falls back to champion positions on
-  // both sides.
+  // to the room, and only against peers who have published one too, so
+  // nobody can listen in on a player who has the setting off. The camera is
+  // a listening point only, never a point anyone is heard at. Absent from
+  // every client before v0.5.9, and from every client whose user has the
+  // setting off — in both cases the pair is scored champion to champion.
   cx?: number;
   cy?: number;
   // v0.3: team identifier on 'join' (ORDER / CHAOS). Optional for back-compat

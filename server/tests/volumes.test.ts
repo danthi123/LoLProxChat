@@ -301,10 +301,10 @@ describe('computeTieredVolumes — "voice on camera" (#36)', () => {
   // on, the server reads the requester's own from room state too, and a camera
   // counts for a pair only when both sides have published one.
   //
-  // That makes the whole thing symmetric — the point you listen from is a
-  // point you can be heard at — and it means a player who leaves the setting
-  // off can only be heard by someone actually near them on the map, whatever
-  // anyone else does with their camera.
+  // It is one-way: your camera is a point you listen from, never a point you
+  // are heard at. And a player who leaves the setting off can only be heard by
+  // someone actually near them on the map, whatever anyone else does with
+  // their camera.
   type Client = {
     name: string;
     team?: 'ORDER' | 'CHAOS';
@@ -337,24 +337,23 @@ describe('computeTieredVolumes — "voice on camera" (#36)', () => {
     expect(ask('Me', { x: 0, y: 0 }, room).peerVolumes.Enemy).toBe(1.0);
   });
 
-  it('...and the enemy hears the eavesdropper just as loudly', () => {
-    // The point of the symmetry: listening from a camera means being audible
-    // at it. Panning onto a fight to listen in is not free.
+  it('...but the enemy does not hear me through my camera', () => {
+    // One-way: panning onto a fight lets you listen in without the people in
+    // it hearing you. The enemy's own camera is on their own champion, nowhere
+    // near mine.
     const room = pair({ x: 0, y: 0 }, { x: 5000, y: 0 }, { x: 5000, y: 0 }, { x: 5000, y: 0 });
-    expect(ask('Enemy', { x: 5000, y: 0 }, room).peerVolumes.Me).toBe(1.0);
+    expect(ask('Enemy', { x: 5000, y: 0 }, room).peerVolumes.Me).toBeUndefined();
   });
 
-  it('gives both sides the same volume however the four points are arranged', () => {
-    const cases: Array<[{ x: number; y: number }, { x: number; y: number }, { x: number; y: number }, { x: number; y: number }]> = [
-      [{ x: 0, y: 0 }, { x: 5000, y: 0 }, { x: 4800, y: 0 }, { x: 300, y: 0 }],
-      [{ x: 0, y: 0 }, { x: 1200, y: 0 }, { x: 9000, y: 9000 }, { x: 9000, y: 9000 }],
-      [{ x: 700, y: 700 }, { x: 8000, y: 200 }, { x: 8000, y: 900 }, { x: 4000, y: 4000 }],
-    ];
-    for (const [mePos, enemyPos, myCam, enemyCam] of cases) {
-      const room = pair(mePos, enemyPos, myCam, enemyCam);
-      expect(ask('Me', mePos, room).peerVolumes.Enemy)
-        .toBe(ask('Enemy', enemyPos, room).peerVolumes.Me);
-    }
+  it('lets each side hear through its own camera, independently', () => {
+    // Both cameras on the other champion: each hears the other.
+    const both = pair({ x: 0, y: 0 }, { x: 5000, y: 0 }, { x: 5000, y: 0 }, { x: 0, y: 0 });
+    expect(ask('Me', { x: 0, y: 0 }, both).peerVolumes.Enemy).toBe(1.0);
+    expect(ask('Enemy', { x: 5000, y: 0 }, both).peerVolumes.Me).toBe(1.0);
+    // Only the enemy looking: only the enemy hears.
+    const theirs = pair({ x: 0, y: 0 }, { x: 5000, y: 0 }, { x: 9000, y: 9000 }, { x: 0, y: 0 });
+    expect(ask('Me', { x: 0, y: 0 }, theirs).peerVolumes.Enemy).toBeUndefined();
+    expect(ask('Enemy', { x: 5000, y: 0 }, theirs).peerVolumes.Me).toBe(1.0);
   });
 
   it('keeps hearing an enemy beside the champion while the camera is elsewhere', () => {
@@ -381,9 +380,9 @@ describe('computeTieredVolumes — "voice on camera" (#36)', () => {
 
   it('ignores a listenPosition in the request — a camera must be published', () => {
     // The old wire field. Honouring it would let a client listen from a point
-    // its peers are never scored against, which is exactly the asymmetry this
-    // design removes. Both players have the setting off here; the request asks
-    // to hear from on top of the enemy anyway.
+    // it never published, which skips the opt-in. Both players have the
+    // setting off here; the request asks to hear from on top of the enemy
+    // anyway.
     const room = pair({ x: 0, y: 0 }, { x: 5000, y: 0 });
     const result = computeTieredVolumes(
       { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me', listenPosition: { x: 5000, y: 0 } },
@@ -410,20 +409,28 @@ describe('computeTieredVolumes — "voice on camera" (#36)', () => {
     expect(ask('Me', { x: 0, y: 0 }, room).peerVolumes.Enemy).toBeUndefined();
   });
 
+  it('treats a peer whose camera went stale as opted out, even with mine fresh', () => {
+    const stale = Date.now() - 60_000;
+    const room = makeGetter([
+      { name: 'Me', team: 'ORDER', position: at(0, 0), camera: at(5000, 0) },
+      { name: 'Enemy', team: 'CHAOS', position: at(5000, 0), camera: { x: 5000, y: 0, updatedMs: stale } },
+    ]);
+    expect(ask('Me', { x: 0, y: 0 }, room).peerVolumes.Enemy).toBeUndefined();
+  });
+
   it('does not let a camera bypass the range cutoff', () => {
     // All four combinations beyond 1350u.
     const room = pair({ x: 0, y: 0 }, { x: 9000, y: 9000 }, { x: 5000, y: 0 }, { x: 2000, y: 8000 });
     expect(ask('Me', { x: 0, y: 0 }, room).peerVolumes.Enemy).toBeUndefined();
   });
 
-  it('lets two opted-in players watching the same fight hear each other', () => {
-    // Neither champion is anywhere near the other, and neither is near the
-    // fight — but both have put a listening point on it, and a listening point
-    // is also a point you are audible at. Falls out of the symmetry rather
-    // than being a special case, and is asserted here so it stays deliberate.
+  it('does not let two cameras on the same spot hear each other', () => {
+    // Neither champion is anywhere near the other, and both players are
+    // looking at the same fight. A camera is not a point anyone is heard at,
+    // so there is nothing for either of them to hear.
     const room = pair({ x: 500, y: 500 }, { x: 13000, y: 13000 }, { x: 7000, y: 7000 }, { x: 7200, y: 7000 });
-    expect(ask('Me', { x: 500, y: 500 }, room).peerVolumes.Enemy).toBe(1.0);
-    expect(ask('Enemy', { x: 13000, y: 13000 }, room).peerVolumes.Me).toBe(1.0);
+    expect(ask('Me', { x: 500, y: 500 }, room).peerVolumes.Enemy).toBeUndefined();
+    expect(ask('Enemy', { x: 13000, y: 13000 }, room).peerVolumes.Me).toBeUndefined();
   });
 
   it('does not let a camera bypass the team filter', () => {

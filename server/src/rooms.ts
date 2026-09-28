@@ -170,9 +170,10 @@ export class RoomManager {
     const info = this.clients.get(ws);
     if (!info) return;
     info.position = undefined;
-    // The camera goes with it. Disowning the position means "peers must stop
-    // hearing me"; leaving a camera behind would keep a consenting peer
-    // hearing them at it, which is the same phantom audio by another route.
+    // The camera goes with it. Disowning the position means "I no longer know
+    // where I am"; a peer with no position is skipped in scoring anyway, and
+    // a leftover camera would only go on advertising the opt-in for a client
+    // that has nothing to be scored at.
     info.camera = undefined;
   }
 

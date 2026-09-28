@@ -17,9 +17,9 @@ export function setAllyProximity(enabled: boolean): void {
 // "Voice on camera" (#36): hear the map from wherever the camera is looking as
 // well as from the champion's own position.
 //
-// Symmetric and mutual, both deliberately. Symmetric because the camera you
-// listen from is published to the server and scored as a point you are
-// AUDIBLE at — pan onto a fight to listen in and the people in it hear you.
+// One-way and mutual, both deliberately. One-way because the camera is a point
+// you listen from, never one you are heard at: pan onto a fight and you hear
+// it, while the people in it hear you only from where your champion stands.
 // Mutual because a camera only counts between two players who have both
 // turned this on: with it off you publish no camera, nobody else's can reach
 // you, and you are heard only by players actually near you on the map.

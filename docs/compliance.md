@@ -44,23 +44,21 @@ What bounds the leak today is the hearing radius and nothing else: you learn tha
 
 For the precise threat-modeling around how a modified client *could* extract additional information from the volume side channel, see [`threat-model.md`](threat-model.md). Note that the volume value the server returns is **continuous** — the v0.1.26 bucket quantization and jitter were reverted in v0.1.33 because the bucket transitions were audible in real games; the mitigations that remain are the hard cutoff at vision range and the staleness window on peer coordinates.
 
-## Specifically: "Voice on camera" (opt-in, default OFF, mutual)
+## Specifically: "Voice on camera" (opt-in on both sides, default OFF, one-way)
 
 Added in v0.5.8 for [#36](https://github.com/danthi123/LoLProxChat/issues/36), reworked in v0.5.9. When enabled, you hear the map from **the centre of your in-game camera** as well as from your champion. The camera position is read the same way as everything else — off the minimap, by finding the camera-viewport rectangle the game already draws there.
 
 **It does not fit the argument made above, and we are not going to pretend otherwise.** The case for the default behaviour is that hearing is anchored to your champion, so you only ever hear enemies the game would already be hinting at, and getting close enough to hear someone costs you the same risk it costs them. A free camera is not anchored to anything and costs nothing — you can pan it over a bush, an objective, or the enemy jungle and learn whether someone there is talking, with no vision and no ward. That is information the game deliberately withholds, which is exactly what the "no fog-of-war reveals" line above rules out.
 
-Three things bound it. The first two were there from the start; the third is the v0.5.9 rework, and it is the one that matters.
+Three things bound it.
 
 **1. It only reaches other people running this app, in your room.** It cannot hear anyone who has not installed it and joined the lobby with you, and it carries voice, not game audio.
 
 **2. The range cutoff is unchanged.** `MAX_HEARING_RANGE` still applies, measured from the camera. Panning does not let you hear further, only from somewhere else.
 
-**3. It is mutual, and enforced on the server.** As originally shipped it was *listen-only*: your camera changed what you heard and never what anyone heard from you. That sounded conservative and was the opposite. It made listening free — you could put your ear anywhere on the map, at no risk, and the person you were listening to had no way to know or to decline. Since v0.5.9:
+**3. It only works between two players who have both turned it on, and that is enforced on the server.** Your client publishes your camera centre to the server only while the setting is on, and the server uses your camera against a player only when *they* have published one too. If you leave it off you publish nothing, nobody else's camera can reach you, and you are heard only by players actually near you on the map — whatever anyone else has chosen. Publishing the camera *is* the opt-in: the server reads your own camera from that published copy when it answers you, and ignores the pre-v0.5.9 `listenPosition` request field, which let a client name a listening point of its own and so skip the opt-in.
 
-- **Your camera is a place you can be heard.** Pan onto a fight to listen in and the people in it hear you, at the same volume you hear them. Volumes between any two players are now symmetric by construction: `V(A,B) = V(B,A)`, always.
-- **It only works between two players who have both turned it on.** Your client publishes your camera centre to the server only while the setting is on, and the server uses a camera for a pair only when *both* sides have published one. If you leave it off you publish nothing, nobody else's camera can reach you, and you are heard only by players actually near you on the map — whatever anyone else has chosen.
-- **There is no flag to lie about.** Publishing the camera *is* the opt-in, and the server reads your own camera from that same published copy when it answers you. So you cannot listen from a point your peers are not scored against. The pre-v0.5.9 `listenPosition` request field, which let a client name a listening point of its own, is ignored.
+**It is one-way.** Your camera is a point you listen *from*, never a point you are heard at: pan onto a fight and you hear it, but the people in it hear you only if they are near your champion or their own camera is on you. A v0.5.9 test build briefly made it two-way, on the argument that listening should cost the listener something. Players testing it found the result worse to play with — hearing someone because they happened to glance at you is unpredictable, while being heard only where your champion stands is not — and the two-way version did not add a protection the mutual opt-in lacks. Between two players who have both opted in, listening is free, and both of them chose that.
 
 So a player in a competitive game can turn it off and know exactly what they have: plain proximity, no camera reach in either direction, unaffected by what their opponents do. That is the property that was missing.
 

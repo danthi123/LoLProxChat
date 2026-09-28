@@ -218,18 +218,17 @@ describe('E4 an enemy past vision range is held, then silenced (#27)', () => {
   });
 });
 
-describe('E5 voice on camera is mutual and symmetric (#36)', () => {
+describe('E5 voice on camera is mutual opt-in and one-way (#36)', () => {
   // The feature is an opt-in between two players, enforced server-side: each
   // client publishes its camera centre to room state over `coords`, the server
   // reads the requester's own from there too, and a camera counts for a pair
-  // only when both sides have published one. So the point you listen from is
-  // the same stored point your peers are scored against — listening in on a
-  // fight means being audible in it.
+  // only when both sides have published one. It is one-way: the camera is a
+  // point you listen from, never a point you are heard at.
   //
   // audio-prefs is process-global localStorage, so both clients here share one
   // toggle; the per-side matrix (one on, one off) is covered where the rule is
   // enforced, in server/tests/volumes.test.ts and server/tests/integration.test.ts.
-  it('lets a distant pair hear each other through the camera, both at once', async () => {
+  it('lets the player looking hear a distant enemy, without being heard back', async () => {
     const { players, a, b } = roster('CHAOS');
     const [one, two] = track(makeClient(a, players), makeClient(b, players));
     // Positioned before the first tick: the distance the camera is supposed to
@@ -258,16 +257,14 @@ describe('E5 voice on camera is mutual and symmetric (#36)', () => {
       'A to hear the enemy under its camera',
     );
     expect(aHeard).toBeGreaterThan(0.9);
-
-    // The half that did not exist before: B hears A back, at the same volume,
-    // without B having done anything. A's camera is a place A can be heard.
-    const bHeard = await waitFor(
-      () => volumesFor(b).map((e) => e.response?.peerVolumes?.[a]).filter((v) => v !== undefined).pop(),
-      'the enemy to hear A back through the same camera',
-    );
-    expect(bHeard).toBe(aHeard);
     await waitFor(() => one.peerFor(b)!.volume > 0.9, 'A to actually play the enemy');
-    await waitFor(() => two.peerFor(a)!.volume > 0.9, 'B to actually play A');
+
+    // B's camera is on B's own champion, nowhere near A, so B hears nothing:
+    // A listening in does not make A audible.
+    const bSince = volumesFor(b).length;
+    await waitFor(() => volumesFor(b).length > bSince + 4, 'several more B exchanges to go by');
+    expect(volumesFor(b).slice(bSince).filter((e) => a in (e.response?.peerVolumes ?? {}))).toEqual([]);
+    expect(two.peerFor(a)!.volume).toBe(0);
   });
 
   it('reaches nobody while the setting is off, and never asks the server to', async () => {

@@ -56,11 +56,11 @@ export interface VolumeRequestV2 {
   // send is documented where someone will find it.
   //
   // "Voice on camera" (#36) used to work by letting the request name the point
-  // it wanted to hear from. That made listening free and invisible: you could
-  // pan a camera onto an enemy, hear them, and never be audible yourself. The
-  // camera is now published to room state over `coords` like any other
-  // position, read from there for the requester as well, and only used when
-  // both players in a pair have published one. See computeTieredVolumes.
+  // it wanted to hear from, which let a client listen in on players who had
+  // never turned the feature on. The camera is now published to room state
+  // over `coords` like any other position, read from there for the requester
+  // as well, and only used when both players in a pair have published one.
+  // See computeTieredVolumes.
   listenPosition?: { x: number; y: number };
 }
 
@@ -285,13 +285,13 @@ export interface TieredRoomClient {
 }
 
 /**
- * Closest approach between two players' sets of audible/listening points.
+ * Closest approach between two sets of points: the smallest distance from any
+ * point in `a` to any point in `b`.
  *
- * With voice on camera off on either side this is just champion-to-champion.
- * With it on for BOTH, each side has two points — champion and camera — and
- * the pair is scored on whichever combination is closest. That is what makes
- * the feature symmetric: the camera you listen from is also a place you can be
- * heard, so panning onto a fight to eavesdrop means the people in it hear you.
+ * Used with the requester's listening points on one side and the peer's
+ * champion on the other. With voice on camera off on either side that is just
+ * champion-to-champion; with it on for BOTH, the requester listens from its
+ * champion and its camera, and hears the peer if either is close enough.
  */
 export function closestApproach(
   a: readonly { x: number; y: number }[],
@@ -387,20 +387,27 @@ export function computeTieredVolumes(
 
     // "Voice on camera" (#36) is an opt-in BETWEEN TWO PLAYERS, not a setting
     // one of them applies to the other. Both sides have to be publishing a
-    // camera for either side's camera to count; if this peer has the setting
+    // camera for the requester's camera to count; if this peer has the setting
     // off, their camera is absent from room state and the pair is scored
-    // champion-to-champion in both directions — so a player who leaves it off
-    // can only be heard by someone actually near them on the map.
+    // champion-to-champion — so a player who leaves it off can only be heard
+    // by someone actually near them on the map.
     //
-    // Note both cameras are read from ROOM STATE, the requester's included.
-    // That is the whole enforcement: the point you hear from is the same
-    // stored point your peers are scored against, so there is no way to listen
-    // from somewhere without being audible there. A request cannot assert a
+    // It is one-way: your camera is a point you listen FROM, never a point you
+    // are heard at, so the peer is always scored at their champion. Panning
+    // onto a fight lets you hear it without the people in it hearing you; they
+    // hear you only if their own camera is on you. A v0.5.9 test build made it
+    // two-way, and players testing it found hearing someone who happened to
+    // glance at you unpredictable — being heard is anchored to where your
+    // champion stands.
+    //
+    // The requester's own camera is read from ROOM STATE, not the request, so
+    // a client cannot listen from a point without having published it — which
+    // is also what makes publishing it the opt-in. A request cannot assert a
     // listening point of its own (the old `listenPosition` field is ignored).
     const bothOptedIn = !!myCamera && !!peer.camera &&
       peer.camera.updatedMs >= cutoff;
     const myPoints = bothOptedIn ? [body.myPosition, myCamera!] : [body.myPosition];
-    const peerPoints = bothOptedIn ? [peer.position, peer.camera!] : [peer.position];
+    const peerPoints = [peer.position];
 
     const dist = closestApproach(myPoints, peerPoints);
     if (dist >= range) {

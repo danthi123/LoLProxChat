@@ -27,9 +27,10 @@ export class VolumeClient {
    *
    * There is deliberately no camera argument. "Voice on camera" (#36) used to
    * send a `listenPosition` here, which let the request name a point to hear
-   * from that peers were never scored against — listening for free. The camera
-   * now goes to room state over `coords` and the server reads ours from there,
-   * so it cannot be asserted per-request. See signaling.sendCoords.
+   * from without publishing it — so it worked against players who had never
+   * opted in. The camera now goes to room state over `coords` and the server
+   * reads ours from there, so it cannot be asserted per-request. See
+   * signaling.sendCoords.
    */
   async computeVolumes(
     myPosition: Position,

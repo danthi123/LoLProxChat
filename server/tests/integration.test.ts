@@ -203,7 +203,7 @@ describe('tiered proximity — end-to-end against the real server', () => {
     alice.close(); ally.close(); enemyClose.close(); enemyEdge.close(); enemyBeyond.close();
   });
 
-  it('"voice on camera" needs both players opted in, and is symmetric (#36)', async () => {
+  it('"voice on camera" needs both players opted in, and is one-way (#36)', async () => {
     const room = 'r-camera';
     const alice = await joinRoom(room, 'CamAlice', 'ORDER');
     const enemy = await joinRoom(room, 'CamEnemy', 'CHAOS');
@@ -223,14 +223,18 @@ describe('tiered proximity — end-to-end against the real server', () => {
     expect((await computeVolumes({ x: 0, y: 0 }, room, 'CamAlice')).peerVolumes.CamEnemy).toBeUndefined();
     expect((await computeVolumes({ x: 5000, y: 0 }, room, 'CamEnemy')).peerVolumes.CamAlice).toBeUndefined();
 
-    // The enemy turns it on too. Now Alice's camera reaches them — and theirs
-    // reaches her, at exactly the same volume. Listening is not free.
+    // The enemy turns it on too, camera on their own champion. Now Alice's
+    // camera reaches them — and only in her direction: a camera is a point you
+    // listen from, not one you are heard at.
     sendCoordsWithCamera(enemy, 5000, 0, 5000, 0);
     await sleep(300);
-    const aliceHears = (await computeVolumes({ x: 0, y: 0 }, room, 'CamAlice')).peerVolumes.CamEnemy;
-    const enemyHears = (await computeVolumes({ x: 5000, y: 0 }, room, 'CamEnemy')).peerVolumes.CamAlice;
-    expect(aliceHears).toBe(1.0);
-    expect(enemyHears).toBe(aliceHears);
+    expect((await computeVolumes({ x: 0, y: 0 }, room, 'CamAlice')).peerVolumes.CamEnemy).toBe(1.0);
+    expect((await computeVolumes({ x: 5000, y: 0 }, room, 'CamEnemy')).peerVolumes.CamAlice).toBeUndefined();
+
+    // The enemy pans onto Alice, and now hears her too.
+    sendCoordsWithCamera(enemy, 5000, 0, 0, 0);
+    await sleep(300);
+    expect((await computeVolumes({ x: 5000, y: 0 }, room, 'CamEnemy')).peerVolumes.CamAlice).toBe(1.0);
 
     // The enemy turns it back off — a coords with no camera centre — and is
     // out of reach again on the next tick, not after the staleness window.
@@ -242,9 +246,9 @@ describe('tiered proximity — end-to-end against the real server', () => {
   });
 
   it('a listenPosition in the request buys nothing (#36)', async () => {
-    // The pre-v0.5.9 wire field. Honouring it would let a client hear from a
-    // point its peers are never scored against, which is the asymmetry the
-    // published-camera design exists to remove.
+    // The pre-v0.5.9 wire field. Honouring it would let a client listen in on
+    // a player who never turned the feature on; the published camera is what
+    // makes the opt-in mutual.
     const room = 'r-camera-spoof';
     const alice = await joinRoom(room, 'SpoofAlice', 'ORDER');
     const enemy = await joinRoom(room, 'SpoofEnemy', 'CHAOS');
