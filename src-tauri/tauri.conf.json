@@ -1,7 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/nickvdyck/tauri-settings-schema/refs/heads/main/schemas/2.1.0/schema.json",
   "productName": "LoLProxChat",
-  "version": "0.1.0",
   "identifier": "com.proxchat.app",
   "build": {
     "frontendDist": "../dist",

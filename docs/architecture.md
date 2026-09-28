@@ -80,10 +80,10 @@ Both windows are declared in `src-tauri/tauri.conf.json`. Both have transparent 
 
 Tracking is a state machine: **SCANNING → LOCKED → (DEAD)**. Every CV tick:
 
-1. **Capture.** `invoke('capture_minimap')` triggers a Win32 `BitBlt` of a bounded screen rect. Tauri returns the raw RGBA bytes as a data URL.
+1. **Capture.** `invoke('capture_minimap')` triggers a Win32 `BitBlt` of a bounded screen rect on a blocking worker (not the window message loop, which also drives the 30 Hz click-through poll). It returns one raw byte buffer: an 8-byte header (LE `u32` width, LE `u32` height) followed by top-down row-major RGBA with no padding. `src/core/capture-frame.ts` decodes it into a `CaptureFrame` as a zero-copy view; the tracker refuses a frame whose dimensions disagree with the capture bounds it pushed, and re-pushes the bounds once. There is no BMP, no base64 and no canvas round-trip on this path.
 2. **Color mask.** Build HSV-thresholded masks for each plausible champion-circle color (teal allies + various enemy hues). Tracked via `buildWhiteMasks` / `findBlobs`.
 3. **Blob detection.** Flood-fill connected components, filter by size + fill-ratio against the expected icon diameter at the current minimap scale.
-4. **Identity.** Each candidate icon is cropped and identified by a champion classifier (`src/services/champion-classifier.ts` — a small CNN trained on champion icons, run in-browser via ONNX Runtime) combined with blob scoring, so the tracker follows *your* champion rather than whatever icon is nearest. Design notes + research: [`docs/plans/2026-06-03-cv-tracking-research.md`](plans/2026-06-03-cv-tracking-research.md).
+4. **Identity.** Candidate icons are cropped and identified by a champion classifier — all of a tick's crops in a single batched inference (`src/services/champion-classifier.ts` — a small CNN trained on champion icons, run in-browser via ONNX Runtime) combined with blob scoring, so the tracker follows *your* champion rather than whatever icon is nearest. Design notes + research: [`docs/plans/2026-06-03-cv-tracking-research.md`](plans/2026-06-03-cv-tracking-research.md).
 5. **Track.** In LOCKED state, prefer the blob nearest to last position + velocity; rebuild velocity as an EMA on apparent motion. Allow brief "holds" (no match in range) using extrapolation with a velocity cap (10 px/tick — see `extrapolatePosition`). The scoring/selection math (composite blob score, Phase-1 in-range pick, Phase-2 classifier reacquisition, adaptive thresholds) lives in pure functions in `src/services/tracking-helpers.ts` — testable in isolation; `handleLocked` is the orchestration layer that wires them up plus the side-effect ordering.
 6. **Position-jump detection.** All `lastPosition` writes funnel through `setLastPosition`, which warns when a jump exceeds both a distance threshold (>500 game-units) AND a speed threshold (>2000 u/s) — both gates filter out CV pixel-jitter on normal movement while still catching real teleports (recall) or mis-tracks. Thresholds live as `JUMP_WARN_MIN_UNITS` / `JUMP_WARN_MIN_SPEED` static constants on `TrackingService`.
 
@@ -99,6 +99,8 @@ This is the part that matters for both the threat model and the "what does the s
 2. Immediately after, the client POSTs `/compute-volumes` with `{ myPosition, roomId, name }`. The server reads the latest position for every *other* client in the room (skipping any whose last `coords` is older than 5 s) and returns `{ peerVolumes: { peerName: volume } }`.
 3. Volume math: pairwise distance with quadratic falloff `1 - (d/MAX_HEARING_RANGE)²`, continuous float in `[0, 1]`. `MAX_HEARING_RANGE = 1350` game units (≈ champion vision range). Allies always return 1.0; cross-team peers use the falloff and are omitted entirely beyond the range. See `server/src/volumes.ts`.
 
+On a map the client has no coordinate system for, none of the three steps above happen: tracking never starts, no `coords` are sent, and every peer is held at 1.0 — voice works, proximity is off, and the panel says why. Coordinates are only ever broadcast for a map whose dimensions the client actually knows (`src/core/map-detect.ts`).
+
 The result: **a peer client never sees another client's raw position; the server sees every client's plaintext XY for as long as they're in the room.** That's a deliberate trade — the server needs positions to compute proximity, and a peer never receives another peer's coordinates. The only party who can see positions is whoever runs the server, so self-host if that matters to you. Threat-model implications in [`threat-model.md`](threat-model.md).
 
 ## WebRTC voice flow
@@ -108,7 +110,7 @@ Voice is the only thing on the WebRTC connection — there is no data channel.
 - Each client publishes a single mic stream through a WebAudio graph: `mic → GainNode → MediaStreamDestination → RTCPeerConnection`.
 - Each peer's incoming stream goes through the inverse: `RTCPeerConnection → MediaStreamSource → GainNode → AudioContext.destination`.
 - The per-peer gain is driven by the server-returned volume, smoothed (`nextSmoothedVolume`, ~1-second ramp) so distance changes ease in instead of snapping, and tracking jitter is damped.
-- ICE candidates flow through the signaling server's `/ws` endpoint. Direct P2P (host or srflx) is preferred; TURN relay kicks in if the user opted into "Hide IP" or if direct paths fail. TURN credentials come from Cloudflare's Realtime TURN API, proxied through the signaling server's `/turn-credentials`.
+- ICE candidates flow through the signaling server's `/ws` endpoint. Direct P2P (host or srflx) is preferred; TURN relay kicks in if the user opted into "Hide IP" or if direct paths fail. TURN credentials come from Cloudflare's Realtime TURN API, proxied through the signaling server's `/turn-credentials`. The client caches the response in memory for 60 seconds and de-duplicates concurrent requests, so a lobby's worth of peer setups makes one call rather than one per peer. Failed or empty responses are not cached — an ICE server list is frozen into each `RTCPeerConnection` at construction, so caching a STUN-only fallback would strand every peer of that game without a relay.
 - ICE failure auto-recovers: initiator side calls `pc.restartIce()` + re-issues an offer, capped at 2 attempts per peer, counter resets on successful re-connect.
 
 ## Signaling server (`server/`)
@@ -128,13 +130,15 @@ Source files:
 |---|---|
 | `src/index.ts` | HTTP/WebSocket bootstrap, route dispatch, rate limits (per-player + per-IP backstop) + body cap + WS connection cap |
 | `src/ws-handler.ts` | Per-connection lifecycle, room messages, per-connection message rate limit |
-| `src/rooms.ts` | In-memory room table, presence tracking |
+| `src/rooms.ts` | In-memory room table, presence tracking, one-entry-per-name-per-room invariant |
+| `src/validate.ts` | `join` argument validation (types, length caps, room-id charset, control characters) |
+| `src/heartbeat.ts` | WebSocket liveness: ping sweep + termination of half-open connections |
 | `src/volumes.ts` | Team-aware distance→volume falloff math (`computeTieredVolumes`), reading coords from room state. Older entry points remain for backward compatibility. |
 | `src/turn.ts` | Cloudflare TURN credential fetcher + cache + coturn HMAC fallback |
 | `src/rate-limit.ts` | Token-bucket and concurrency limiters used across endpoints. No external dep. |
 | `src/types.ts` | Shared request/response types |
 
-74 tests under `server/tests/` (tiered-proximity + team room-state, TURN credentials, and rate-limiting incl. an end-to-end per-player isolation test).
+165 tests under `server/tests/` (tiered-proximity + team room-state, `join` validation, heartbeat reaping, TURN credentials, and rate-limiting incl. client-IP trust resolution and an end-to-end per-player isolation test).
 
 **Rate-limit defaults** (all in `src/rate-limit.ts::LIMITS`):
 - `/turn-credentials`: 60 req/min per IP
@@ -161,11 +165,11 @@ Manual checks (Settings → Updates → CHECK) skip the launch delay and the Aut
 
 | Service | Responsibility |
 |---|---|
-| `Orchestrator` | Game-state polling, session lifecycle, broadcast cadence, scanning-mode passthrough, peer state registry. The wiring layer between everything else. |
-| `TrackingService` | Minimap CV pipeline. State machine described above. |
-| `ChampionClassifier` | Champion classifier (a small CNN run via ONNX Runtime Web) — the champion-identity signal for tracking. |
+| `Orchestrator` | Game-state polling, session lifecycle, broadcast cadence, scanning-mode passthrough, peer state registry. The wiring layer between everything else. Its collaborators and its three loop periods come from an `OrchestratorDeps` record with a `defaultDeps()` fallback, so `new Orchestrator()` — the app's only construction — builds exactly what it always did, while tests can substitute fakes. `stop()` is the counterpart to `start()`; the app has no shutdown path that calls it. |
+| `TrackingService` | Minimap CV pipeline. State machine described above. Constructed with the League game window's client rect (a `ScreenRect`), not a width/height pair — the capture square is derived from that rect's origin and height. Frames come from an injectable `FrameSource` (default: the Tauri capture command) and the identity signal from a `BlobScorer` (default: `ChampionClassifier`), which is what lets `tests/cv/` drive the real pipeline over synthesized minimaps. |
+| `ChampionClassifier` | Champion classifier (a small CNN run via ONNX Runtime Web) — the champion-identity signal for tracking. Implements `BlobScorer`, and owns the one canvas-dependent step in the scan path: it builds the `ImageData` its crop packing needs, so every stage between capture and scoring is DOM-free plain array work. |
 | `AudioService` | WebRTC audio + per-peer volume control. Input mode toggle (Always Open / PTT). Mic acquisition with selected device. Output via shared `AudioContext`. Noise suppression handled natively by Chromium. |
-| `SignalingService` | WebSocket presence + signal relay. Auto-reconnect with exponential backoff. |
+| `SignalingService` | WebSocket presence + signal relay. Auto-reconnect with exponential backoff, except on close code 4000 (the room+name was taken over by another connection), which is terminal. |
 | `PeerConnection` | Single peer's `RTCPeerConnection` wrapper. EMA-smoothed gain, periodic `getStats()` logging, ICE-restart on failure, ICE-transport-policy reading from privacy settings. |
 | `VolumeClient` | Calls `/compute-volumes` with `{ myPosition, roomId, name }` and applies the returned per-peer volumes. |
 | `GameStateService` | Wraps Tauri commands for LCU + Live Client Data into a TypeScript surface. |
@@ -180,20 +184,34 @@ Not services in their own right — small support modules consumed by the servic
 | Module | Used by | Purpose |
 |---|---|---|
 | `src/services/tracking-helpers.ts` | `TrackingService` | Pure scoring/selection math used by `handleLocked`. Unit-tested in isolation. |
+| `src/services/frame-source.ts` | `tracking.ts` | `FrameSource` — one capture, returned as the raw wire bytes `capture.rs` writes. Deliberately not a decoded frame: decoding, the header/bounds agreement check and the bounds resync stay in the tracker, so a test frame source exercises them too. |
 | `src/services/blob-types.ts` | `tracking.ts`, `tracking-helpers.ts` | Shared `Blob` interface. Lives outside `tracking.ts` so the helpers can import it without a circular reach back. |
+| `src/core/capture-frame.ts` | `tracking.ts` | Decodes the raw `capture_minimap` byte frame into a `CaptureFrame` (`width`, `height`, `Uint8ClampedArray`). DOM-free — it is a view over the transferred buffer, not an `ImageData`. |
+| `src/core/identity.ts` | `game-state.ts`, `orchestrator.ts`, `streamer-detect.ts` | Reads whichever Riot ID fields a patch of League provides into one comparable `Identity`, and matches the local player against the roster. |
+| `src/core/map-detect.ts` | `game-state.ts` | Resolves the map from `mapNumber` / `mapName` / `gameMode`, or refuses. A refusal is what disables proximity rather than defaulting to Summoner's Rift geometry. |
+| `src/core/streamer-detect.ts` | `game-state.ts`, `orchestrator.ts` | Streamer-mode heuristic (displayed name equals champion name, and, where the roster carries tag lines, no tag line on that player). |
 | `src/core/window-globals.ts` | `overlay.ts`, `background.ts`, `orchestrator.ts` | `declare global { interface Window { … } }` for the two app-specific properties used as a cross-module bus (`__proxchatRunUpdateCheck`, `__lolproxchat_debug_enabled`). Imported side-effect-only. |
+
+### Where the seams are, and why
+
+Two of the services above take their collaborators as constructor arguments rather than building them inline, and both defaults are exactly the expression that used to be inline — the app constructs them the same way it always did.
+
+- `TrackingService(gameRect, mapType, frameSource?)` plus `setClassifier(scorer)` is what makes the CV pipeline runnable outside the WebView. Everything from `decodeCaptureFrame` down is plain array work, so `tests/cv/` feeds synthesized minimaps through the real colour classification, blob detection, scoring and state machine and checks the reported game coordinates against known ground truth.
+- `Orchestrator(deps?)` is what makes the session lifecycle runnable without I/O: the game-state transition table, interval teardown and audio-monitor cleanup run under fake timers in the fast suite, and `tests/e2e/` stands two whole clients up against the real built signaling server.
+
+See [`CONTRIBUTING.md`](../CONTRIBUTING.md) § "Testing" for what each suite covers, and [`docs/manual-test-checklist.md`](manual-test-checklist.md) for what only a real match on Windows can prove.
 
 ## Key Rust commands (under `src-tauri/src/`)
 
 | Command (file) | Responsibility |
 |---|---|
-| `capture::set_capture_bounds`, `capture::capture_minimap` | Win32 GDI BitBlt of a bounded screen rect into an RGBA data URL. |
+| `capture::set_capture_bounds`, `capture::capture_minimap` | Win32 GDI BitBlt of a bounded screen rect into a raw RGBA byte frame (8-byte width/height header, then top-down RGBA), returned as a Tauri `Response` and produced on a blocking worker. The source is `GetDC(NULL)` — the device context for the whole **virtual** screen — so bounds on a monitor left of or above the primary one (negative coordinates) read back real pixels rather than black. Bounds that do not intersect the virtual screen are rejected with a descriptive error. |
 | `lcu::check_league_running`, `lcu::get_game_state`, `lcu::get_live_client_data`, `lcu::read_league_config_file`, `lcu::get_league_install_dir` | LCU + Live Client Data polling. Install-dir resolution via the LCU lockfile path. `read_league_config_file` takes no arguments and reads only `Config/game.cfg` — Rust computes the path so the frontend can't supply arbitrary file paths. |
 | `updater::check_for_update`, `updater::download_and_apply_update` | GitHub Releases check + in-place exe swap. Handles the `--complete-update <old-path>` startup arg. |
 | `main::position_scanner`, `main::hide_scanner` | Auto-pin the scanner window over the detected minimap region. |
-| `main::get_screen_size` | Primary monitor resolution for DPI math. |
+| `game_window::get_game_window_info` | Locates the League **game** window (`FindWindowW("RiotWindowClass")`, rejecting invisible/minimized handles) and returns its client rect in screen coordinates plus the virtual- and primary-screen rects, the matched window's title and owning process, and any Win32 error. All capture geometry derives from this. Plausibility is judged in `src/core/game-window.ts`, not here, so jest can cover it. |
 | `main::set_panel_size` | Reports the panel's current hit-rect size to the click-through polling loop. |
-| `main::append_log` | Writes a single line to the rolling debug log file. |
+| `main::append_log`, `main::append_log_lines` | Writes to the rolling debug log file. The frontend buffers console output and calls `append_log_lines`, which takes one lock and one flush per batch; the single-line `append_log` stays registered for version skew between the bundle and the binary. |
 | `main::open_log_folder` | Launches Explorer at the log directory. |
 
 `main.rs` also runs the cursor-position polling loop (30 Hz, skipped while LMB held to avoid tearing down a native window-drag), installs the low-level keyboard hook for the rebindable push-to-talk and toggle-mute keys (push-to-talk defaults to Caps Lock), opens the rolling log file at startup with 3-session rotation, and routes `tauri::WindowEvent::CloseRequested` on any window to `app.exit(0)`.

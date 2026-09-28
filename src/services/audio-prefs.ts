@@ -14,14 +14,20 @@ export function setAllyProximity(enabled: boolean): void {
   else localStorage.removeItem(ALLY_PROXIMITY_KEY);
 }
 
-// "Voice on camera" (#36): hear the map from wherever the camera is looking
-// rather than from the champion's own position. Listen-only and asymmetric —
-// peers still compute their distance to your CHAMPION, so panning your camera
-// changes what you hear and never what anyone hears from you.
+// "Voice on camera" (#36): hear the map from wherever the camera is looking as
+// well as from the champion's own position.
+//
+// One-way and mutual, both deliberately. One-way because the camera is a point
+// you listen from, never one you are heard at: pan onto a fight and you hear
+// it, while the people in it hear you only from where your champion stands.
+// Mutual because a camera only counts between two players who have both
+// turned this on: with it off you publish no camera, nobody else's can reach
+// you, and you are heard only by players actually near you on the map.
 //
 // Default off, and deliberately so: it widens what the app can tell you about
 // enemies beyond your champion's own vision, which is the boundary
-// docs/compliance.md draws. Opting in is the user's call to make knowingly.
+// docs/compliance.md draws. Opting in is the user's call to make knowingly,
+// and someone who leaves it off is not exposed by anyone else's choice.
 const CAMERA_LISTEN_KEY = 'lolproxchat.cameraListen';
 
 export function getCameraListen(): boolean {

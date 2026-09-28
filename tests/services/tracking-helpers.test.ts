@@ -10,6 +10,7 @@ import {
   nextClassifierEma,
   computeNearFieldPx,
   computeViewportCenter,
+  describeViewportCenter,
 } from '../../src/services/tracking-helpers';
 import type { Blob } from '../../src/services/blob-types';
 
@@ -60,22 +61,64 @@ describe('computeReacquireThreshold', () => {
 });
 
 describe('computeBlobScore', () => {
-  test('with classifier: pos + cls dominate, weights sum ~1.0', () => {
-    const s = computeBlobScore({ posScore: 1, clsScore: 1, whiteScore: 1, peerScore: 1 }, true);
-    expect(s).toBeCloseTo(1.0, 5);
+  test('with classifier: an all-1 candidate scores exactly 1 (weights are normalized)', () => {
+    const s = computeBlobScore({ posScore: 1, clsScore: 1, whiteScore: 1 }, true);
+    expect(s).toBeCloseTo(1.0, 12);
+  });
+
+  test('without classifier: an all-1 candidate scores exactly 1', () => {
+    const s = computeBlobScore({ posScore: 1, clsScore: 1, whiteScore: 1 }, false);
+    expect(s).toBeCloseTo(1.0, 12);
   });
 
   test('without classifier: clsScore is ignored entirely', () => {
     // cls=0 (modified) and cls=1 should both produce the same score when no classifier
-    const a = computeBlobScore({ posScore: 0.5, clsScore: 0, whiteScore: 0.5, peerScore: 0.5 }, false);
-    const b = computeBlobScore({ posScore: 0.5, clsScore: 1, whiteScore: 0.5, peerScore: 0.5 }, false);
+    const a = computeBlobScore({ posScore: 0.5, clsScore: 0, whiteScore: 0.5 }, false);
+    const b = computeBlobScore({ posScore: 0.5, clsScore: 1, whiteScore: 0.5 }, false);
     expect(a).toBe(b);
   });
 
   test('higher posScore strictly wins (ceteris paribus)', () => {
-    const lo = computeBlobScore({ posScore: 0.2, clsScore: 0.5, whiteScore: 0.5, peerScore: 0.5 }, true);
-    const hi = computeBlobScore({ posScore: 0.8, clsScore: 0.5, whiteScore: 0.5, peerScore: 0.5 }, true);
+    const lo = computeBlobScore({ posScore: 0.2, clsScore: 0.5, whiteScore: 0.5 }, true);
+    const hi = computeBlobScore({ posScore: 0.8, clsScore: 0.5, whiteScore: 0.5 }, true);
     expect(hi).toBeGreaterThan(lo);
+  });
+
+  // Single-term probes pin each renormalized weight to a literal value. A
+  // ranking-equivalence test cannot do this: dividing every surviving term by
+  // ANY single constant preserves ordering, so only the absolute values catch
+  // a wrong (or missing) divisor after the dead peer term was dropped.
+  describe('renormalized weights (peer term removed)', () => {
+    test('with classifier: pos 0.35/0.85, cls 0.30/0.85, white 0.20/0.85', () => {
+      expect(computeBlobScore({ posScore: 1, clsScore: 0, whiteScore: 0 }, true))
+        .toBeCloseTo(0.4117647, 6);
+      expect(computeBlobScore({ posScore: 0, clsScore: 1, whiteScore: 0 }, true))
+        .toBeCloseTo(0.3529412, 6);
+      expect(computeBlobScore({ posScore: 0, clsScore: 0, whiteScore: 1 }, true))
+        .toBeCloseTo(0.2352941, 6);
+    });
+
+    test('without classifier: pos 0.45/0.70, white 0.25/0.70', () => {
+      expect(computeBlobScore({ posScore: 1, clsScore: 0, whiteScore: 0 }, false))
+        .toBeCloseTo(0.6428571, 6);
+      expect(computeBlobScore({ posScore: 0, clsScore: 0, whiteScore: 1 }, false))
+        .toBeCloseTo(0.3571429, 6);
+    });
+
+    test('the surviving terms keep their pre-removal ratios exactly', () => {
+      // pos:cls:white was 0.35:0.30:0.20 with the classifier and 0.45:-:0.25
+      // without it. Renormalizing must not re-rank anything, so the ratios —
+      // not just the ordering — have to survive.
+      const pos = computeBlobScore({ posScore: 1, clsScore: 0, whiteScore: 0 }, true);
+      const cls = computeBlobScore({ posScore: 0, clsScore: 1, whiteScore: 0 }, true);
+      const white = computeBlobScore({ posScore: 0, clsScore: 0, whiteScore: 1 }, true);
+      expect(pos / cls).toBeCloseTo(0.35 / 0.30, 10);
+      expect(cls / white).toBeCloseTo(0.30 / 0.20, 10);
+
+      const posNo = computeBlobScore({ posScore: 1, clsScore: 0, whiteScore: 0 }, false);
+      const whiteNo = computeBlobScore({ posScore: 0, clsScore: 0, whiteScore: 1 }, false);
+      expect(posNo / whiteNo).toBeCloseTo(0.45 / 0.25, 10);
+    });
   });
 });
 
@@ -83,7 +126,6 @@ describe('pickBestBlobInRange', () => {
   const noScores = {
     cls: () => 0.5,
     white: () => 0.5,
-    peer: () => 0.5,
   };
 
   test('picks the blob closest to the predicted position', () => {
@@ -174,7 +216,7 @@ describe('pickBestBlobInRange', () => {
     const lastReg = { x: 28, y: 308 };
     const predicted = { x: 28, y: 308 };
     const maxJumpPx = computeMaxJumpPx(30, /*holdStartMs*/ 0, /*now*/ 1000);
-    const deadClassifier = { cls: () => 0.0, white: () => 0.8, peer: () => 1.0 };
+    const deadClassifier = { cls: () => 0.0, white: () => 0.8 };
 
     const phase1 = pickBestBlobInRange(
       [blob], lastReg, predicted, maxJumpPx, /*hasClassifier*/ true, deadClassifier,
@@ -347,5 +389,55 @@ describe('computeViewportCenter (#36 voice on camera)', () => {
   test('guards against a mask smaller than the stated region', () => {
     expect(computeViewportCenter(new Uint8Array(10), W, H)).toBeNull();
     expect(computeViewportCenter(new Uint8Array(0), 0, 0)).toBeNull();
+  });
+});
+
+describe('describeViewportCenter — why a camera frame missed', () => {
+  const W = 340, H = 340;
+
+  function mkMask(left: number, top: number, right: number, bottom: number): Uint8Array {
+    const mask = new Uint8Array(W * H);
+    for (let x = left; x <= right; x++) { mask[top * W + x] = 1; mask[bottom * W + x] = 1; }
+    for (let y = top; y <= bottom; y++) { mask[y * W + left] = 1; mask[y * W + right] = 1; }
+    return mask;
+  }
+
+  // These four reasons need opposite fixes — a threshold that is too strict
+  // versus a rectangle that is the wrong shape — so a bug report has to be able
+  // to tell them apart. Before this, every one of them logged "not readable".
+  test('an empty mask reports no-marked-pixels, not a shape failure', () => {
+    const r = describeViewportCenter(new Uint8Array(W * H), W, H);
+    expect(r.centre).toBeNull();
+    expect(r.miss).toBe('no-marked-pixels');
+    expect(r.markedPixels).toBe(0);
+  });
+
+  test('marked pixels that form no rectangle report no-opposing-edges', () => {
+    // A single long horizontal streak: pixels exist, but there is no second
+    // edge to pair it with.
+    const mask = new Uint8Array(W * H);
+    for (let x = 100; x < 180; x++) mask[150 * W + x] = 1;
+    const r = describeViewportCenter(mask, W, H);
+    expect(r.centre).toBeNull();
+    expect(r.miss).toBe('no-opposing-edges');
+    expect(r.markedPixels).toBeGreaterThan(0);
+  });
+
+  test('a box spanning most of the minimap reports span-too-large', () => {
+    const r = describeViewportCenter(mkMask(5, 5, 334, 334), W, H);
+    expect(r.centre).toBeNull();
+    expect(r.miss).toBe('span-too-large');
+  });
+
+  test('a real camera box reports a centre and no miss', () => {
+    const r = describeViewportCenter(mkMask(100, 150, 166, 187), W, H);
+    expect(r.centre).toEqual({ cx: 133, cy: 168.5 });
+    expect(r.miss).toBeUndefined();
+    expect(r.markedPixels).toBeGreaterThan(0);
+  });
+
+  test('computeViewportCenter still returns just the centre', () => {
+    expect(computeViewportCenter(mkMask(100, 150, 166, 187), W, H)).toEqual({ cx: 133, cy: 168.5 });
+    expect(computeViewportCenter(new Uint8Array(W * H), W, H)).toBeNull();
   });
 });
