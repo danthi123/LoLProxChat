@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.5.9] — 2026-09-28
+
 ### Notes
 - **Proximity audio does not respect fog of war, and cannot at present.** An enemy in a brush or behind a wall is as audible as one in the open at the same distance. League's client API reports positions but nothing about vision, so there is no signal to gate on; modelling it would need a static terrain mesh and line-of-sight tests, which is not implemented. [`docs/compliance.md`](docs/compliance.md) now says so directly rather than claiming no fog-of-war reveals.
 

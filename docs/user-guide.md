@@ -74,6 +74,7 @@ The log is plain text. It contains your summoner name and nearby players' summon
 | Panel sits in the middle of the screen | No game detected yet, or tracking hasn't locked on. The panel's status text tells you which. |
 | Panel sits above the minimap instead of beside it | The detected minimap bounds are off. Turn on **Debug** and check the tracking log lines. (The draggable panel never auto-positions — only the minimap overlay does.) |
 | Panel says it can't find the League window | League is in true fullscreen, or minimized. Switch to **Borderless** in Video Settings. |
+| An enemy you're fighting up close cuts out for a few seconds | Fixed in v0.5.9 — update. Your minimap icons overlapping made the app think you had recalled. If it still happens, attach a log with the game time: it now records what the tracker could see at that moment. |
 | Tracking never locks when League is on a second monitor | Fixed in v0.5.9 — update. Older builds only ever looked at the primary monitor, so the capture region landed on the wrong display. |
 | Tracking never locks at a very large minimap | The debug log says `capture square is only NNNpx`. Lower **MinimapScale** in League's HUD settings. |
 | Audio cuts out or crackles | Usually the minimap scan competing for the main thread at a high scan rate. Lower the **Scan Rate** slider to ~50 (Debug). |
