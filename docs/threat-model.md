@@ -69,6 +69,11 @@ The client-side remnant of this idea — a peer-avoidance penalty in the tracker
 - A modified client can broadcast a fake position to make itself appear at base, at an enemy's location, or anywhere else.
 - This is fundamentally unfixable without Riot exposing authoritative game state to third-party tools (they don't).
 
+### Dead players hear and are heard at their body
+
+- While dead, a client keeps publishing the position it last saw its champion at (none, if it had already lost track), for the whole death timer, so enemies near the body hear the dead player and the dead player hears them. That is information the stock client withholds from a dead player (see [`compliance.md`](compliance.md) § "While dead"). It is fixed-point — the body does not move — and bounded by `MAX_HEARING_RANGE` like everything else.
+- The server does not know about death at all; it scores whatever position the client publishes. A modified client could equally publish any position while dead, as it can while alive (see "Single-client self-reported position trust").
+
 ### "Voice on camera" widens the stock client's own reach (opt-in on both sides, one-way)
 
 - With `Voice on camera` enabled, a client publishes its camera centre to room state alongside its champion position, and hears from both points. An unmodified client can therefore hear enemies its champion has no vision of, by panning the camera — the fog-of-war reveal that [`compliance.md`](compliance.md) otherwise rules out. That is the feature working as designed, not an attack; it ships off by default and the setting says so.

@@ -70,6 +70,9 @@ export class TrackingService {
   private lastPosition: Position | null = null;
   private lastPositionUpdateMs = 0;
   private deathPosition: Position | null = null;
+  // The last position that came from actually seeing us (or the covered-icon
+  // anchor) rather than from extrapolation — where onDeath puts the body.
+  private lastSeenPosition: Position | null = null;
   private expectedIconDiam = 0;
 
   // Velocity prediction (smoothed over recent frames)
@@ -123,6 +126,8 @@ export class TrackingService {
   // the last frame we saw it on showed it overlapped AND shrunk — the signature
   // of an icon being covered, as opposed to vanishing whole (recall, teleport).
   private fullIconPixels = 0;
+  private iconPixelSamples: number[] = [];
+  private lastIconSampleMs = 0;
   // Same, for the bounding box — what coverCorrectedCentre measures against.
   private fullIconW = 0;
   private fullIconH = 0;
@@ -131,6 +136,9 @@ export class TrackingService {
   // This frame's red blobs that could be enemy icons over ours — looser than
   // the icon filter, see isPossibleOccluder.
   private occluderBlobs: Blob[] = [];
+  // Whether this frame showed anything at all on the minimap — any icon or
+  // structure of either colour. See the no-teal branch of handleLocked.
+  private minimapReadable = true;
   // When we successfully tracked a blob that moved >3px from last tick.
   // Used to make Phase 2 re-acquisition stricter when stationary, so we don't
   // teleport the tracking dot onto a minion wave / turret if the icon flickers.
@@ -244,6 +252,7 @@ export class TrackingService {
     }
     this.lastPosition = newPos;
     this.lastPositionUpdateMs = performance.now();
+    if (source !== 'extrapolate') this.lastSeenPosition = newPos;
   }
   getFilteredImageUrl(): string | null { return this.filteredImageUrl; }
   /** Seconds since the last successful frame-to-frame lock, or 0 if currently tracking. */
@@ -328,6 +337,7 @@ export class TrackingService {
     this.holdReason = null;
     this.resetOcclusion();
     this.fullIconPixels = 0;
+    this.iconPixelSamples = [];
   }
 
   /**
@@ -368,6 +378,7 @@ export class TrackingService {
     this.holdReason = null;
     this.resetOcclusion();
     this.fullIconPixels = 0;
+    this.iconPixelSamples = [];
   }
 
   loadChampionTemplate(_championName: string): void {
@@ -518,20 +529,37 @@ export class TrackingService {
     }
   }
 
+  /**
+   * We died: stay where we died until onRespawn.
+   *
+   * The orchestrator learns of a death from a 3s poll, so by now our icon may
+   * already have been gone for a moment and the tracker holding — possibly
+   * extrapolating away from the body, possibly already past the point where
+   * the orchestrator disowns the position. None of that means anything once we
+   * know why the icon went: the position becomes the last place the tracker
+   * actually saw us (or the covered-icon anchor), and any hold is cleared so
+   * the disown clock cannot run out partway through the death timer. The
+   * orchestrator re-owns the position on its next tick.
+   *
+   * Until v0.5.10 this was never called (death was never detected), and a
+   * death handed a covered-icon episode back to an ordinary hold — matching
+   * what an undetected death did. With death detected, both now simply hold
+   * the body's position.
+   */
   onDeath(): void {
     if (this.state === TrackingState.DEAD) return;
-    this.deathPosition = this.lastPosition;
+    // Only a tracker that has us LOCKED knows where the body is. A tracker that
+    // is SCANNING gave up on its last position — possibly long ago, possibly in
+    // another lane — so there is no body to be at: the position is cleared and
+    // the orchestrator stays team-only until respawn.
+    this.deathPosition = this.state === TrackingState.LOCKED
+      ? (this.lastSeenPosition ?? this.lastPosition)
+      : null;
+    this.lastPosition = this.deathPosition;
     this.state = TrackingState.DEAD;
-    // Died while covered (common: melee fights are where icons overlap). The
-    // episode would otherwise freeze here — nothing is re-evaluated while DEAD
-    // — and keep our position owned at the killer's feet until respawn. Hand
-    // the time back to an ordinary hold from when our icon vanished, which is
-    // exactly what happens to a death that was not covered.
-    if (this.occluded) {
-      this.holdStartMs = this.occludedSinceMs;
-      this.holdReason = 'no-match';
-      this.occluded = false;
-    }
+    this.holdStartMs = 0;
+    this.holdReason = null;
+    this.resetOcclusion();
   }
 
   onRespawn(): void {
@@ -539,6 +567,7 @@ export class TrackingService {
     this.state = TrackingState.SCANNING;
     this.lastPixelPos = null;
     this.deathPosition = null;
+    this.lastSeenPosition = null;
     this.lockedTickCount = 0;
     this.scanFrameCount = 0;
     this.scanStartMs = performance.now();
@@ -887,12 +916,13 @@ export class TrackingService {
    */
   async tick(): Promise<void> {
     if (this.state === TrackingState.DEAD) {
-      // Ahead of the tick guard and the dt bookkeeping on purpose: there is
-      // nothing on screen to track, so a dead champion should cost no capture —
-      // and the overlay still needs a position every tick while you wait.
+      // Ahead of the tick guard and the dt bookkeeping on purpose: there is no
+      // champion on screen to track — and the overlay still needs a position
+      // every tick while you wait.
       if (this.deathPosition && this.onPositionUpdate) {
         this.onPositionUpdate(this.deathPosition);
       }
+      await this.deadCameraTick();
       return;
     }
 
@@ -917,6 +947,32 @@ export class TrackingService {
       }
     } catch (err) {
       this.logCaptureError('[Tracking] capture_minimap failed:', err);
+    } finally {
+      this.tickRunning = false;
+    }
+  }
+
+  /**
+   * While dead, keep reading only the camera rectangle, a few times a second,
+   * so "voice on camera" follows where the player is watching exactly as it
+   * does while alive. Skipped entirely with the setting off, so a dead
+   * champion otherwise still costs no capture. Without this the camera froze
+   * at the moment of death for the whole timer.
+   */
+  private lastDeadCameraMs = 0;
+  private async deadCameraTick(): Promise<void> {
+    if (!this.cameraTrackingEnabled || !this.minimapRegion || this.tickRunning) return;
+    const now = performance.now();
+    if (now - this.lastDeadCameraMs < 200) return;
+    this.lastDeadCameraMs = now;
+    this.tickRunning = true;
+    try {
+      const frame = decodeCaptureFrame(await this.frameSource.capture());
+      if (frame.width !== this.captureBounds.width || frame.height !== this.captureBounds.height) return;
+      const { viewportMask } = this.buildWhiteMasks(frame, this.minimapRegion);
+      this.updateCameraPosition(viewportMask, this.minimapRegion);
+    } catch (err) {
+      this.logCaptureError('[Tracking] capture while dead failed:', err);
     } finally {
       this.tickRunning = false;
     }
@@ -979,6 +1035,7 @@ export class TrackingService {
     const allBlobs = this.findBlobs(mask, region.width, region.height);
     const iconBlobs = this.filterIconBlobs(allBlobs);
     this.occluderBlobs = allBlobs.filter(b => isPossibleOccluder(b, this.expectedIconDiam));
+    this.minimapReadable = allBlobs.length > 0;
 
     // Regenerate the debug-mode filtered image at 5Hz (scan-rate independent).
     // This is what makes the debug overlay feel "live" without paying the
@@ -1193,7 +1250,20 @@ export class TrackingService {
       if (this.lockedTickCount === 0) {
         console.log('[Tracking] Extrapolating position (no teal blobs) ' + this.describeLoss(tealBlobs, redBlobs, lastRegion));
       }
-      this.extrapolatePosition(region, 'no-blobs');
+      // Our icon is missing with no other own-team icon in sight. If anything
+      // else on the minimap is readable (enemy icons, structures), the capture
+      // is fine and we are simply not there: a 'no-match', disowned after 2s.
+      // Only a minimap showing nothing at all is the capture failing, which
+      // earns the longer 5s wait. This used to be decided on own-team icons
+      // alone, on the premise that a real game always draws four allies — not
+      // true in a 1v1, where it made every recall take 5s to go quiet.
+      //
+      // Except with an enemy icon sitting right where we vanished: that is
+      // most likely a cover the occlusion check did not catch (an enemy that
+      // landed on us in one frame, or came in diagonally), and a recall under
+      // an enemy's icon is the rarer case — so it keeps the longer wait.
+      const enemyOnUs = !!findOccluder(redBlobs, lastRegion, this.expectedIconDiam);
+      this.extrapolatePosition(region, this.minimapReadable && !enemyOnUs ? 'no-match' : 'no-blobs');
       return;
     }
 
@@ -1332,26 +1402,35 @@ export class TrackingService {
   private noteIconCoverage(blob: Blob, overlapping: boolean): void {
     this.lastSeenPixels = blob.pixels;
     // Learn our icon's usual size only from blobs that look like ONE whole
-    // icon. An ally's icon merged with ours doubles the count, and an inflated
-    // baseline makes any nearby enemy look like it is covering us — hence the
-    // size and 1.3x caps. An icon cut off by the minimap's edge (the fountain
-    // sits in a corner) is the opposite problem: learnt from, it drags the
-    // baseline down, the 1.3x cap then refuses every full-size frame after,
-    // and no real cover ever looks shrunk enough. So edge-touching blobs are
-    // not learnt from at all.
+    // icon: not overlapped, not clipped by the minimap's edge (the fountain sits
+    // in a corner), and no bigger than an icon (an ally merged with ours).
+    //
+    // The pixel baseline is the median of recent samples, one every 250ms over
+    // ~10s. Real icons vary a lot with what is behind them — a v0.5.9 game
+    // logged 106 to 338 pixels for the same unobstructed icon, terrain pixels
+    // joining the ring after dilation — and the previous EMA with a 1.3x cap
+    // on growth sank to 130 and refused every larger sample from then on, which
+    // made a real cover almost impossible to recognise. A median rides out a
+    // brief stacked ally without needing a cap.
     const bw = blob.maxX - blob.minX + 1;
     const bh = blob.maxY - blob.minY + 1;
     const region = this.minimapRegion;
     const atEdge = !!region && (blob.minX <= 1 || blob.minY <= 1 ||
       blob.maxX >= region.width - 2 || blob.maxY >= region.height - 2);
     const singleIcon = !atEdge &&
-      bw <= this.expectedIconDiam * 1.2 && bh <= this.expectedIconDiam * 1.2 &&
-      (this.fullIconPixels === 0 || blob.pixels <= this.fullIconPixels * 1.3);
+      bw <= this.expectedIconDiam * 1.2 && bh <= this.expectedIconDiam * 1.2;
     if (!overlapping && singleIcon) {
       const ema = (v: number, x: number) => (v > 0 ? v * 0.9 + x * 0.1 : x);
-      this.fullIconPixels = ema(this.fullIconPixels, blob.pixels);
       this.fullIconW = ema(this.fullIconW, bw);
       this.fullIconH = ema(this.fullIconH, bh);
+      const now = performance.now();
+      if (this.iconPixelSamples.length === 0 || now - this.lastIconSampleMs >= 250) {
+        this.lastIconSampleMs = now;
+        this.iconPixelSamples.push(blob.pixels);
+        if (this.iconPixelSamples.length > 40) this.iconPixelSamples.shift();
+        const sorted = [...this.iconPixelSamples].sort((a, b) => a - b);
+        this.fullIconPixels = sorted[Math.floor(sorted.length / 2)];
+      }
     }
     this.lastSeenPartlyCovered = overlapping && this.fullIconPixels > 0 &&
       blob.pixels < this.fullIconPixels * COVERED_PIXEL_FRACTION;

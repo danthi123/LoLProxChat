@@ -310,11 +310,14 @@ export function isPossibleOccluder(b: Blob, expectedIconDiam: number): boolean {
 /**
  * Why the tracker is holding instead of following a blob frame to frame.
  *
- * 'no-blobs' — the minimap had no own-team icons at all. A real game always
- *   draws four allies there, so this says the capture failed or something
+ * 'no-blobs' — nothing at all was readable on the minimap: no icon or
+ *   structure of either colour. That says the capture failed or something
  *   covered the minimap, NOT that we moved.
- * 'no-match' — icons were present and none was us. This one does say we
- *   moved; a recall is the case that matters.
+ * 'no-match' — the minimap was readable and our icon was not on it. This one
+ *   does say we moved; a recall is the case that matters. (Until v0.5.10 a
+ *   frame with enemy icons and structures but no own-team icon counted as
+ *   'no-blobs', on the premise that a real game always draws four allies —
+ *   which made every recall in a 1v1 take 5s to go quiet.)
  *
  * `null` means not holding.
  */

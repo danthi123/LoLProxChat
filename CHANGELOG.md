@@ -4,6 +4,14 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Fixed
+- **Deaths were never detected, in any version.** The app read `isDead` from League's `activePlayer`, which has no such field — it exists only on the `allPlayers` entries. So a death played out as the tracker losing your icon: you stayed audible for 2-5 seconds, were then cut off from enemies in both directions, and the tracker rescanned the map — which testers reported as dying making voice behave inconsistently. Death is now read from your own roster entry, checked once a second. **While dead you stay where you died, in both directions, for the whole death timer** (if the app had already lost track of you when you died, there is no body and you are team-only until you respawn). You leave the body the moment you respawn — scheduled from League's own `respawnTimer` instead of waiting for the next poll — and are team-only for the moment it takes to find you at the fountain. With Voice on camera on, the camera keeps following where you are watching while dead. Deaths and respawns are now logged. Being heard and hearing at your body while dead is a deliberate widening of what the app reveals; [`docs/compliance.md`](docs/compliance.md) § "While dead" says so.
+- **A recall in a 1v1 took about 5 seconds to go quiet instead of 2.** An icon missing from a minimap with no teammates on it was treated as a possible capture glitch — on the premise that a real game always shows four allies — and given longer to recover. That wait is now kept for a minimap on which nothing at all is readable, or, with no teammate on the minimap, an enemy icon within an icon of where yours vanished (a cover the app did not catch); an icon missing from an otherwise readable minimap is treated like any other lost position, as it already was in a full game.
+- **Recognising an icon covered by an enemy's got harder as a game went on.** The app's idea of how many pixels your icon normally has could only creep upward slowly, so a stretch over dark terrain dragged it down and brighter terrain never brought it back (one log settled at 130 for an icon that measured up to 338). It is now the median of recent samples (at least the last 10 seconds).
+
+### Notes
+- **With Voice on camera on, you keep hearing wherever your camera is.** After a recall with an unlocked camera, that is still the lane you left, until you move the camera. That is the setting working as designed (it is one-way: they do not hear you), but it is easy to mistake for the app still placing you in lane.
+
 ## [v0.5.9] — 2026-09-28
 
 ### Notes

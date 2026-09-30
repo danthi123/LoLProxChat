@@ -91,7 +91,14 @@ export class ScriptedTracker {
   getDetectedMinimapScreenBounds(): null { return null; }
   getScanFps(): number { return this.fps; }
   getGameRect(): ScreenRect { return this.gameRect; }
-  onDeath(): void { this.deaths++; this.state = TrackingState.DEAD; }
+  /** Mirrors the real onDeath: a LOCKED tracker keeps the body where it is and
+   *  clears any hold; any other state has no body to keep. */
+  onDeath(): void {
+    this.deaths++;
+    if (this.state !== TrackingState.LOCKED) this.position = null;
+    this.state = TrackingState.DEAD;
+    this.holdSec = 0;
+  }
   onRespawn(): void { this.respawns++; this.state = TrackingState.SCANNING; }
 
   /** Walk the champion to a new game coordinate. */
