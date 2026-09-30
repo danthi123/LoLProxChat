@@ -70,6 +70,8 @@ function vanished(count: number, over: SceneSpec = BACKDROP): SceneSpec[] {
 
 /** Frames with no teal blob anywhere — nothing for the tracker to follow. */
 const NO_TEAL: SceneSpec = { enemies: BACKDROP.enemies, camera: BACKDROP.camera };
+/** Frames with nothing readable at all — the capture itself failing. */
+const BLANK: SceneSpec = {};
 
 function distance(a: Point, b: Point): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
@@ -216,8 +218,38 @@ describe('why the tracker says it lost us', () => {
   // other (see disownAfterSec), so the tracker has to tell them apart. It is
   // the difference between "the minimap capture failed" and "we are not where
   // we said we were".
-  test('reports no-blobs when the minimap has no own-team icons at all', async () => {
+  test('reports no-blobs when nothing on the minimap is readable at all', async () => {
+    const scenes = renderScenes([...walk(16), ...Array.from({ length: 12 }, () => BLANK)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    const held = records.filter(r => r.holdSec > 0);
+    expect(held.length).toBeGreaterThan(0);
+    expect(held.every(r => r.holdReason === 'no-blobs')).toBe(true);
+  });
+
+  test('reports no-match when the minimap is readable but shows no own-team icon (a 1v1 recall)', async () => {
+    // Until v0.5.10 this was no-blobs, on the premise that a real game always
+    // draws four allies — so in a 1v1 every recall took 5s to go quiet.
     const scenes = renderScenes([...walk(16), ...Array.from({ length: 12 }, () => NO_TEAL)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    const held = records.filter(r => r.holdSec > 0);
+    expect(held.length).toBeGreaterThan(0);
+    expect(held.every(r => r.holdReason === 'no-match')).toBe(true);
+  });
+
+  test('keeps the longer wait when an enemy icon sits where we vanished (a missed cover, 1v1)', async () => {
+    // Review: an enemy icon landing on ours in one frame never shows the
+    // shrinking that starts an occlusion episode. Treated as no-match it cut
+    // audio at 2s where it used to be 5s.
+    const VANISH: Point = at(START, STEP, 15);
+    const ONE_V_ONE: SceneSpec = { camera: BACKDROP.camera, enemies: [{ x: 250, y: 160 }] };
+    const scenes = renderScenes([
+      ...walk(16, START, STEP, ONE_V_ONE),
+      ...Array.from({ length: 12 }, () => ({ ...ONE_V_ONE, self: null, enemiesOnTop: [VANISH] })),
+    ]);
     const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
     const records = await driveTracker(h, scenes);
 
@@ -239,7 +271,7 @@ describe('why the tracker says it lost us', () => {
   test('a hold that starts blind stays no-match once icons come back without us', async () => {
     // The stronger signal wins for the rest of the hold: whatever the first
     // frame looked like, icons returning and still not matching means we moved.
-    const scenes = renderScenes([...walk(16), NO_TEAL, NO_TEAL, ...vanished(10)]);
+    const scenes = renderScenes([...walk(16), BLANK, BLANK, ...vanished(10)]);
     const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
     const records = await driveTracker(h, scenes);
 
@@ -254,6 +286,63 @@ describe('why the tracker says it lost us', () => {
 
     expect(records[records.length - 1].holdSec).toBe(0);
     expect(records[records.length - 1].holdReason).toBeNull();
+  });
+});
+
+describe('dying', () => {
+  // Deaths are detected from a 3s poll, so by the time onDeath arrives the
+  // icon may have been gone a while, the tracker holding and extrapolating.
+  test('puts the body where the tracker last saw us and clears the hold', async () => {
+    const VANISH: Point = at(START, STEP, 15);
+    const scenes = renderScenes([...walk(16), ...vanished(20)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    expect(records[records.length - 1].holdSec).toBeGreaterThan(2);
+
+    h.svc.onDeath();
+    expect(h.svc.getHoldDurationSec()).toBe(0);
+    expect(h.svc.getHoldReason()).toBeNull();
+    expect(distance(gameToTruth(h.svc.getLastPosition()!), VANISH)).toBeLessThanOrEqual(3);
+    jest.advanceTimersByTime(20_000);
+    expect(h.svc.getHoldDurationSec()).toBe(0);
+
+    h.svc.onRespawn();
+    expect(h.svc.getState()).toBe(TrackingState.SCANNING);
+  });
+
+  test('has no body to keep if it had already lost us and was rescanning', async () => {
+    // Review: a tracker in SCANNING gave up on its last position, possibly long
+    // ago and in another lane — taking that as the body would make it live.
+    const scenes = renderScenes([...walk(16), ...vanished(48)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    expect(records[records.length - 1].state).toBe(TrackingState.SCANNING);
+
+    h.svc.onDeath();
+    expect(h.svc.getLastPosition()).toBeNull();
+  });
+
+  test('keeps following the camera while dead, for voice on camera', async () => {
+    // Review: the tracker stopped capturing at death, so the camera the
+    // player listens from froze where they died for the whole timer.
+    const CAM_A = { x: 140, y: 30, w: 110, h: 80 };
+    const CAM_B = { x: 20, y: 160, w: 110, h: 80 };
+    const alive = walk(16, START, STEP, { ...BACKDROP, camera: CAM_A });
+    const dead = Array.from({ length: 16 }, () => ({ ...BACKDROP, self: null, camera: CAM_B }));
+    const scenes = renderScenes([...alive, ...dead]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    h.svc.setCameraTracking(true);
+    await driveTracker(h, scenes.slice(0, 16));
+    const before = h.svc.getCameraPosition();
+    expect(before).not.toBeNull();
+
+    h.svc.onDeath();
+    await driveTracker(h, scenes.slice(16));
+    const after = h.svc.getCameraPosition();
+    expect(h.svc.getState()).toBe(TrackingState.DEAD);
+    expect(after).not.toBeNull();
+    const centreB = truthToGame({ x: CAM_B.x + CAM_B.w / 2, y: CAM_B.y + CAM_B.h / 2 });
+    expect(Math.hypot(after!.x - centreB.x, after!.y - centreB.y)).toBeLessThan(400);
   });
 });
 
@@ -964,19 +1053,22 @@ describe('an enemy icon drawn over ours', () => {
     expect(records[records.length - 1].holdSec).toBeGreaterThan(2);
   });
 
-  test('dying while covered is disowned like any other death, not held until respawn', async () => {
-    // Review round three: nothing is re-evaluated while DEAD, so an episode
-    // in progress at death froze with the position owned at the killer's
-    // feet for the whole death timer.
+  test('dying while covered holds the body where we died, like any other death', async () => {
+    // Before v0.5.10 no death was ever detected, and this handed the episode
+    // back to an ordinary hold to match what an undetected death did. With
+    // death detected, the policy is one rule: stay where you died until you
+    // respawn, heard and hearing from there — no hold, so nothing disowns it.
     const scenes = renderScenes(slideUnder(1, 8));
     const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
-    await driveTracker(h, scenes);
+    const records = await driveTracker(h, scenes);
     expect(logs.some(covering)).toBe(true);
+    const where = records[records.length - 1].px!;
 
     h.svc.onDeath();
-    jest.advanceTimersByTime(3000);
-    expect(h.svc.getHoldDurationSec()).toBeGreaterThan(2);
-    expect(h.svc.getHoldReason()).toBe('no-match');
+    jest.advanceTimersByTime(10_000);
+    expect(h.svc.getState()).toBe(TrackingState.DEAD);
+    expect(h.svc.getHoldDurationSec()).toBe(0);
+    expect(distance(gameToTruth(h.svc.getLastPosition()!), where)).toBeLessThan(1);
   });
 
   test('gives up after MAX_OCCLUDED_MS and falls back to an ordinary hold', async () => {

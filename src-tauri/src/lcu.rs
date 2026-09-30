@@ -10,8 +10,55 @@ pub struct GameState {
     pub is_league_running: bool,
     pub is_in_game: bool,
     pub summoner_name: Option<String>,
+    /// Always false, and kept only so the shape older frontends read does not
+    /// change. It used to be read from `activePlayer.isDead`, which the Live
+    /// Client API has never had — `isDead` exists only on `allPlayers` entries
+    /// — so no death was ever detected. See `players`.
     pub is_dead: bool,
     pub game_flow_phase: String,
+    /// Every roster entry's identity fields plus `isDead` / `respawnTimer`,
+    /// passed through as-is. The frontend picks out the local player with the
+    /// same identity matching it used to start the session (src/core/identity.ts):
+    /// League has spelled these name fields differently across patches, and a
+    /// second, simpler matcher here would be the next thing to silently break.
+    pub players: Vec<LivePlayerState>,
+}
+
+#[derive(Clone, Serialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LivePlayerState {
+    pub summoner_name: Option<String>,
+    pub riot_id: Option<String>,
+    pub riot_id_game_name: Option<String>,
+    pub riot_id_tag_line: Option<String>,
+    pub is_dead: bool,
+    /// Seconds until respawn while dead, per League. 0 when alive.
+    pub respawn_timer: f64,
+}
+
+/// The death-relevant slice of each `allPlayers` entry.
+fn live_player_states(data: &serde_json::Value) -> Vec<LivePlayerState> {
+    data.get("allPlayers").map(player_list_states).unwrap_or_default()
+}
+
+/// Same, from a bare player array (`/liveclientdata/playerlist`).
+fn player_list_states(list: &serde_json::Value) -> Vec<LivePlayerState> {
+    let text = |p: &serde_json::Value, k: &str| p.get(k).and_then(|v| v.as_str()).map(String::from);
+    list.as_array()
+        .map(|players| {
+            players
+                .iter()
+                .map(|p| LivePlayerState {
+                    summoner_name: text(p, "summonerName"),
+                    riot_id: text(p, "riotId"),
+                    riot_id_game_name: text(p, "riotIdGameName"),
+                    riot_id_tag_line: text(p, "riotIdTagLine"),
+                    is_dead: p.get("isDead").and_then(|v| v.as_bool()).unwrap_or(false),
+                    respawn_timer: p.get("respawnTimer").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Common install locations, tried when no LeagueClient process is visible.
@@ -380,6 +427,7 @@ pub async fn get_game_state() -> GameState {
         summoner_name: None,
         is_dead: false,
         game_flow_phase: "None".into(),
+        players: Vec::new(),
     };
 
     let lockfile = find_lockfile();
@@ -417,15 +465,31 @@ pub async fn get_game_state() -> GameState {
                     .or_else(|| player.get("summonerName"))
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                state.is_dead = player
-                    .get("isDead")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
             }
+            state.players = live_player_states(&data);
         }
     }
 
     state
+}
+
+/// Just the roster's identity and death state, for the frontend's once-a-second
+/// death poll while in a game. `/playerlist` rather than `/allgamedata`: the
+/// 3s game-state poll already fetches the whole payload, and death is the only
+/// thing that needs to be fresher than that — the tracker's position is
+/// disowned 2s after it loses the icon, so a death seen only on a 3s poll
+/// often cut a dying player out of enemy audio before putting them back at
+/// their body. Errors are silent: the next poll, or the 3s one, covers them.
+#[tauri::command]
+pub async fn get_live_players() -> Vec<LivePlayerState> {
+    let Some(client) = lcu_http() else { return Vec::new() };
+    match client.get("https://127.0.0.1:2999/liveclientdata/playerlist").send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(list) => player_list_states(&list),
+            Err(_) => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Get full live client data (all players, active player, events).
@@ -449,6 +513,31 @@ pub fn read_league_config_file() -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn death_comes_from_the_roster_not_active_player() {
+        // The real payload shape: activePlayer carries no isDead at all, which is
+        // why reading it there never detected a death.
+        let data = serde_json::json!({
+            "activePlayer": { "riotId": "Me#EUW", "level": 3 },
+            "allPlayers": [
+                { "riotId": "Me#EUW", "riotIdGameName": "Me", "riotIdTagLine": "EUW",
+                  "summonerName": "Me", "isDead": true, "respawnTimer": 12.5 },
+                { "riotId": "You#EUW", "summonerName": "You", "isDead": false, "respawnTimer": 0.0 }
+            ]
+        });
+        let players = live_player_states(&data);
+        assert_eq!(players.len(), 2);
+        assert!(players[0].is_dead);
+        assert_eq!(players[0].respawn_timer, 12.5);
+        assert_eq!(players[0].riot_id.as_deref(), Some("Me#EUW"));
+        assert!(!players[1].is_dead);
+        assert!(live_player_states(&serde_json::json!({})).is_empty());
+        // /playerlist is the same entries as a bare array.
+        let list = player_list_states(&data["allPlayers"]);
+        assert_eq!(list.len(), 2);
+        assert!(list[0].is_dead);
+    }
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

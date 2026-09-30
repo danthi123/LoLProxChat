@@ -5,6 +5,7 @@ import {
   GameSession,
   SessionFailureReason,
   TauriGameState,
+  localDeathState,
 } from './game-state';
 import { SignalingService, SignalMessage, PositionBroadcast } from './signaling';
 import { AudioService } from './audio';
@@ -40,6 +41,8 @@ export interface OrchestratorTimings {
   gameStatePollMs: number;
   volumeTickMs: number;
   configPollMs: number;
+  /** In-game death poll; defaults to 1000. See pollDeath. */
+  deathPollMs?: number;
 }
 
 /**
@@ -107,6 +110,13 @@ export class Orchestrator {
     { sig: string; reason: SessionFailureReason; detail: string; at: number } | null = null;
   private peerStates: Map<string, PeerState> = new Map();
   private volumeTickId: number | null = null;
+  // Fires at the respawn time League gave us when we died — see applyDeathState.
+  private respawnTimerId: ReturnType<typeof setTimeout> | null = null;
+  private deathPollId: number | null = null;
+  private deathPollRunning = false;
+  // When a scheduled respawn last fired, so a poll that read the roster a moment
+  // before League flipped isDead does not kill us again.
+  private respawnedAtMs = 0;
   private configPollId: number | null = null;
   private gameStatePollId: number | null = null;
   private positionTickRunning = false;
@@ -191,15 +201,12 @@ export class Orchestrator {
         await this.pollForLiveClientData();
       }
 
-      // Update death state from Tauri backend
-      if (this.session && state.isDead !== this.session.localPlayer.isDead) {
-        if (state.isDead) {
-          this.session.localPlayer.isDead = true;
-          this.tracking?.onDeath();
-        } else {
-          this.session.localPlayer.isDead = false;
-          this.tracking?.onRespawn();
-        }
+      // Once the 1s death poll is running it is the only source of death state.
+      // Two unordered sources could apply a reading from before the death after
+      // one from after it — "alive" landing late would respawn us mid-death and
+      // lose the body for the rest of the timer.
+      if (this.session && this.deathPollId === null) {
+        this.applyDeathState(localDeathState(state.players, this.session.localPlayer));
       }
 
       if (!state.isInGame) {
@@ -466,6 +473,11 @@ export class Orchestrator {
       this.configPollId = window.setInterval(
         () => this.pollGameGeometry(),
         this.deps.timings.configPollMs,
+      ) as unknown as number;
+
+      this.deathPollId = window.setInterval(
+        () => this.pollDeath(),
+        this.deps.timings.deathPollMs ?? 1000,
       ) as unknown as number;
 
     } catch (e) {
@@ -1001,9 +1013,92 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * Follow the local player's death and respawn.
+   *
+   * While dead we stay where we died, for proximity in both directions, for
+   * the whole death timer: the tracker freezes our position there (onDeath)
+   * rather than treating the vanished icon as a lost lock. Before v0.5.10 no
+   * death was ever detected (see localDeathState), so a death played out as a
+   * lost lock instead — audible for 2-5s, then cut, then a rescan — which is
+   * what testers heard as inconsistent.
+   *
+   * Death is only visible on the 3s game-state poll, but League says how long
+   * the timer is, so the respawn is scheduled from that rather than waiting up
+   * to 3s for the poll to notice.
+   */
+  private applyDeathState(death: { isDead: boolean; respawnTimer: number } | null): void {
+    if (!this.session || !death) return;
+    const local = this.session.localPlayer;
+    const trackerDead = this.tracking?.getState() === TrackingState.DEAD;
+    if (death.isDead && (!local.isDead || (this.tracking && !trackerDead))) {
+      // (The second half: a session created mid-death seeds local.isDead from
+      // the roster, so the transition would otherwise never reach the tracker.)
+      // A poll can read the roster just before League clears isDead; with under
+      // a second left on a timer we already acted on, that is not a new death.
+      if (this.respawnedAtMs > 0 && performance.now() - this.respawnedAtMs < 3500 && death.respawnTimer < 1) return;
+      local.isDead = true;
+      local.respawnTimer = death.respawnTimer;
+      this.tracking?.onDeath();
+      console.log('[LoLProxChat] Died — respawn in ' + death.respawnTimer.toFixed(1) +
+        's; holding position where we died until then');
+      this.scheduleRespawn(death.respawnTimer);
+    } else if (death.isDead && local.isDead) {
+      // League counts the timer down, so each poll re-aims the respawn. A
+      // reading of 0 while still dead is League a moment behind itself, not a
+      // cancellation — keep the respawn already scheduled.
+      local.respawnTimer = death.respawnTimer;
+      if (death.respawnTimer > 0) this.scheduleRespawn(death.respawnTimer);
+    } else if (!death.isDead && local.isDead) {
+      this.respawn('game state');
+    }
+  }
+
+  /**
+   * Death state once a second while in a game, on top of the 3s game-state
+   * poll. The tracker disowns our position 2s after it loses the icon, so a
+   * death seen only on the 3s poll often cut a dying player out of enemy audio
+   * and then put them back at their body a moment later.
+   */
+  private async pollDeath(): Promise<void> {
+    if (this.deathPollRunning || !this.session) return;
+    this.deathPollRunning = true;
+    try {
+      const players = await this.gameState.pollLivePlayers();
+      if (this.session) this.applyDeathState(localDeathState(players, this.session.localPlayer));
+    } finally {
+      this.deathPollRunning = false;
+    }
+  }
+
+  private scheduleRespawn(seconds: number): void {
+    if (this.respawnTimerId !== null) clearTimeout(this.respawnTimerId);
+    this.respawnTimerId = null;
+    if (!(seconds > 0)) return;
+    this.respawnTimerId = setTimeout(() => {
+      this.respawnTimerId = null;
+      this.respawn('respawn timer');
+    }, seconds * 1000);
+  }
+
+  private respawn(source: string): void {
+    if (this.respawnTimerId !== null) clearTimeout(this.respawnTimerId);
+    this.respawnTimerId = null;
+    if (!this.session || !this.session.localPlayer.isDead) return;
+    this.session.localPlayer.isDead = false;
+    this.session.localPlayer.respawnTimer = 0;
+    this.respawnedAtMs = performance.now();
+    this.tracking?.onRespawn();
+    console.log('[LoLProxChat] Respawned (' + source + ') — rescanning from the fountain');
+  }
+
   private endSession(): void {
     this.positionTickRunning = false;
     this.sessionActive = false;
+    if (this.respawnTimerId !== null) clearTimeout(this.respawnTimerId);
+    this.respawnTimerId = null;
+    if (this.deathPollId !== null) clearInterval(this.deathPollId);
+    this.deathPollId = null;
 
     if (this.volumeTickId !== null) {
       clearInterval(this.volumeTickId);

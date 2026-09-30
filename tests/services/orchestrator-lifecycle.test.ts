@@ -220,6 +220,124 @@ describe('the game-state poll', () => {
     expect(h.tracker.respawns).toBe(1);
   });
 
+  it('respawns on League\'s own timer, not on the next poll', async () => {
+    const h = await startInGame();
+    // Die with 4.5s on the clock at t=0.2s; League counts it down live, so the
+    // fake is re-read every 100ms with the time actually left.
+    const respawnAt = 4700;
+    let t = 200;
+    await jest.advanceTimersByTimeAsync(200);
+    const step = async (ms: number) => {
+      for (let i = 0; i < ms; i += 100) {
+        const left = Math.max(0, (respawnAt - t) / 1000);
+        h.gameState.setDead(left > 0, left);
+        await jest.advanceTimersByTimeAsync(100);
+        t += 100;
+      }
+      await settle();
+    };
+
+    await step(1500);
+    // The 1s death poll saw it, well before the 3s game-state poll would have.
+    expect(h.tracker.deaths).toBe(1);
+
+    // Respawn lands on the timer (4.7s), not on whichever poll next reads alive.
+    // Hold League's roster at "dead, 0.3s left" past the respawn: a poll a
+    // moment behind League is not a new death.
+    await step(3000);
+    h.gameState.setDead(true, 0.3);
+    // Spans the 5s death poll, which reads that stale roster.
+    await jest.advanceTimersByTimeAsync(400);
+    await settle();
+    expect(h.tracker.respawns).toBe(1);
+    expect(h.tracker.deaths).toBe(1);
+
+    h.gameState.setDead(false);
+    await jest.advanceTimersByTimeAsync(3000);
+    await settle();
+    expect(h.tracker.respawns).toBe(1);
+    expect(h.tracker.deaths).toBe(1);
+  });
+
+  it('does not let a late game-state reply from before the death respawn us', async () => {
+    // Review: the 3s poll's snapshot can be taken just before the death and
+    // land after the 1s poll has already acted on it.
+    const h = await startInGame();
+    h.tracker.moveTo(7000, 7000);
+    const real = h.gameState.pollGameState.bind(h.gameState);
+    h.gameState.pollGameState = async () => {
+      const before = await real();
+      h.gameState.setDead(true, 20);
+      await new Promise((r) => setTimeout(r, 300));
+      return before;
+    };
+    await jest.advanceTimersByTimeAsync(4000);
+    await settle();
+    expect(h.tracker.deaths).toBe(1);
+    expect(h.tracker.respawns).toBe(0);
+  });
+
+  it('keeps the scheduled respawn when League reads 0s while still dead', async () => {
+    const h = await startInGame();
+    h.gameState.setDead(true, 2);
+    await jest.advanceTimersByTimeAsync(1000);
+    await settle();
+    expect(h.tracker.deaths).toBe(1);
+    h.gameState.setDead(true, 0);
+    await jest.advanceTimersByTimeAsync(2500);
+    await settle();
+    expect(h.tracker.respawns).toBe(1);
+  });
+
+  it('enters the dead state when the session starts mid-death', async () => {
+    const h = makeHarness();
+    h.gameState.setDead(true, 10);
+    // parsePlayerList seeds the roster's isDead into the session's local player.
+    h.gameState.liveClientData!.allPlayers = h.gameState.liveClientData!.allPlayers
+      .map((p, i) => (i === 0 ? { ...p, isDead: true, respawnTimer: 10 } : p));
+    h.orchestrator.start();
+    await settle();
+    await jest.advanceTimersByTimeAsync(1000);
+    await settle();
+    expect(h.tracker.deaths).toBe(1);
+  });
+
+  it('keeps a dead player at their body, re-owning a position the lost icon had disowned', async () => {
+    // The icon vanishes at death before any poll can say why: the tracker
+    // holds, and past 2s the position is disowned. The death then puts the
+    // body back, owned, for the whole timer.
+    const h = await startInGame();
+    h.tracker.moveTo(7000, 7000);
+    await jest.advanceTimersByTimeAsync(300);
+    h.tracker.holdSec = 2.5;
+    await jest.advanceTimersByTimeAsync(300);
+    const sendCoords = (h.signaling as any).sendCoords as jest.Mock;
+    expect(sendCoords.mock.calls.some(c => c[2] === true)).toBe(true);
+
+    sendCoords.mockClear();
+    h.gameState.setDead(true, 20);
+    await jest.advanceTimersByTimeAsync(1000);
+    await settle();
+    await jest.advanceTimersByTimeAsync(5000);
+    const calls = sendCoords.mock.calls;
+    expect(calls.length).toBeGreaterThan(20);
+    for (const c of calls.slice(-20)) {
+      expect(c[0]).toBe(7000);
+      expect(c[1]).toBe(7000);
+      expect(c[2]).toBe(false);
+    }
+  });
+
+  it('ignores the top-level isDead, which League never actually sends', async () => {
+    // Before v0.5.10 death was read from activePlayer.isDead, which does not
+    // exist, so no death was ever detected. Only the roster entry counts.
+    const h = await startInGame();
+    h.gameState.state = { ...h.gameState.state, isDead: true };
+    await jest.advanceTimersByTimeAsync(3000);
+    await settle();
+    expect(h.tracker.deaths).toBe(0);
+  });
+
   it('starts a fresh session for the next game without stacking the old one\'s loops', async () => {
     const h = await startInGame();
     const duringSession = jest.getTimerCount();
@@ -227,10 +345,10 @@ describe('the game-state poll', () => {
     h.gameState.gameEnded();
     await jest.advanceTimersByTimeAsync(3000);
     await settle();
-    // Only the game-state poll survives a session; the volume tick and the
-    // geometry poll are both cleared.
+    // Only the game-state poll survives a session; the volume tick, the
+    // geometry poll and the death poll are all cleared.
     expect(jest.getTimerCount()).toBe(1);
-    expect(duringSession).toBe(3);
+    expect(duringSession).toBe(4);
 
     h.gameState.state = { ...h.gameState.state, isInGame: true, gameFlowPhase: 'InProgress' };
     await jest.advanceTimersByTimeAsync(3000);

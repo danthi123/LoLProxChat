@@ -20,7 +20,7 @@ LoLProxChat is built to stay within the categories Riot Games explicitly publish
 - ❌ No automation, scripting, or bot behavior — the app never takes any in-game action on your behalf.
 - ❌ No decision-making aids — no enemy ult timers, no warned-by, no jungle timers, no skill suggestions.
 - ❌ No warded-by indicators, no enemy item builds, no spectator-mode data.
-- ⚠️ **Proximity audio does not respect fog of war.** Hearing is computed from distance alone, so an enemy in a brush or behind a wall is as audible as one standing in the open at the same range. The opt-in "Voice on camera" setting widens that further, though only between two players who have both turned it on. Both are covered below — this is the app's one real departure from "no exposure of obfuscated information", and it is stated here rather than buried.
+- ⚠️ **Proximity audio does not respect fog of war.** Hearing is computed from distance alone, so an enemy in a brush or behind a wall is as audible as one standing in the open at the same range. While dead you stay audible, and can hear, at your body. The opt-in "Voice on camera" setting widens that further, though only between two players who have both turned it on. All three are covered below — this is the app's one real departure from "no exposure of obfuscated information", and it is stated here rather than buried.
 - ❌ No in-game advertising (banned by Riot in May 2025).
 - ❌ No paid tier or freemium gating — Riot's monetization rules require a free tier; LoLProxChat is fully open source and free.
 
@@ -43,6 +43,14 @@ It is not a bug that can be fixed at this layer. The Live Client Data API report
 What bounds the leak today is the hearing radius and nothing else: you learn that *an* enemy is within roughly vision range of you, not which one, not where, and not through any mechanism you could aim. Players who do not want that should not run the app, and anyone running it in a competitive context should understand it is what they are opting into.
 
 For the precise threat-modeling around how a modified client *could* extract additional information from the volume side channel, see [`threat-model.md`](threat-model.md). Note that the volume value the server returns is **continuous** — the v0.1.26 bucket quantization and jitter were reverted in v0.1.33 because the bucket transitions were audible in real games; the mitigations that remain are the hard cutoff at vision range and the staleness window on peer coordinates.
+
+### While dead
+
+A dead player stays where they died for proximity purposes, in both directions, until they respawn: enemies near the body hear them, and they hear enemies near the body. (If the app had already lost track of the champion when they died, there is no body and they are team-only until respawn.)
+
+That is a real widening, and it is stated here because the argument above does not cover it. The case for hearing being anchored to your champion is that getting close enough to hear someone costs you the same risk it costs them. A dead champion is at no risk and gives no vision at the body. So a player killed at Baron or under a tower learns, for the length of the death timer (well over a minute late game), whether enemies are still near that spot and whether they are talking — which the stock client does not tell a dead player, whose camera shows only what their team can see.
+
+What bounds it is the same as everything else here: the ~1350-unit hearing radius from a fixed point (the body cannot move), only players running this app, voice and never game audio, and nothing about *which* enemy or exactly where. The alternative — dead players silent to enemies — was considered and set aside because players testing the app expected enemies to keep hearing them while dead; it is a small, contained change around `onDeath` in `src/services/tracking.ts` and the orchestrator's dead-state path if that judgement changes.
 
 ## Specifically: "Voice on camera" (opt-in on both sides, default OFF, one-way)
 

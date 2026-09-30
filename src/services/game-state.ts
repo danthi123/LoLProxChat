@@ -15,8 +15,52 @@ export interface TauriGameState {
   isLeagueRunning: boolean;
   isInGame: boolean;
   summonerName: string | null;
+  /** Always false — kept for shape compatibility. Read death from `players`
+   *  with localDeathState(); see src-tauri/src/lcu.rs. */
   isDead: boolean;
   gameFlowPhase: string;
+  /** Roster identity fields plus death state, straight from allPlayers.
+   *  Absent from builds before v0.5.10. */
+  players?: LivePlayerState[];
+}
+
+export interface LivePlayerState {
+  summonerName?: string | null;
+  riotId?: string | null;
+  riotIdGameName?: string | null;
+  riotIdTagLine?: string | null;
+  isDead: boolean;
+  /** Seconds until respawn while dead; 0 when alive. */
+  respawnTimer: number;
+}
+
+/**
+ * The local player's death state, found in the roster with the same identity
+ * matching that started the session.
+ *
+ * `activePlayer` has no `isDead` field — only `allPlayers` entries do — and
+ * until v0.5.10 the app read it from `activePlayer`, so no death was ever
+ * detected and every death played out as the tracker losing the icon.
+ * Returns null when the local player cannot be picked out unambiguously; the
+ * caller must then leave the death state as it was rather than guess.
+ */
+export function localDeathState(
+  players: LivePlayerState[] | undefined,
+  local: Player,
+): { isDead: boolean; respawnTimer: number } | null {
+  if (!players || players.length === 0) return null;
+  const me = readIdentity(local);
+  if (!me) return null;
+  const roster: Identity[] = [];
+  const index: number[] = [];
+  players.forEach((p, i) => {
+    const id = readIdentity(p);
+    if (id) { roster.push(id); index.push(i); }
+  });
+  const match = matchLocal(roster, me);
+  if (!match) return null;
+  const p = players[index[match.index]];
+  return { isDead: !!p.isDead, respawnTimer: Number.isFinite(p.respawnTimer) ? p.respawnTimer : 0 };
 }
 
 /** Shape returned by the Rust get_live_client_data command */
@@ -173,6 +217,15 @@ export class GameStateService {
   /** Poll Tauri backend for basic game state (league running, in-game, summoner name) */
   async pollGameState(): Promise<TauriGameState> {
     return invoke<TauriGameState>('get_game_state');
+  }
+
+  /** Roster death state only — the orchestrator's 1s death poll. */
+  async pollLivePlayers(): Promise<LivePlayerState[]> {
+    try {
+      return await invoke<LivePlayerState[]>('get_live_players');
+    } catch {
+      return [];
+    }
   }
 
   /** Poll League Live Client Data API via Tauri backend */

@@ -7,24 +7,37 @@
 // which a single process-wide invoke mock could not do, since it cannot tell
 // which of the two orchestrators is asking.
 
-import { GameStateService, LiveClientData, TauriGameState } from '../../../src/services/game-state';
+import { GameStateService, LiveClientData, LivePlayerState, TauriGameState } from '../../../src/services/game-state';
 import { Player } from '../../../src/core/types';
 
 export class ScriptedGameState extends GameStateService {
   state: TauriGameState;
   liveClientData: LiveClientData | null;
+  private readonly localName: string;
 
   constructor(localName: string, roster: Player[], gameData: unknown) {
     super();
+    const local = roster.find((p) => p.summonerName === localName);
+    if (!local) throw new Error('scripted roster has no entry for ' + localName);
+    this.localName = localName;
+    // Shaped like the real payload: the top-level isDead is always false (it
+    // used to be read from activePlayer, which never carries it), and death
+    // lives only on the roster entries. A fake that set the top-level flag is
+    // how the app went for its whole life without ever detecting a death.
     this.state = {
       isLeagueRunning: true,
       isInGame: true,
       summonerName: localName,
       isDead: false,
       gameFlowPhase: 'InProgress',
+      players: roster.map((p) => ({
+        summonerName: p.summonerName,
+        riotIdGameName: p.riotIdGameName,
+        riotIdTagLine: p.riotIdTagLine,
+        isDead: false,
+        respawnTimer: 0,
+      })),
     };
-    const local = roster.find((p) => p.summonerName === localName);
-    if (!local) throw new Error('scripted roster has no entry for ' + localName);
     this.liveClientData = {
       activePlayer: {
         summonerName: local.summonerName,
@@ -40,6 +53,10 @@ export class ScriptedGameState extends GameStateService {
     return { ...this.state };
   }
 
+  async pollLivePlayers(): Promise<LivePlayerState[]> {
+    return (this.state.players ?? []).map((p) => ({ ...p }));
+  }
+
   async pollLiveClientData(): Promise<LiveClientData | null> {
     return this.liveClientData;
   }
@@ -53,8 +70,13 @@ export class ScriptedGameState extends GameStateService {
     this.state = { ...this.state, isLeagueRunning: false, isInGame: false, gameFlowPhase: 'None' };
   }
 
-  setDead(isDead: boolean): void {
-    this.state = { ...this.state, isDead };
+  /** Kill or revive the local player, the way League reports it. */
+  setDead(isDead: boolean, respawnTimer = 0): void {
+    this.state = {
+      ...this.state,
+      players: (this.state.players ?? []).map((p) =>
+        p.summonerName === this.localName ? { ...p, isDead, respawnTimer: isDead ? respawnTimer : 0 } : p),
+    };
   }
 }
 
