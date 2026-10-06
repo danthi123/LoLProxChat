@@ -11,86 +11,90 @@
     <div id="drag-handle" class="widget-header" data-tauri-drag-region>
       <span class="widget-title" data-tauri-drag-region title="LoLProxChat">LPC</span>
       <div class="header-controls">
-        <button id="btn-self-mute" class="icon-btn" title="Toggle Self Mute">MIC</button>
-        <button id="btn-mute-all" class="icon-btn" title="Mute All">VOL</button>
-        <button id="btn-reset-header" class="icon-btn" title="Wrong position? If people next to you can't hear you, click this, then walk somewhere: the app finds your champion on the minimap again. Until it does, only your team hears you.">POS</button>
-        <button id="btn-settings" class="icon-btn" title="Settings">SET</button>
+        <button id="btn-self-mute" class="icon-btn" data-i18n-title="header.selfMute" title="Toggle Self Mute">MIC</button>
+        <button id="btn-mute-all" class="icon-btn" data-i18n-title="header.muteAll" title="Mute All">VOL</button>
+        <button id="btn-reset-header" class="icon-btn" data-i18n="header.posLabel" data-i18n-title="header.pos" title="Wrong position? If people next to you can't hear you, click this, then walk somewhere: the app finds your champion on the minimap again. Until it does, only your team hears you.">POS</button>
+        <button id="btn-settings" class="icon-btn" data-i18n="header.settingsLabel" data-i18n-title="header.settings" title="Settings">SET</button>
         <button id="btn-collapse" class="icon-btn" title="Collapse">&raquo;</button>
       </div>
     </div>
     <div id="player-list" class="player-list">
-      <div class="empty-state">Waiting for nearby players...</div>
+      <div class="empty-state" data-i18n="players.waiting">Waiting for nearby players...</div>
     </div>
     <div id="settings-panel" class="settings-panel hidden">
       <div class="setting-row">
-        <label>Input Device</label>
+        <label data-i18n="settings.language">Language</label>
+        <select id="language"></select>
+      </div>
+      <div class="setting-row">
+        <label data-i18n="settings.inputDevice">Input Device</label>
         <select id="input-device">
-          <option value="">Default</option>
+          <option value="" data-i18n="settings.default">Default</option>
         </select>
       </div>
       <div class="setting-row">
-        <label>Output Device</label>
+        <label data-i18n="settings.outputDevice">Output Device</label>
         <select id="output-device">
-          <option value="">Default</option>
+          <option value="" data-i18n="settings.default">Default</option>
         </select>
       </div>
       <div class="setting-row">
-        <label>Input Mode</label>
+        <label data-i18n="settings.inputMode">Input Mode</label>
         <select id="input-mode">
-          <option value="always">Always Open</option>
-          <option value="ptt">Push to Talk</option>
+          <option value="always" data-i18n="settings.alwaysOpen">Always Open</option>
+          <option value="ptt" data-i18n="settings.pushToTalk">Push to Talk</option>
         </select>
       </div>
       <div class="setting-row">
-        <label title="Push-to-talk key. Default Caps Lock. The LED won't toggle (Discord-style synthetic flip-back).">PTT Key</label>
+        <label data-i18n="settings.pttKey" data-i18n-title="settings.pttKeyHint" title="Push-to-talk key. Default Caps Lock. The LED won't toggle (Discord-style synthetic flip-back).">PTT Key</label>
         <button id="btn-bind-ptt" class="icon-btn">Caps Lock</button>
       </div>
       <div class="setting-row">
-        <label title="Optional toggle-self-mute hotkey. Click to bind a key; click again to clear.">Toggle-mute Key</label>
+        <label data-i18n="settings.toggleKey" data-i18n-title="settings.toggleKeyHint" title="Optional toggle-self-mute hotkey. Click to bind a key; click again to clear.">Toggle-mute Key</label>
         <button id="btn-bind-toggle" class="icon-btn">(unbound)</button>
       </div>
       <div class="setting-row">
-        <label>Mic Volume</label>
+        <label data-i18n="settings.micVolume">Mic Volume</label>
         <div class="setting-value-group">
           <input id="input-volume" type="range" min="0" max="100" value="100">
           <span id="volume-label" class="setting-value-label">100</span>
         </div>
       </div>
       <div class="setting-row">
-        <label title="Routes all voice through the TURN relay so peers never see your public IP. Adds ~20-100ms latency. Takes effect on next peer connection.">Hide IP (Force TURN)</label>
+        <label data-i18n="settings.forceTurn" data-i18n-title="settings.forceTurnHint" title="Routes all voice through the TURN relay so peers never see your public IP. Adds ~20-100ms latency. Takes effect on next peer connection.">Hide IP (Force TURN)</label>
         <button id="btn-force-turn" class="icon-btn">OFF</button>
       </div>
       <div class="setting-row">
-        <label title="When ON, teammates fade with distance just like enemies. When OFF (default), teammates are always at full volume. Takes effect on the next position update.">Ally proximity</label>
+        <label data-i18n="settings.allyProximity" data-i18n-title="settings.allyProximityHint" title="When ON, teammates fade with distance just like enemies. When OFF (default), teammates are always at full volume. Takes effect on the next position update.">Ally proximity</label>
         <button id="btn-ally-proximity" class="icon-btn">OFF</button>
       </div>
       <div class="setting-row">
-        <label title="When ON, you also hear the map from wherever your camera is looking, not just from your champion. One-way: the people you listen in on only hear you if they are near your champion or looking at you themselves. Only works between players who BOTH have it on: leave it off and nobody's camera can reach you, only players actually near you on the map. Off by default, because it lets you hear enemies your champion could not see.">Voice on camera</label>
+        <label data-i18n="settings.cameraListen" data-i18n-title="settings.cameraListenHint" title="When ON, you also hear the map from wherever your camera is looking, not just from your champion. One-way: the people you listen in on only hear you if they are near your champion or looking at you themselves. Only works between players who BOTH have it on: leave it off and nobody's camera can reach you, only players actually near you on the map. Off by default, because it lets you hear enemies your champion could not see.">Voice on camera</label>
         <button id="btn-camera-listen" class="icon-btn">OFF</button>
       </div>
       <div class="setting-row">
-        <label title="If people near you can't hear you, the app may be tracking the wrong icon on your minimap (it can latch onto a ward you walked past). This drops the current position and finds your champion again; walk somewhere after pressing it so it can tell you apart. Until it finds you, only your team hears you.">Wrong position?</label>
+        <label data-i18n="settings.wrongPosition" data-i18n-title="settings.wrongPositionHint" title="If people near you can't hear you, the app may be tracking the wrong icon on your minimap (it can latch onto a ward you walked past). This drops the current position and finds your champion again; walk somewhere after pressing it so it can tell you apart. Until it finds you, only your team hears you.">Wrong position?</label>
         <button id="btn-reset-position" class="icon-btn">RESET</button>
       </div>
       <div class="setting-row">
-        <label>Debug</label>
+        <label data-i18n="settings.debug">Debug</label>
         <button id="btn-debug" class="icon-btn">OFF</button>
       </div>
       <div class="setting-row">
-        <label>Debug Logs</label>
-        <button id="btn-open-logs" class="icon-btn" title="Open log folder to attach to a GitHub issue">OPEN</button>
+        <label data-i18n="settings.debugLogs">Debug Logs</label>
+        <button id="btn-open-logs" class="icon-btn" data-i18n="settings.open" data-i18n-title="settings.openLogsHint" title="Open log folder to attach to a GitHub issue">OPEN</button>
       </div>
       <div class="setting-row">
-        <label>Auto-update</label>
+        <label data-i18n="settings.autoUpdate">Auto-update</label>
         <button id="btn-autoupdate" class="icon-btn">OFF</button>
       </div>
       <div class="setting-row">
-        <label>Updates</label>
-        <button id="btn-check-update" class="icon-btn">CHECK</button>
+        <label data-i18n="settings.updates">Updates</label>
+        <button id="btn-check-update" class="icon-btn" data-i18n="settings.check">CHECK</button>
       </div>
       <div id="update-status" style="font-size:10px;color:#8892a8;padding:4px 0;text-align:center;"></div>
       <div id="scan-rate-row" class="setting-row hidden">
-        <label>Scan Rate</label>
+        <label data-i18n="settings.scanRate">Scan Rate</label>
         <div class="setting-value-group">
           <input id="input-scan-rate" type="range" min="0" max="100" value="50">
           <span id="scan-rate-label" class="setting-value-label">50</span>

@@ -18,6 +18,9 @@ import { getForceTurnRelay, setForceTurnRelay } from '../services/privacy';
 import { getAllyProximity, setAllyProximity, getCameraListen, setCameraListen } from '../services/audio-prefs';
 import { computeDesiredHeight, shouldSendSize } from './resize-helpers';
 import { browserKeyToWin32Vk, humanizeVk } from '../core/keymap';
+import {
+  LANGUAGES, Lang, applyTranslations, getLanguage, setLanguage, t, translateKey, translateStatus,
+} from './i18n';
 import '../core/window-globals';
 
 // v0.3 (#11): dynamic overlay-window resize so the panel grows to fit
@@ -86,6 +89,9 @@ const dragHandle = document.getElementById('drag-handle')!;
 let debugEnabled = false;
 setLoggingEnabled(false);
 
+// Every toggle shows ON/OFF in the panel language.
+const onOff = (on: boolean): string => t(on ? 'settings.on' : 'settings.off');
+
 // Per-player volume cache (so sliders don't reset on re-render)
 const playerVolumes: Map<string, number> = new Map();
 
@@ -117,11 +123,11 @@ const btnResetHeader = document.getElementById('btn-reset-header')!;
 let resetFeedbackId: ReturnType<typeof setTimeout> | null = null;
 function resetPosition(): void {
   sendToBackground('resetPosition', {});
-  btnResetPosition.textContent = 'SEARCHING';
+  btnResetPosition.textContent = t('settings.searching');
   btnResetHeader.classList.add('searching');
   if (resetFeedbackId !== null) clearTimeout(resetFeedbackId);
   resetFeedbackId = setTimeout(() => {
-    btnResetPosition.textContent = 'RESET';
+    btnResetPosition.textContent = t('settings.reset');
     btnResetHeader.classList.remove('searching');
     resetFeedbackId = null;
   }, 2000);
@@ -168,12 +174,12 @@ function populateDeviceSelect(
 ): void {
   const defaultOpt = document.createElement('option');
   defaultOpt.value = '';
-  defaultOpt.textContent = 'Default';
+  defaultOpt.textContent = t('settings.default');
   const opts: HTMLOptionElement[] = [defaultOpt];
   for (const d of devices) {
     const opt = document.createElement('option');
     opt.value = d.deviceId;
-    opt.textContent = d.label || `(unnamed ${d.kind})`;
+    opt.textContent = d.label || t(d.kind === 'audiooutput' ? 'settings.unnamedOutput' : 'settings.unnamedInput');
     opts.push(opt);
   }
   select.replaceChildren(...opts);
@@ -204,7 +210,7 @@ btnCollapse.addEventListener('click', () => {
   collapsed = !collapsed;
   panel.classList.toggle('collapsed', collapsed);
   btnCollapse.textContent = collapsed ? '\u00AB' : '\u00BB';
-  btnCollapse.title = collapsed ? 'Expand' : 'Collapse';
+  btnCollapse.title = t(collapsed ? 'header.expand' : 'header.collapse');
   // Close settings when collapsing
   if (collapsed) {
     settingsPanel.classList.add('hidden');
@@ -219,7 +225,7 @@ const updateStatus = document.getElementById('update-status')!;
 // --- Auto-update UI ---
 function syncAutoUpdateButton(): void {
   const on = isAutoUpdateEnabled();
-  btnAutoUpdate.textContent = on ? 'ON' : 'OFF';
+  btnAutoUpdate.textContent = onOff(on);
   btnAutoUpdate.classList.toggle('active', on);
 }
 queueMicrotask(syncAutoUpdateButton);
@@ -230,20 +236,20 @@ btnAutoUpdate.addEventListener('click', () => {
 });
 
 async function runUpdateCheck(triggeredByUser: boolean): Promise<void> {
-  updateStatus.textContent = 'Checking for updates…';
+  updateStatus.textContent = t('update.checking');
   try {
     const info = await checkForUpdate();
     if (info.update_available && info.download_url) {
-      updateStatus.textContent = 'Update available: v' + info.latest_version + ' — applying…';
+      updateStatus.textContent = t('update.available', { version: String(info.latest_version) });
       await downloadAndApply(info.download_url);
       // If apply succeeds, the process exits before we reach here
     } else {
       updateStatus.textContent = triggeredByUser
-        ? 'Up to date (v' + info.current_version + ')'
+        ? t('update.upToDate', { version: String(info.current_version) })
         : '';
     }
   } catch (e) {
-    updateStatus.textContent = 'Update check failed: ' + (e as Error).message;
+    updateStatus.textContent = t('update.failed', { error: (e as Error).message });
   }
 }
 
@@ -265,7 +271,7 @@ window.__proxchatRunUpdateCheck = runUpdateCheck;
 const btnForceTurn = document.getElementById('btn-force-turn') as HTMLButtonElement;
 function syncForceTurnButton(): void {
   const on = getForceTurnRelay();
-  btnForceTurn.textContent = on ? 'ON' : 'OFF';
+  btnForceTurn.textContent = onOff(on);
   btnForceTurn.classList.toggle('active', on);
 }
 queueMicrotask(syncForceTurnButton);
@@ -281,7 +287,7 @@ btnForceTurn.addEventListener('click', () => {
 const btnAllyProximity = document.getElementById('btn-ally-proximity') as HTMLButtonElement;
 function syncAllyProximityButton(): void {
   const on = getAllyProximity();
-  btnAllyProximity.textContent = on ? 'ON' : 'OFF';
+  btnAllyProximity.textContent = onOff(on);
   btnAllyProximity.classList.toggle('active', on);
 }
 queueMicrotask(syncAllyProximityButton);
@@ -297,7 +303,7 @@ btnAllyProximity.addEventListener('click', () => {
 const btnCameraListen = document.getElementById('btn-camera-listen') as HTMLButtonElement;
 function syncCameraListenButton(): void {
   const on = getCameraListen();
-  btnCameraListen.textContent = on ? 'ON' : 'OFF';
+  btnCameraListen.textContent = onOff(on);
   btnCameraListen.classList.toggle('active', on);
 }
 queueMicrotask(syncCameraListenButton);
@@ -324,20 +330,23 @@ const FORBIDDEN_CODES = new Set([
   'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight',
 ]);
 
+// Re-label the bind buttons when the language changes (key names are
+// localized too: Caps Lock is Bloq Mayús on a Spanish keyboard).
+const bindRelabelers: Array<() => void> = [];
+
 function setupBindButton(buttonId: string, storageKey: string, backgroundCmd: string, defaultVk: number | null): void {
   const btn = document.getElementById(buttonId) as HTMLButtonElement;
   if (!btn) return;
   const stored = localStorage.getItem(storageKey);
-  const initialVk = stored !== null ? parseInt(stored, 10) : defaultVk;
-  if (initialVk !== null && !Number.isNaN(initialVk) && initialVk > 0) {
-    btn.textContent = humanizeVk(initialVk);
-  } else {
-    btn.textContent = '(unbound)';
-  }
+  let boundVk = stored !== null ? parseInt(stored, 10) : defaultVk;
+  const label = (): string =>
+    boundVk !== null && !Number.isNaN(boundVk) && boundVk > 0 ? translateKey(humanizeVk(boundVk)) : t('settings.unbound');
+  btn.textContent = label();
+  bindRelabelers.push(() => { if (!btn.disabled) btn.textContent = label(); });
 
   btn.addEventListener('click', () => {
-    const originalText = btn.textContent || '(unbound)';
-    btn.textContent = 'Press a key…';
+    const originalText = label();
+    btn.textContent = t('settings.pressKey');
     btn.classList.add('active');
     btn.disabled = true;
     const restore = (text: string) => {
@@ -354,19 +363,20 @@ function setupBindButton(buttonId: string, storageKey: string, backgroundCmd: st
         return;
       }
       if (FORBIDDEN_CODES.has(e.code)) {
-        restore('(LoL/system key — pick another)');
+        restore(t('settings.forbiddenKey'));
         setTimeout(() => restore(originalText), 1500);
         return;
       }
       const vk = browserKeyToWin32Vk(e.code);
       if (vk === null) {
-        restore('(key not supported)');
+        restore(t('settings.unsupportedKey'));
         setTimeout(() => restore(originalText), 1500);
         return;
       }
       localStorage.setItem(storageKey, String(vk));
       sendToBackground(backgroundCmd, { vk });
-      restore(humanizeVk(vk));
+      boundVk = vk;
+      restore(label());
     };
     window.addEventListener('keydown', onKey, true);
   });
@@ -384,7 +394,7 @@ queueMicrotask(() => {
 
 btnDebug.addEventListener('click', () => {
   debugEnabled = !debugEnabled;
-  btnDebug.textContent = debugEnabled ? 'ON' : 'OFF';
+  btnDebug.textContent = onOff(debugEnabled);
   btnDebug.classList.toggle('active', debugEnabled);
   scanRateRow.classList.toggle('hidden', !debugEnabled);
   setLoggingEnabled(debugEnabled);
@@ -510,9 +520,9 @@ function createPlayerRow(peer: NearbyPeer, localTeam: 'ORDER' | 'CHAOS' | null |
   const indicator = document.createElement('span');
   indicator.className = 'player-muted-indicator';
   if (peer.isDead) {
-    indicator.textContent = 'DEAD';
+    indicator.textContent = t('players.dead');
   } else if (peer.isMuted) {
-    indicator.textContent = 'MUTED';
+    indicator.textContent = t('players.muted');
   } else {
     indicator.style.display = 'none';
   }
@@ -535,13 +545,13 @@ function createPlayerRow(peer: NearbyPeer, localTeam: 'ORDER' | 'CHAOS' | null |
 
   const muteBtn = document.createElement('button') as HTMLButtonElement;
   muteBtn.className = 'player-mute-btn' + (peer.isMutedByLocal ? ' muted' : '');
-  muteBtn.textContent = peer.isMutedByLocal ? 'MUTED' : 'MUTE';
+  muteBtn.textContent = t(peer.isMutedByLocal ? 'players.mutedByYou' : 'players.mute');
   muteBtn.addEventListener('click', () => {
     // Flip the UI immediately so the user gets feedback without waiting
     // for the next broadcastOverlayState tick. Backend state will confirm.
     const nowMuted = !muteBtn.classList.contains('muted');
     muteBtn.classList.toggle('muted', nowMuted);
-    muteBtn.textContent = nowMuted ? 'MUTED' : 'MUTE';
+    muteBtn.textContent = t(nowMuted ? 'players.mutedByYou' : 'players.mute');
     console.log('[Overlay] Mute toggled for', peer.summonerName, '→', nowMuted);
     sendToBackground('toggleMutePlayer', { name: peer.summonerName });
   });
@@ -557,10 +567,10 @@ function updatePlayerRow(peer: NearbyPeer): void {
 
   // Update indicator
   if (peer.isDead) {
-    entry.indicator!.textContent = 'DEAD';
+    entry.indicator!.textContent = t('players.dead');
     entry.indicator!.style.display = '';
   } else if (peer.isMuted) {
-    entry.indicator!.textContent = 'MUTED';
+    entry.indicator!.textContent = t('players.muted');
     entry.indicator!.style.display = '';
   } else {
     entry.indicator!.style.display = 'none';
@@ -577,11 +587,14 @@ function updatePlayerRow(peer: NearbyPeer): void {
   // Update mute button
   const isMuted = peer.isMutedByLocal;
   entry.muteBtn.className = 'player-mute-btn' + (isMuted ? ' muted' : '');
-  entry.muteBtn.textContent = isMuted ? 'MUTED' : 'MUTE';
+  entry.muteBtn.textContent = t(isMuted ? 'players.mutedByYou' : 'players.mute');
 }
 
 // --- Render state ---
+let lastState: OverlayState | null = null;
+
 function renderState(state: OverlayState): void {
+  lastState = state;
   // Color-only mute indication (see the click handlers) — label stays static.
   btnSelfMute.classList.toggle('active', state.selfMuted);
   btnMuteAll.classList.toggle('active', state.muteAll);
@@ -639,7 +652,7 @@ function renderState(state: OverlayState): void {
   }
 
   // Show/hide empty state with lifecycle-aware text
-  const emptyText = state.lifecycleStatus || 'Waiting for nearby players...';
+  const emptyText = state.lifecycleStatus ? translateStatus(state.lifecycleStatus) : t('players.waiting');
   const emptyState = playerList.querySelector('.empty-state');
   if (sortedPeers.length === 0) {
     if (!emptyState) {
@@ -673,6 +686,42 @@ function renderState(state: OverlayState): void {
 window.addEventListener('overlayUpdate', ((event: CustomEvent) => {
   renderState(event.detail);
 }) as EventListener);
+
+// --- Language ---
+// Applied at load, and again live from the Settings drop-down: everything the
+// panel shows is re-labelled in place, no restart.
+const languageSelect = document.getElementById('language') as HTMLSelectElement;
+for (const { code, name } of LANGUAGES) {
+  const opt = document.createElement('option');
+  opt.value = code;
+  opt.textContent = name;
+  languageSelect.appendChild(opt);
+}
+
+function applyLanguage(): void {
+  const lang = getLanguage();
+  document.documentElement.lang = lang;
+  languageSelect.value = lang;
+  applyTranslations(document, lang);
+  if (resetFeedbackId === null) btnResetPosition.textContent = t('settings.reset');
+  btnCollapse.title = t(collapsed ? 'header.expand' : 'header.collapse');
+  syncAutoUpdateButton();
+  syncForceTurnButton();
+  syncAllyProximityButton();
+  syncCameraListenButton();
+  btnDebug.textContent = onOff(debugEnabled);
+  for (const relabel of bindRelabelers) relabel();
+  updateStatus.textContent = '';
+  if (!settingsPanel.classList.contains('hidden')) refreshDeviceLists();
+  if (lastState) renderState(lastState);
+}
+
+languageSelect.addEventListener('change', () => {
+  setLanguage(languageSelect.value as Lang);
+  applyLanguage();
+});
+// After the bind buttons are set up (queued above), so they are relabelled too.
+queueMicrotask(applyLanguage);
 
 console.log('LoLProxChat overlay loaded');
 
