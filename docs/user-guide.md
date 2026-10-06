@@ -29,6 +29,7 @@ Each player row has:
 
 | Setting | What it does |
 |---|---|
+| **Language** | The panel's language: English or Español. Applies immediately and persists. On first launch it follows your Windows display language (Spanish if Windows is in Spanish, English otherwise). |
 | **Input Device** | Which microphone to use. "Default" follows Windows' default communications device. Selection persists across launches. Switching mid-game swaps the source in place — no peer reconnection needed. |
 | **Output Device** | Which speaker / headset to send voice to. Same persistence behavior. |
 | **Input Mode** | "Always Open" (default) — mic is always live unless self-muted. "Push to Talk" — hold the bound PTT key (default Caps Lock) to transmit; it works while League has focus. |

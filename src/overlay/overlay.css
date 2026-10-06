@@ -111,6 +111,9 @@ html, body {
 
 .player-name {
   flex: 1;
+  /* Room for a short champion name even when the row carries both labels
+     (DEAD + MUTED, longer in Spanish): the slider gives way instead. */
+  min-width: 44px;
   font-size: 11px;
   white-space: nowrap;
   overflow: hidden;
@@ -128,7 +131,8 @@ html, body {
   border-radius: 3px;
   outline: none;
   cursor: pointer;
-  flex-shrink: 0;
+  flex-shrink: 1;
+  min-width: 40px;
 }
 .player-volume::-webkit-slider-thumb {
   -webkit-appearance: none;
@@ -150,6 +154,7 @@ html, body {
   padding: 3px 8px;
   border-radius: 3px;
   flex-shrink: 0;
+  white-space: nowrap;
   transition: background 0.1s, color 0.1s;
 }
 .player-mute-btn:hover { background: rgba(100, 120, 160, 0.25); }
@@ -163,6 +168,8 @@ html, body {
 .player-muted-indicator {
   font-size: 10px;
   color: #e74c4c;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .settings-panel {
