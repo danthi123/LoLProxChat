@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.5.14] — 2026-10-06
+
 ### Added
 - **Spanish.** A Language drop-down at the top of Settings switches everything in the panel — labels, tooltips, buttons, status messages, key names — between English and Español, instantly. On first launch it follows your Windows display language. Logs, the Debug readout and error details from the updater stay in English.
 
