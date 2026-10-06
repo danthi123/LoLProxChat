@@ -493,8 +493,9 @@ describe('nextWrongLockEvidence', () => {
     expect(feed(runs).switchTo).toBeNull();
   });
 
-  test('a followed blob that moves more than an icon resets the evidence', () => {
-    const walking = Array.from({ length: 12 }, (_, i) => ({ ...against, followed: { x: WARD.x + i * 4, y: WARD.y } }));
+  test('a followed blob that moves resets the evidence', () => {
+    // 2px per 500ms run: slower than any champion walks.
+    const walking = Array.from({ length: 12 }, (_, i) => ({ ...against, followed: { x: WARD.x + i * 2, y: WARD.y } }));
     expect(feed(walking).switchTo).toBeNull();
   });
 
@@ -505,11 +506,35 @@ describe('nextWrongLockEvidence', () => {
     expect(feed(Array(12).fill({ ...against, followed: null })).switchTo).toBeNull();
   });
 
+  test('noise spread across several allies never adds up', () => {
+    const allies = [{ x: 30, y: 120 }, { x: 250, y: 60 }, { x: 200, y: 260 }];
+    const runs = Array.from({ length: 20 }, (_, i) => ({ ...against, best: { ...allies[i % 3], score: 1 } }));
+    expect(feed(runs).switchTo).toBeNull();
+  });
+
+  test('a stray hit every 12s never adds up, however long it goes on', () => {
+    const silent: WrongLockRun = { ...against, discriminating: false };
+    const runs = Array.from({ length: 24 * 15 }, (_, i) => (i % 24 === 0 ? against : silent));
+    expect(feed(runs).switchTo).toBeNull();
+  });
+
+  test('a discriminating run that does not support the switch resets it', () => {
+    const weak: WrongLockRun = { ...against, followedScore: 0.3 };
+    const runs = [...Array(5).fill(against), weak, ...Array(5).fill(against)];
+    expect(feed(runs).switchTo).toBeNull();
+  });
+
+  test('a preferred icon that walks is still the same icon', () => {
+    const runs = Array.from({ length: 12 }, (_, i) => ({ ...against, best: { x: REAL.x + i * 3, y: REAL.y, score: 1 } }));
+    expect(feed(runs).switchTo).toEqual({ x: REAL.x + 8 * 3, y: REAL.y });
+  });
+
   test('evidence goes stale', () => {
     let ev = emptyWrongLockEvidence();
     for (let i = 0; i < 5; i++) ev = nextWrongLockEvidence(ev, against, 1000 + i * 500, ICON).evidence;
     expect(ev.runs).toBe(5);
     const later = nextWrongLockEvidence(ev, against, 3000 + WRONG_LOCK_STALE_MS + 1, ICON);
+    expect(WRONG_LOCK_STALE_MS).toBeLessThanOrEqual(3000);
     expect(later.switchTo).toBeNull();
     expect(later.evidence.runs).toBe(1);
   });

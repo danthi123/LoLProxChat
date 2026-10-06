@@ -35,6 +35,8 @@ import {
   emptyWrongLockEvidence,
   nextWrongLockEvidence,
   RESET_AVOID_MS,
+  RESET_OBSERVE_MS,
+  WRONG_LOCK_STILL_FRACTION,
 } from './tracking-helpers';
 
 export enum TrackingState {
@@ -154,6 +156,7 @@ export class TrackingService {
   // Set by resetPosition(): the spot (region px) the user told us we are not
   // at, and until when the next scan avoids it.
   private avoidPoint: { x: number; y: number } | null = null;
+  private avoidOrigin: { x: number; y: number } | null = null;
   private avoidUntilMs = 0;
   private static readonly TUNED_FPS = 8;
 
@@ -643,6 +646,7 @@ export class TrackingService {
       : null;
     this.state = TrackingState.SCANNING;
     this.avoidPoint = was;
+    this.avoidOrigin = was;
     this.avoidUntilMs = performance.now() + RESET_AVOID_MS;
     this.lastPixelPos = null;
     this.lockedTickCount = 0;
@@ -1191,12 +1195,35 @@ export class TrackingService {
     // After a user reset, leave out the blob we were locked on — the user just
     // told us it is not them — unless the classifier vouches for it, or it is
     // the only candidate there is.
-    if (this.avoidPoint && performance.now() < this.avoidUntilMs) {
-      const avoid = this.avoidPoint;
+    //
+    // The avoided blob is followed while we scan, and the avoidance dropped the
+    // moment it moves: what RESET is for is a lock stuck on something static
+    // (a ward). A blob that walks away is a champion — quite possibly us, with
+    // RESET pressed on a lock that was right — and the ordinary scan decides.
+    if (this.avoidPoint && performance.now() < this.avoidUntilMs && this.avoidOrigin) {
       const radius = Math.max(5, this.expectedIconDiam * 0.6);
-      const others = tealBlobs.filter(b =>
-        Math.hypot(b.cx - avoid.x, b.cy - avoid.y) > radius || this.getClassifierScore(b) >= 0.5);
-      if (others.length > 0) tealBlobs = others;
+      let nearest: Blob | null = null;
+      let nearestDist = computeNearFieldPx(this.expectedIconDiam);
+      for (const b of tealBlobs) {
+        const d = Math.hypot(b.cx - this.avoidPoint.x, b.cy - this.avoidPoint.y);
+        if (d <= nearestDist) { nearest = b; nearestDist = d; }
+      }
+      if (nearest) this.avoidPoint = { x: nearest.cx, y: nearest.cy };
+      const moved = Math.hypot(this.avoidPoint.x - this.avoidOrigin.x, this.avoidPoint.y - this.avoidOrigin.y);
+      if (moved > Math.max(3, this.expectedIconDiam * WRONG_LOCK_STILL_FRACTION)) {
+        console.log('[Tracking] The spot reset away from moved — it is a champion, not a marker; scanning normally');
+        this.avoidPoint = null;
+      } else if (nearest && performance.now() - (this.avoidUntilMs - RESET_AVOID_MS) < RESET_OBSERVE_MS) {
+        // Still there and not moved yet: watch it a little longer before
+        // locking anything, or a champion walking at ordinary speed would be
+        // ruled out before it had covered the distance that clears it.
+        return;
+      } else {
+        const avoid = this.avoidPoint;
+        const others = tealBlobs.filter(b =>
+          Math.hypot(b.cx - avoid.x, b.cy - avoid.y) > radius || this.getClassifierScore(b) >= 0.5);
+        if (others.length > 0) tealBlobs = others;
+      }
     }
 
     this.scanFrameCount++;

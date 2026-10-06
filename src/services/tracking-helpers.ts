@@ -369,20 +369,35 @@ export const WRONG_LOCK_RUNS = 6;
 export const WRONG_LOCK_MIN_MS = 4000;
 /** How long a scan after a user reset steers away from where we were. */
 export const RESET_AVOID_MS = 10_000;
+/** How long that scan watches the abandoned blob for movement before locking. */
+export const RESET_OBSERVE_MS = 1500;
 
-/** Evidence older than this, with nothing new since, is dropped. */
-export const WRONG_LOCK_STALE_MS = 15_000;
+/**
+ * A gap this long between supporting runs drops the evidence. The case this
+ * exists for is a model that says the same thing on run after run; a stray
+ * noise hit every few seconds must never add up to a switch.
+ */
+export const WRONG_LOCK_STALE_MS = 3000;
+
+/**
+ * How far the followed blob may drift (as a fraction of an icon) and still
+ * count as not moving. A ward's centroid jitters by a pixel or two; a champion
+ * walking at ordinary speed leaves this radius within about a second.
+ */
+export const WRONG_LOCK_STILL_FRACTION = 0.25;
 
 export interface WrongLockEvidence {
   /** Region px: where the followed blob was when the evidence started. */
   anchor: { x: number; y: number } | null;
+  /** Region px: where the preferred blob was on the latest supporting run. */
+  best: { x: number; y: number } | null;
   runs: number;
   firstMs: number;
   lastMs: number;
 }
 
 export function emptyWrongLockEvidence(): WrongLockEvidence {
-  return { anchor: null, runs: 0, firstMs: 0, lastMs: 0 };
+  return { anchor: null, best: null, runs: 0, firstMs: 0, lastMs: 0 };
 }
 
 export interface WrongLockRun {
@@ -401,25 +416,28 @@ export interface WrongLockRun {
  * Returns the blob to move to once the evidence is sufficient, else null.
  *
  * Phase 1 follows whatever teal blob is nearest on continuity alone (see
- * computeNearFieldPx), so walking past something static and teal — a ward,
- * as far as a v0.5.10 log shows — at the moment our own icon is hidden hands
- * the lock to it. Nothing moved it back: the static blob never vanishes, so
- * there is never a hold for Phase 2 to act on, and the classifier saying "not
- * us" about it for three and a half minutes went unheard. The other player
- * heard nothing the whole time, because they were scored against the ward.
+ * computeNearFieldPx). In a v0.5.10 log, the player's icon was briefly covered
+ * by an enemy's beside something static and teal — a ward, most likely — and
+ * the lock came out of it on the ward. The ward stayed visible, so the lock
+ * stayed with it; the classifier, on the runs where it recognised anything,
+ * rated the ward 0.00 and the real icon 1.00, and nothing listened. The other
+ * player was scored against the ward and heard nothing for minutes.
  *
  * What counts as evidence is deliberately narrow, because the classifier is
- * weak on some champions and a confident wrong switch onto an ally is worse
- * than staying put:
- *  - only runs where the model discriminated at all count; silent runs are
- *    neutral (some champions score 0.000 on most runs);
- *  - the followed blob must score near zero AND a distinct blob must be the
- *    one the model prefers;
- *  - the followed blob must not have moved more than one icon from where the
- *    evidence started. A champion we are actually following moves; a static
- *    marker does not. This is what keeps a weak classifier from ever moving a
- *    lock that is following a walking champion;
- *  - any run where the followed blob scores well resets everything.
+ * weak on some champions — its raw scores for the champion in that log were
+ * 0.000 to 0.03, barely above the normalization floor — and a confident wrong
+ * switch onto an ally is worse than staying put:
+ *  - silent runs (nothing cleared the raw floor) are neutral;
+ *  - a supporting run has the followed blob at <= 0.1 and a distinct blob the
+ *    clear favourite; any other discriminating run resets everything;
+ *  - it must be the SAME preferred blob each time (it may drift, as a walking
+ *    champion does); noise spread over several allies never adds up;
+ *  - supporting runs must come close together (WRONG_LOCK_STALE_MS);
+ *  - the followed blob must stay essentially still (WRONG_LOCK_STILL_FRACTION
+ *    of an icon). A ward does not move; a champion we are following does.
+ *
+ * Not protected: a champion standing still while a weak classifier is
+ * consistently, densely sure it is a particular ally for 4s.
  */
 export function nextWrongLockEvidence(
   ev: WrongLockEvidence,
@@ -429,20 +447,24 @@ export function nextWrongLockEvidence(
 ): { evidence: WrongLockEvidence; switchTo: { x: number; y: number } | null } {
   const none = { evidence: emptyWrongLockEvidence(), switchTo: null };
   if (ev.runs > 0 && nowMs - ev.lastMs > WRONG_LOCK_STALE_MS) ev = emptyWrongLockEvidence();
-  if (!run.discriminating || !run.followed) return { evidence: ev, switchTo: null };
-  if (run.followedScore >= 0.5) return none;
+  if (!run.discriminating) return { evidence: ev, switchTo: null };
+  if (!run.followed) return none;
 
   const best = run.best;
-  const distinct = !!best && Math.hypot(best.x - run.followed.x, best.y - run.followed.y) > iconDiam;
-  if (run.followedScore > 0.1 || !best || !distinct || best.score < 0.99) {
-    return { evidence: ev, switchTo: null };
-  }
+  const supports = run.followedScore <= 0.1 && !!best && best.score >= 0.99 &&
+    Math.hypot(best.x - run.followed.x, best.y - run.followed.y) > iconDiam;
+  if (!supports || !best) return none;
 
-  if (ev.anchor && Math.hypot(run.followed.x - ev.anchor.x, run.followed.y - ev.anchor.y) > iconDiam) {
+  const still = Math.max(3, iconDiam * WRONG_LOCK_STILL_FRACTION);
+  if (ev.anchor && Math.hypot(run.followed.x - ev.anchor.x, run.followed.y - ev.anchor.y) > still) {
+    ev = emptyWrongLockEvidence();
+  }
+  if (ev.best && Math.hypot(best.x - ev.best.x, best.y - ev.best.y) > iconDiam) {
     ev = emptyWrongLockEvidence();
   }
   const next: WrongLockEvidence = {
     anchor: ev.anchor ?? { x: run.followed.x, y: run.followed.y },
+    best: { x: best.x, y: best.y },
     runs: ev.runs + 1,
     firstMs: ev.runs > 0 ? ev.firstMs : nowMs,
     lastMs: nowMs,
