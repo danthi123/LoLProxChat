@@ -297,6 +297,86 @@ export function isPossibleOccluder(b: Blob, expectedIconDiam: number): boolean {
   return bw >= lo && bh >= lo && bw <= hi && bh <= hi;
 }
 
+// ---------- our icon merged with a teammate's ----------
+
+/**
+ * A teal blob too big to be one icon but small enough to be two or three
+ * touching: our icon merged with a teammate's. filterIconBlobs drops these —
+ * past 1.6 icons across they are not an icon — so without this a player
+ * standing beside a teammate simply vanished from the tracker. In a v0.5.12
+ * two-player log the pair laned together, the tracker gave up on the player
+ * every time their icons overlapped, and the rescan then locked onto the
+ * teammate's icon, the only clean one left.
+ */
+export function isPossibleStack(b: Blob, expectedIconDiam: number): boolean {
+  if (b.color !== 'teal' || b.pixels < 15) return false;
+  if (b.fillRatio > 0.40 || b.fillRatio < 0.08) return false;
+  const bw = b.maxX - b.minX + 1;
+  const bh = b.maxY - b.minY + 1;
+  const single = expectedIconDiam * 1.6;
+  if (bw <= single && bh <= single) return false;
+  // Three in a row reach ~2.7 icons, and one of them walking off diagonally
+  // stretches the box further before it comes away; anything under 3.2 icons
+  // keeps a group we are following matched while it does.
+  const hi = expectedIconDiam * 3.2;
+  return bw >= expectedIconDiam * 0.6 && bh >= expectedIconDiam * 0.6 && bw <= hi && bh <= hi;
+}
+
+/**
+ * The merged blob we are part of, if any: one whose extent reaches our last
+ * position (within half an icon) and whose centroid is within 1.5 icons —
+ * the same pair of tests findOccluder uses for merged enemy icons, and for the
+ * same reason (a diagonal pair's bounding box has an empty corner).
+ */
+export function findStack(stacks: Blob[], at: { x: number; y: number }, expectedIconDiam: number): Blob | null {
+  const pad = expectedIconDiam * 0.5;
+  let best: Blob | null = null;
+  let bestDist = Infinity;
+  for (const b of stacks) {
+    if (at.x < b.minX - pad || at.x > b.maxX + pad || at.y < b.minY - pad || at.y > b.maxY + pad) continue;
+    const d = Math.hypot(b.cx - at.x, b.cy - at.y);
+    if (d > expectedIconDiam * 1.5 || d >= bestDist) continue;
+    best = b;
+    bestDist = d;
+  }
+  return best;
+}
+
+/**
+ * Where in a merged blob we are: the point nearest `toward` (our predicted
+ * position) at which an icon centre could sit, i.e. at least half an icon in
+ * from the blob's edges. Keeps us on our own side of the pair, and moves with
+ * the pair when it walks.
+ */
+export function positionInStack(b: Blob, toward: { x: number; y: number }, expectedIconDiam: number): { x: number; y: number } {
+  const r = expectedIconDiam / 2;
+  const clamp = (v: number, lo: number, hi: number) => (lo > hi ? (lo + hi) / 2 : Math.min(hi, Math.max(lo, v)));
+  return {
+    x: clamp(toward.x, b.minX + r, b.maxX + 1 - r),
+    y: clamp(toward.y, b.minY + r, b.maxY + 1 - r),
+  };
+}
+
+/**
+ * How long we follow a merged blob wider than about two icons (three or more
+ * teammates) before treating it as lost: it may be teammates we left.
+ */
+export const MAX_STACKED_MS = 15_000;
+
+/** Consecutive classifier runs at >= 0.5 that release an excluded bystander icon. */
+export const BYSTANDER_VOUCH_RUNS = 3;
+
+/**
+ * How far from where we were lost (region px) a rescan may lock an icon that
+ * nothing identifies: two icons, plus walking speed for the time since. A
+ * champion moves about 6px/s on a 1.92-scale minimap; 8px/s leaves margin and
+ * covers the whole minimap within about 40s, so a champion the classifier
+ * never recognises is not left unlocked for good.
+ */
+export function rescanReachPx(expectedIconDiam: number, elapsedMs: number): number {
+  return expectedIconDiam * 2 + 8 * Math.max(0, elapsedMs) / 1000;
+}
+
 // ---------- v0.3 tracking tweaks (driven by IXAM's v0.1.33 issue #7 logs) ----------
 
 /**
