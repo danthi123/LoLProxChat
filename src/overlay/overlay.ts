@@ -109,12 +109,25 @@ btnMuteAll.addEventListener('click', () => {
   sendToBackground('toggleMuteAll', {});
 });
 
+// "Wrong position?": the header's POS button (always in reach, collapsed or
+// not) and the labelled RESET row in Settings do the same thing. Both light up
+// for 2s so a click mid-game visibly registered.
 const btnResetPosition = document.getElementById('btn-reset-position')!;
-btnResetPosition.addEventListener('click', () => {
+const btnResetHeader = document.getElementById('btn-reset-header')!;
+let resetFeedbackId: ReturnType<typeof setTimeout> | null = null;
+function resetPosition(): void {
   sendToBackground('resetPosition', {});
   btnResetPosition.textContent = 'SEARCHING';
-  setTimeout(() => { btnResetPosition.textContent = 'RESET'; }, 2000);
-});
+  btnResetHeader.classList.add('searching');
+  if (resetFeedbackId !== null) clearTimeout(resetFeedbackId);
+  resetFeedbackId = setTimeout(() => {
+    btnResetPosition.textContent = 'RESET';
+    btnResetHeader.classList.remove('searching');
+    resetFeedbackId = null;
+  }, 2000);
+}
+btnResetPosition.addEventListener('click', resetPosition);
+btnResetHeader.addEventListener('click', resetPosition);
 
 btnSettings.addEventListener('click', () => {
   settingsPanel.classList.toggle('hidden');
