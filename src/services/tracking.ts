@@ -151,6 +151,8 @@ export class TrackingService {
   // Teal blobs too big for one icon: ours merged with a teammate's. See
   // stackStep().
   private stackBlobs: Blob[] = [];
+  // This frame's single-icon teal blobs, bystanders left out.
+  private frameTealIcons: Blob[] = [];
   private stacked = false;
   // Where the teammate's icon sits in the pair (region px), mirrored from ours
   // through the merged blob's centroid.
@@ -158,6 +160,11 @@ export class TrackingService {
   // Our position relative to the merged blob's centroid (region px), so we
   // move with the pair and keep to our side of it. See stackStep().
   private stackOffset: { x: number; y: number } | null = null;
+  // The most pixels the merged blob has had this episode, and whether it has
+  // ever been wider than about two icons: an icon leaving a group of three or
+  // more leaves a merged pair behind, not one icon. See stackStep().
+  private stackPeakPixels = 0;
+  private stackWasWide = false;
   // Where we last saw our icon on its own (one icon's size, nothing over it),
   // and when: which side of a merged pair we are on.
   private lastCleanReg: { x: number; y: number } | null = null;
@@ -380,6 +387,9 @@ export class TrackingService {
 
     this.state = TrackingState.SCANNING;
     this.lostAt = null;
+    this.bystanders = [];
+    this.bystanderBlobs = [];
+    this.lastCleanReg = null;
     this.lastPixelPos = null;
     this.lockedTickCount = 0;
     this.scanFrameCount = 0;
@@ -422,6 +432,9 @@ export class TrackingService {
     }
     this.state = TrackingState.SCANNING;
     this.lostAt = null;
+    this.bystanders = [];
+    this.bystanderBlobs = [];
+    this.lastCleanReg = null;
     this.lastPixelPos = null;
     this.lockedTickCount = 0;
     this.scanFrameCount = 0;
@@ -1169,6 +1182,7 @@ export class TrackingService {
     const iconBlobs = this.excludeBystanders(this.filterIconBlobs(allBlobs));
     this.occluderBlobs = allBlobs.filter(b => isPossibleOccluder(b, this.expectedIconDiam));
     this.stackBlobs = allBlobs.filter(b => isPossibleStack(b, this.expectedIconDiam));
+    this.frameTealIcons = iconBlobs.filter(b => b.color === 'teal');
     this.minimapReadable = allBlobs.length > 0;
 
     // Regenerate the debug-mode filtered image at 5Hz (scan-rate independent).
@@ -1238,6 +1252,18 @@ export class TrackingService {
     if (!this.minimapRegion) return;
 
     let tealBlobs = iconBlobs.filter(b => b.color === 'teal');
+    // A bystander with our movement path drawn from it is us after all: the
+    // icon we lost reappeared within two icons of where we were, but beyond
+    // the hold's near field. Exclusion is released only by the classifier
+    // otherwise, and a silent classifier would never release it.
+    const pathed = this.bystanderBlobs.filter(b =>
+      b.color === 'teal' && this.whitePixelScore(b, whiteMask, viewportMask, region.width, region.height) > 0);
+    if (pathed.length > 0) {
+      this.bystanders = this.bystanders.filter(o => !pathed.some(b => b.cx === o.x && b.cy === o.y));
+      this.bystanderBlobs = this.bystanderBlobs.filter(b => !pathed.includes(b));
+      tealBlobs = [...tealBlobs, ...pathed];
+      console.log('[Tracking] Movement path drawn from an icon set aside as a teammate\'s — considering it again');
+    }
     if (tealBlobs.length === 0) return;
     let avoidedSomething = false;
 
@@ -1866,6 +1892,8 @@ export class TrackingService {
     this.stackedSinceMs = 0;
     this.stackPartner = null;
     this.stackOffset = null;
+    this.stackPeakPixels = 0;
+    this.stackWasWide = false;
   }
 
   /**
@@ -1974,10 +2002,13 @@ export class TrackingService {
    * side as it changes shape. The blob's shape changes are not fed into the
    * velocity, which only decays.
    *
-   * A blob wider than about two icons may be teammates we left behind (a
-   * recall from the middle of a group): those are followed for at most
-   * MAX_STACKED_MS. A two-icon merge needs no cap: if ours leaves it, what is
-   * left is one icon, and resolveStackExit handles it.
+   * A two-icon merge needs no cap: if ours leaves it, what is left is one
+   * icon, and resolveStackExit handles it. Once the blob has been wider than
+   * about two icons, though, what is left after we leave can still be a
+   * merged pair, which findStack matches as before. So the episode ends — a
+   * hold, which disowns us as for any recall — when the blob loses about an
+   * icon's worth of pixels from its peak, and in any case after
+   * MAX_STACKED_MS.
    */
   private stackStep(lastReg: { x: number; y: number }): boolean {
     if (!this.minimapRegion) return false;
@@ -1993,14 +2024,34 @@ export class TrackingService {
       const clean = this.lastCleanReg && now - this.lastCleanMs <= 10_000 ? this.lastCleanReg : lastReg;
       const start = positionInStack(stack, clean, diam);
       this.stackOffset = { x: start.x - stack.cx, y: start.y - stack.cy };
+      this.stackPeakPixels = stack.pixels;
+      this.stackWasWide = Math.max(stack.maxX - stack.minX + 1, stack.maxY - stack.minY + 1) > diam * 2.1;
       console.log('[Tracking] Own icon merged with a teammate\'s — following the pair until they separate');
     } else {
-      const wide = Math.max(stack.maxX - stack.minX + 1, stack.maxY - stack.minY + 1) > diam * 2.1;
-      if (wide && now - this.stackedSinceMs > MAX_STACKED_MS) {
-        this.stacked = false;
-        this.stackOffset = null;
-        console.log('[Tracking] Stopped following merged teammate icons (the ' + (MAX_STACKED_MS / 1000) + 's cap) — holding as lost');
-        return false;
+      const span = Math.max(stack.maxX - stack.minX + 1, stack.maxY - stack.minY + 1);
+      if (span > diam * 2.1) this.stackWasWide = true;
+      this.stackPeakPixels = Math.max(this.stackPeakPixels, stack.pixels);
+      if (this.stackWasWide) {
+        const iconPx = this.fullIconPixels > 0 ? this.fullIconPixels : stack.pixels / 2;
+        let shrank = stack.pixels < this.stackPeakPixels - iconPx * 0.6;
+        // A teammate walking out of the group shows up as an icon beside it;
+        // ours vanishing (a recall) leaves nothing. The first is no reason to
+        // stop following the rest.
+        if (shrank && this.frameTealIcons.some(b =>
+          b.cx >= stack.minX - diam * 1.5 && b.cx <= stack.maxX + diam * 1.5 &&
+          b.cy >= stack.minY - diam * 1.5 && b.cy <= stack.maxY + diam * 1.5)) {
+          shrank = false;
+          this.stackPeakPixels = stack.pixels;
+        }
+        const capped = now - this.stackedSinceMs > MAX_STACKED_MS;
+        if (shrank || capped) {
+          this.stacked = false;
+          this.stackOffset = null;
+          console.log(shrank
+            ? '[Tracking] An icon left the merged teammate icons we were following — holding as lost'
+            : '[Tracking] Stopped following merged teammate icons (the ' + (MAX_STACKED_MS / 1000) + 's cap) — holding as lost');
+          return false;
+        }
       }
     }
 

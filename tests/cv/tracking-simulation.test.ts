@@ -1559,6 +1559,65 @@ describe('walking alongside a teammate — review findings', () => {
   });
 });
 
+describe('walking alongside a teammate — second review', () => {
+  const SOLO: SceneSpec = { ...BACKDROP };
+  const meet = at(START, STEP, 16);
+  const group = (self: Point | null, mates: Point[]): SceneSpec =>
+    ({ ...SOLO, self, selfTrail: null, allies: [...SOLO.allies!, ...mates] });
+  async function run(specs: SceneSpec[]) {
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records: Awaited<ReturnType<typeof driveTracker>> = [];
+    for (const sc of scenes) records.push(...await driveTracker(h, [sc]));
+    return records;
+  }
+
+  test('our icon set aside near where we were lost is taken back once our movement path shows on it', async () => {
+    // A silent classifier and our icon reappearing 1.5 icons from where it
+    // vanished: past the hold's near field, so the forced rescan sets it aside
+    // as a teammate's. The movement path drawn from it is what says it is us.
+    const last = at(START, STEP, 15);
+    const back = { x: last.x + 36, y: last.y };
+    const records = await run([
+      ...walk(16), ...vanished(4),
+      ...Array.from({ length: 120 }, () => ({ ...SOLO, self: back, selfTrail: { x: -STEP.x, y: -STEP.y } })),
+    ]);
+    const end = records[records.length - 1];
+    expect(end.state).toBe(TrackingState.LOCKED);
+    expect(distance(end.px!, back)).toBeLessThanOrEqual(3);
+  });
+
+  test('recalling out of a group of three does not leave us following the two left behind', async () => {
+    // Three teammates merged into one wide blob; we recall and the other two
+    // stay merged as a pair, which still looks like a stack. Following it
+    // would keep a player sitting in base audible in lane, with no hold.
+    const mates = [{ x: meet.x + 16, y: meet.y }, { x: meet.x + 32, y: meet.y }];
+    const trio = Array.from({ length: 24 }, () => group(meet, mates));
+    const after = Array.from({ length: 80 }, () => group(null, mates));
+    const records = await run([...walk(17), ...trio, ...after]);
+    expect(logs.some(l => l.includes('merged with a teammate'))).toBe(true);
+    expect(logs.some(l => l.includes('An icon left the merged teammate icons'))).toBe(true);
+    const recallAt = 17 + 24;
+    expect(records[recallAt + 24].holdSec).toBeGreaterThan(2);
+    const pairCentre = { x: meet.x + 24, y: meet.y };
+    records.slice(recallAt + 4).forEach(r => {
+      if (r.state === TrackingState.LOCKED && r.holdSec === 0) expect(distance(r.px!, pairCentre)).toBeGreaterThan(20);
+    });
+  });
+
+  test('a teammate walking out of a group of three leaves us following the other', async () => {
+    const a = { x: meet.x + 16, y: meet.y };
+    const trio = Array.from({ length: 24 }, () => group(meet, [a, { x: meet.x + 32, y: meet.y }]));
+    const leave = Array.from({ length: 40 }, (_, i) => group(meet, [a, { x: meet.x + 32 + i, y: meet.y + i }]));
+    const records = await run([...walk(17), ...trio, ...leave]);
+    expect(logs.some(l => l.includes('An icon left the merged teammate icons'))).toBe(false);
+    for (const r of records.slice(-16)) {
+      expect(r.holdSec).toBe(0);
+      expect(distance(r.px!, meet)).toBeLessThanOrEqual(12);
+    }
+  });
+});
+
 describe('the rescan after a hold runs out', () => {
   test('does not lock an unidentified teammate icon far from where we were lost', async () => {
     // Our icon is gone (fog, a merge the tracker could not follow) for long

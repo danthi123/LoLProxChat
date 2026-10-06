@@ -315,7 +315,10 @@ export function isPossibleStack(b: Blob, expectedIconDiam: number): boolean {
   const bh = b.maxY - b.minY + 1;
   const single = expectedIconDiam * 1.6;
   if (bw <= single && bh <= single) return false;
-  const hi = expectedIconDiam * 2.6;
+  // Three in a row reach ~2.7 icons, and one of them walking off diagonally
+  // stretches the box further before it comes away; anything under 3.2 icons
+  // keeps a group we are following matched while it does.
+  const hi = expectedIconDiam * 3.2;
   return bw >= expectedIconDiam * 0.6 && bh >= expectedIconDiam * 0.6 && bw <= hi && bh <= hi;
 }
 
