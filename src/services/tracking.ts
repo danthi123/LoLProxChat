@@ -660,7 +660,7 @@ export class TrackingService {
     this.wrongLockTarget = null;
     this.resetOcclusion();
     console.log('[Tracking] Position reset by the user — rescanning' +
-      (was ? ' (avoiding (' + Math.round(was.x) + ',' + Math.round(was.y) + ') for ' + RESET_AVOID_MS / 1000 + 's)' : ''));
+      (was ? ' (avoiding (' + Math.round(was.x) + ',' + Math.round(was.y) + ') for the next lock, within ' + RESET_AVOID_MS / 1000 + 's)' : ''));
     return true;
   }
 
@@ -1191,6 +1191,7 @@ export class TrackingService {
 
     let tealBlobs = iconBlobs.filter(b => b.color === 'teal');
     if (tealBlobs.length === 0) return;
+    let avoidedSomething = false;
 
     // After a user reset, leave out the blob we were locked on — the user just
     // told us it is not them — unless the classifier vouches for it, or it is
@@ -1202,18 +1203,22 @@ export class TrackingService {
     // RESET pressed on a lock that was right — and the ordinary scan decides.
     if (this.avoidPoint && performance.now() < this.avoidUntilMs && this.avoidOrigin) {
       const radius = Math.max(5, this.expectedIconDiam * 0.6);
+      // Follow it in small steps only: a champion moves under a pixel a frame,
+      // and anything further is a different icon or a frame the avoided blob
+      // was not seen on — neither of which says it moved.
+      const still = Math.max(3, this.expectedIconDiam * WRONG_LOCK_STILL_FRACTION);
       let nearest: Blob | null = null;
-      let nearestDist = computeNearFieldPx(this.expectedIconDiam);
+      let nearestDist = still;
       for (const b of tealBlobs) {
         const d = Math.hypot(b.cx - this.avoidPoint.x, b.cy - this.avoidPoint.y);
         if (d <= nearestDist) { nearest = b; nearestDist = d; }
       }
       if (nearest) this.avoidPoint = { x: nearest.cx, y: nearest.cy };
       const moved = Math.hypot(this.avoidPoint.x - this.avoidOrigin.x, this.avoidPoint.y - this.avoidOrigin.y);
-      if (moved > Math.max(3, this.expectedIconDiam * WRONG_LOCK_STILL_FRACTION)) {
+      if (moved > still) {
         console.log('[Tracking] The spot reset away from moved — it is a champion, not a marker; scanning normally');
         this.avoidPoint = null;
-      } else if (nearest && performance.now() - (this.avoidUntilMs - RESET_AVOID_MS) < RESET_OBSERVE_MS) {
+      } else if (performance.now() - (this.avoidUntilMs - RESET_AVOID_MS) < RESET_OBSERVE_MS) {
         // Still there and not moved yet: watch it a little longer before
         // locking anything, or a champion walking at ordinary speed would be
         // ruled out before it had covered the distance that clears it.
@@ -1222,7 +1227,10 @@ export class TrackingService {
         const avoid = this.avoidPoint;
         const others = tealBlobs.filter(b =>
           Math.hypot(b.cx - avoid.x, b.cy - avoid.y) > radius || this.getClassifierScore(b) >= 0.5);
-        if (others.length > 0) tealBlobs = others;
+        if (others.length > 0 && others.length < tealBlobs.length) {
+          tealBlobs = others;
+          avoidedSomething = true;
+        }
       }
     }
 
@@ -1245,6 +1253,7 @@ export class TrackingService {
     // diagnosed from user logs, and a composite alone cannot tell us whether
     // the classifier or the white-pixel heuristic chose the blob.
     let bestTerms = '';
+    let bestWhite = 0;
 
     // The classifier only earns its 0.45 weight if it actually discriminated
     // this frame. updateClassifierScores() zeroes every blob when no raw score
@@ -1276,6 +1285,7 @@ export class TrackingService {
       if (score > bestScore) {
         bestScore = score;
         bestBlob = b;
+        bestWhite = whiteScore;
         bestTerms = 'cls=' + clsScore.toFixed(2) +
           ' white=' + whiteScore.toFixed(2) +
           ' ring=' + ringScore.toFixed(2);
@@ -1289,6 +1299,16 @@ export class TrackingService {
     // position. The classifier still contributes to the composite score above;
     // it's just no longer a veto. The whole classifier-confidence path is being
     // replaced by template matching in v0.4 (docs/plans/2026-06-03-cv-tracking-research.md).
+    // A user reset that ruled out the old spot, with nothing that actually
+    // identifies us — no classifier signal, no movement path — would lock on
+    // whichever icon has the cleanest ring: an arbitrary ally, which Phase 1
+    // then follows and nothing corrects. Wait instead (we are team-only while
+    // scanning) until the player walks or the classifier speaks, for as long
+    // as the reset's window lasts; after that, scan as usual.
+    if (avoidedSomething && !classifierUsable && bestWhite <= 0) {
+      return;
+    }
+
     this.lockOnBlob(bestBlob, 'composite(score=' + bestScore.toFixed(2) + ' ' + bestTerms + ')');
   }
 

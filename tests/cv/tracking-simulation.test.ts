@@ -1151,25 +1151,51 @@ describe('a lock that ends up on a static teal marker (v0.5.10 Briar log)', () =
 
   test('"Wrong position?" finds the champion when the classifier is no help', async () => {
     // A model that recognises nothing cannot catch this; the user can. The
-    // champion has stopped (no movement trail) and the only other teal icon
-    // nearby is below it, so nothing but the reset's avoidance stops the scan
-    // re-picking the ward, which comes first in raster order.
+    // only other teal icon nearby is below the champion, so nothing but the
+    // reset's avoidance stops the scan re-picking the ward, which comes first
+    // in raster order. Standing still, the champion carries nothing that
+    // identifies it either, so the scan waits for it to walk.
     const STAND: Point = { x: 185, y: 175 };
     const SPARSE: SceneSpec = { ...BACKDROP, allies: [WARD, BACKDROP.allies![1]] };
-    const after = Array.from({ length: 40 }, () => ({ ...SPARSE, self: STAND, selfTrail: null }));
-    const stuck = await drive('zero', 40, -1, after);
-    expect(distance(stuck.records[stuck.records.length - 1].px!, WARD)).toBeLessThanOrEqual(3);
+    const after = [
+      ...Array.from({ length: 32 }, () => ({ ...SPARSE, self: STAND, selfTrail: null })),
+      ...walk(24, STAND, { x: 0, y: -1 }, SPARSE),
+    ];
+    const stuck = await drive('zero', after.length, -1, after);
+    expect(distance(stuck.records[stuck.awayFrom + 30].px!, WARD)).toBeLessThanOrEqual(3);
 
     logs.length = 0;
-    const resetAt = stuck.awayFrom + 16;
-    const { records } = await drive('zero', 40, resetAt, after);
+    const resetAt = stuck.awayFrom + 8;
+    const { records } = await drive('zero', after.length, resetAt, after);
     expect(logs.some(l => l.includes('Position reset by the user'))).toBe(true);
-    expect(records[resetAt].state).toBe(TrackingState.SCANNING);
-    const relocked = records.findIndex((r, i) => i > resetAt && r.state === TrackingState.LOCKED);
-    expect(relocked).toBeGreaterThan(resetAt);
+    const walkFrom = stuck.awayFrom + 32;
+    // Standing still: no lock at all, rather than an arbitrary one.
+    for (const r of records.slice(resetAt, walkFrom)) expect(r.state).toBe(TrackingState.SCANNING);
+    const relocked = records.findIndex((r, i) => i >= walkFrom && r.state === TrackingState.LOCKED);
+    expect(relocked).toBeGreaterThanOrEqual(walkFrom);
     for (const r of records.slice(relocked)) {
       expect(r.state).toBe(TrackingState.LOCKED);
-      expect(distance(r.px!, STAND)).toBeLessThanOrEqual(3);
+      expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    }
+  });
+
+  test('a ward vanishing for one frame during the watch neither locks early nor counts as movement', async () => {
+    const STAND: Point = { x: 185, y: 175 };
+    const SPARSE: SceneSpec = { ...BACKDROP, allies: [WARD, BACKDROP.allies![1]] };
+    const NO_WARD: SceneSpec = { ...BACKDROP, allies: [BACKDROP.allies![1]] };
+    const after = Array.from({ length: 40 }, (_, i) =>
+      ({ ...(i === 18 ? NO_WARD : SPARSE), self: STAND, selfTrail: null }));
+    const stuck = await drive('zero', after.length, -1, after);
+    const resetAt = stuck.awayFrom + 8;
+    logs.length = 0;
+    const { records } = await drive('zero', after.length, resetAt, after);
+    expect(logs.some(l => l.includes('not a marker'))).toBe(false);
+    // The watch is 1.5s whether or not the ward was seen on every frame of it:
+    // frame resetAt + k runs (k + 1) * 125ms after the reset, and the ward is
+    // missing at k = 10.
+    for (const r of records.slice(resetAt, resetAt + 11)) expect(r.state).toBe(TrackingState.SCANNING);
+    for (const r of records.slice(resetAt)) {
+      if (r.state === TrackingState.LOCKED) expect(distance(r.px!, WARD)).toBeGreaterThan(30);
     }
   });
 });
@@ -1178,7 +1204,8 @@ describe('the wrong-lock check leaves a walking champion alone', () => {
   test('a classifier sure of a distant ally does not pull a lock that is moving', async () => {
     // A weak model confidently preferring someone else is the risk this check
     // carries. What protects a correct lock is that we move: the evidence only
-    // builds while the followed blob stays within one icon of where it started.
+    // builds while the followed blob stays within a quarter icon (WRONG_LOCK_STILL_FRACTION,
+    // at least 3px) of where it started.
     // Locked correctly first; from then on the model is sure it is the ally.
     const FAR_ALLY: Point = BACKDROP.allies![1];
     const specs = walk(70);

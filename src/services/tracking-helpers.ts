@@ -367,7 +367,11 @@ export function shouldForceReacquisition(holdStartMs: number, nowMs: number): bo
  */
 export const WRONG_LOCK_RUNS = 6;
 export const WRONG_LOCK_MIN_MS = 4000;
-/** How long a scan after a user reset steers away from where we were. */
+/**
+ * How long a scan after a user reset may keep steering away from where we were
+ * and waiting for something that identifies us. The avoidance ends at the next
+ * lock, which is usually much sooner.
+ */
 export const RESET_AVOID_MS = 10_000;
 /** How long that scan watches the abandoned blob for movement before locking. */
 export const RESET_OBSERVE_MS = 1500;
@@ -436,8 +440,9 @@ export interface WrongLockRun {
  *  - the followed blob must stay essentially still (WRONG_LOCK_STILL_FRACTION
  *    of an icon). A ward does not move; a champion we are following does.
  *
- * Not protected: a champion standing still while a weak classifier is
- * consistently, densely sure it is a particular ally for 4s.
+ * Not protected: a champion standing still, or shuffling within a quarter
+ * icon of one spot (last-hitting), while a weak classifier is consistently,
+ * densely sure it is one particular ally for 4s.
  */
 export function nextWrongLockEvidence(
   ev: WrongLockEvidence,
