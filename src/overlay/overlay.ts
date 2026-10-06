@@ -19,7 +19,7 @@ import { getAllyProximity, setAllyProximity, getCameraListen, setCameraListen } 
 import { computeDesiredHeight, shouldSendSize } from './resize-helpers';
 import { browserKeyToWin32Vk, humanizeVk } from '../core/keymap';
 import {
-  LANGUAGES, Lang, applyTranslations, getLanguage, setLanguage, t, translateKey, translateStatus,
+  LANGUAGES, Lang, StringKey, applyTranslations, getLanguage, setLanguage, t, translateKey, translateStatus,
 } from './i18n';
 import '../core/window-globals';
 
@@ -235,21 +235,27 @@ btnAutoUpdate.addEventListener('click', () => {
   syncAutoUpdateButton();
 });
 
+// Kept as a key so a language switch re-renders the line instead of wiping it.
+let updateStatusMsg: { key: StringKey; params: Record<string, string> } | null = null;
+function setUpdateStatus(key: StringKey | null, params: Record<string, string> = {}): void {
+  updateStatusMsg = key ? { key, params } : null;
+  updateStatus.textContent = key ? t(key, params) : '';
+}
+
 async function runUpdateCheck(triggeredByUser: boolean): Promise<void> {
-  updateStatus.textContent = t('update.checking');
+  setUpdateStatus('update.checking');
   try {
     const info = await checkForUpdate();
     if (info.update_available && info.download_url) {
-      updateStatus.textContent = t('update.available', { version: String(info.latest_version) });
+      setUpdateStatus('update.available', { version: String(info.latest_version) });
       await downloadAndApply(info.download_url);
       // If apply succeeds, the process exits before we reach here
     } else {
-      updateStatus.textContent = triggeredByUser
-        ? t('update.upToDate', { version: String(info.current_version) })
-        : '';
+      if (triggeredByUser) setUpdateStatus('update.upToDate', { version: String(info.current_version) });
+      else setUpdateStatus(null);
     }
   } catch (e) {
-    updateStatus.textContent = t('update.failed', { error: (e as Error).message });
+    setUpdateStatus('update.failed', { error: (e as Error).message });
   }
 }
 
@@ -342,10 +348,11 @@ function setupBindButton(buttonId: string, storageKey: string, backgroundCmd: st
   const label = (): string =>
     boundVk !== null && !Number.isNaN(boundVk) && boundVk > 0 ? translateKey(humanizeVk(boundVk)) : t('settings.unbound');
   btn.textContent = label();
-  bindRelabelers.push(() => { if (!btn.disabled) btn.textContent = label(); });
+  // Mid-capture the button shows the prompt (or a 1.5s rejection, which then
+  // restores label() in whatever language is current by then).
+  bindRelabelers.push(() => { btn.textContent = btn.disabled ? t('settings.pressKey') : label(); });
 
   btn.addEventListener('click', () => {
-    const originalText = label();
     btn.textContent = t('settings.pressKey');
     btn.classList.add('active');
     btn.disabled = true;
@@ -359,18 +366,18 @@ function setupBindButton(buttonId: string, storageKey: string, backgroundCmd: st
       e.stopPropagation();
       window.removeEventListener('keydown', onKey, true);
       if (e.code === 'Escape') {
-        restore(originalText);
+        restore(label());
         return;
       }
       if (FORBIDDEN_CODES.has(e.code)) {
         restore(t('settings.forbiddenKey'));
-        setTimeout(() => restore(originalText), 1500);
+        setTimeout(() => restore(label()), 1500);
         return;
       }
       const vk = browserKeyToWin32Vk(e.code);
       if (vk === null) {
         restore(t('settings.unsupportedKey'));
-        setTimeout(() => restore(originalText), 1500);
+        setTimeout(() => restore(label()), 1500);
         return;
       }
       localStorage.setItem(storageKey, String(vk));
@@ -711,7 +718,7 @@ function applyLanguage(): void {
   syncCameraListenButton();
   btnDebug.textContent = onOff(debugEnabled);
   for (const relabel of bindRelabelers) relabel();
-  updateStatus.textContent = '';
+  if (updateStatusMsg) updateStatus.textContent = t(updateStatusMsg.key, updateStatusMsg.params);
   if (!settingsPanel.classList.contains('hidden')) refreshDeviceLists();
   if (lastState) renderState(lastState);
 }
