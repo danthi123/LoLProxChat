@@ -4,6 +4,12 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Fixed
+- **You could go silent for minutes after walking past a ward.** If your own icon disappeared for a moment right beside something static and teal on the minimap — a ward, in the log that showed it — the tracker latched onto that instead and never let go, because it never disappears. Everyone else then heard you from the ward's spot, so they stopped hearing you once you moved away, while you could still hear them. One tester was silent for three and a half minutes this way. The champion classifier had been saying all along that the ward was not you and your real icon was; the tracker now listens. If the blob it is following has stayed in one place for 4 seconds while the classifier consistently rates it as not you and a different icon as you, it moves to that icon. It only acts while the followed blob stays put, so it cannot drag a correct lock off a champion that is moving.
+
+### Added
+- **Settings → "Wrong position?" → RESET.** Drops the tracked position and finds your champion on the minimap again, skipping the spot it was stuck on. For the cases the automatic check cannot catch, e.g. champions the classifier does not recognise well. For a moment while it searches only your team hears you. It does nothing while you are dead (you stay at your body until you respawn).
+
 ## [v0.5.10] — 2026-09-30
 
 ### Fixed

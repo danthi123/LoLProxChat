@@ -100,6 +100,15 @@ export class ScriptedTracker {
     this.holdSec = 0;
   }
   onRespawn(): void { this.respawns++; this.state = TrackingState.SCANNING; }
+  resets = 0;
+  /** Mirrors the real resetPosition: ignored while dead, otherwise rescans. */
+  resetPosition(): boolean {
+    if (this.state === TrackingState.DEAD) return false;
+    this.resets++;
+    this.state = TrackingState.SCANNING;
+    this.holdSec = 0;
+    return true;
+  }
 
   /** Walk the champion to a new game coordinate. */
   moveTo(x: number, y: number): void {

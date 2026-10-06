@@ -358,6 +358,101 @@ export function shouldForceReacquisition(holdStartMs: number, nowMs: number): bo
   return (nowMs - holdStartMs) >= FORCED_REACQUIRE_HOLD_MS;
 }
 
+// ---------- locked onto something that is not us ----------
+
+/**
+ * How many classifier runs, and how much time, it takes to decide the locked
+ * blob is not us. Runs land every 500ms, so six of them span at least 2.5s;
+ * the time floor makes it 4s whatever the run rate.
+ */
+export const WRONG_LOCK_RUNS = 6;
+export const WRONG_LOCK_MIN_MS = 4000;
+/** How long a scan after a user reset steers away from where we were. */
+export const RESET_AVOID_MS = 10_000;
+
+/** Evidence older than this, with nothing new since, is dropped. */
+export const WRONG_LOCK_STALE_MS = 15_000;
+
+export interface WrongLockEvidence {
+  /** Region px: where the followed blob was when the evidence started. */
+  anchor: { x: number; y: number } | null;
+  runs: number;
+  firstMs: number;
+  lastMs: number;
+}
+
+export function emptyWrongLockEvidence(): WrongLockEvidence {
+  return { anchor: null, runs: 0, firstMs: 0, lastMs: 0 };
+}
+
+export interface WrongLockRun {
+  /** The teal blob the lock is on, region px, or null if none matched this run. */
+  followed: { x: number; y: number } | null;
+  /** Its normalized classifier score this run (0..1). */
+  followedScore: number;
+  /** The highest-scoring other teal blob, or null. */
+  best: { x: number; y: number; score: number } | null;
+  /** Whether this run said anything: some raw score cleared the minimum. */
+  discriminating: boolean;
+}
+
+/**
+ * Fold one classifier run into the evidence that the lock is on the wrong blob.
+ * Returns the blob to move to once the evidence is sufficient, else null.
+ *
+ * Phase 1 follows whatever teal blob is nearest on continuity alone (see
+ * computeNearFieldPx), so walking past something static and teal — a ward,
+ * as far as a v0.5.10 log shows — at the moment our own icon is hidden hands
+ * the lock to it. Nothing moved it back: the static blob never vanishes, so
+ * there is never a hold for Phase 2 to act on, and the classifier saying "not
+ * us" about it for three and a half minutes went unheard. The other player
+ * heard nothing the whole time, because they were scored against the ward.
+ *
+ * What counts as evidence is deliberately narrow, because the classifier is
+ * weak on some champions and a confident wrong switch onto an ally is worse
+ * than staying put:
+ *  - only runs where the model discriminated at all count; silent runs are
+ *    neutral (some champions score 0.000 on most runs);
+ *  - the followed blob must score near zero AND a distinct blob must be the
+ *    one the model prefers;
+ *  - the followed blob must not have moved more than one icon from where the
+ *    evidence started. A champion we are actually following moves; a static
+ *    marker does not. This is what keeps a weak classifier from ever moving a
+ *    lock that is following a walking champion;
+ *  - any run where the followed blob scores well resets everything.
+ */
+export function nextWrongLockEvidence(
+  ev: WrongLockEvidence,
+  run: WrongLockRun,
+  nowMs: number,
+  iconDiam: number,
+): { evidence: WrongLockEvidence; switchTo: { x: number; y: number } | null } {
+  const none = { evidence: emptyWrongLockEvidence(), switchTo: null };
+  if (ev.runs > 0 && nowMs - ev.lastMs > WRONG_LOCK_STALE_MS) ev = emptyWrongLockEvidence();
+  if (!run.discriminating || !run.followed) return { evidence: ev, switchTo: null };
+  if (run.followedScore >= 0.5) return none;
+
+  const best = run.best;
+  const distinct = !!best && Math.hypot(best.x - run.followed.x, best.y - run.followed.y) > iconDiam;
+  if (run.followedScore > 0.1 || !best || !distinct || best.score < 0.99) {
+    return { evidence: ev, switchTo: null };
+  }
+
+  if (ev.anchor && Math.hypot(run.followed.x - ev.anchor.x, run.followed.y - ev.anchor.y) > iconDiam) {
+    ev = emptyWrongLockEvidence();
+  }
+  const next: WrongLockEvidence = {
+    anchor: ev.anchor ?? { x: run.followed.x, y: run.followed.y },
+    runs: ev.runs + 1,
+    firstMs: ev.runs > 0 ? ev.firstMs : nowMs,
+    lastMs: nowMs,
+  };
+  if (next.runs >= WRONG_LOCK_RUNS && nowMs - next.firstMs >= WRONG_LOCK_MIN_MS) {
+    return { evidence: emptyWrongLockEvidence(), switchTo: { x: best.x, y: best.y } };
+  }
+  return { evidence: next, switchTo: null };
+}
+
 /**
  * Standard exponential moving average for classifier confidence. `decay` is
  * the weight kept on the current value; `1 - decay` is the weight of the new

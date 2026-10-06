@@ -109,6 +109,13 @@ btnMuteAll.addEventListener('click', () => {
   sendToBackground('toggleMuteAll', {});
 });
 
+const btnResetPosition = document.getElementById('btn-reset-position')!;
+btnResetPosition.addEventListener('click', () => {
+  sendToBackground('resetPosition', {});
+  btnResetPosition.textContent = 'SEARCHING';
+  setTimeout(() => { btnResetPosition.textContent = 'RESET'; }, 2000);
+});
+
 btnSettings.addEventListener('click', () => {
   settingsPanel.classList.toggle('hidden');
   if (!settingsPanel.classList.contains('hidden')) {

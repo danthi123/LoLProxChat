@@ -32,6 +32,9 @@ window.addEventListener('overlayAction', ((event: CustomEvent) => {
     case 'setPlayerVolume':
       orchestrator.setPlayerVolume(payload.name, payload.volume);
       break;
+    case 'resetPosition':
+      orchestrator.resetPosition();
+      break;
     case 'setScanRate':
       orchestrator.setScanRate(payload.fps);
       break;
