@@ -4,6 +4,10 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Fixed
+- **Walking next to a teammate could make the app think you were them.** When two teammates' minimap icons overlap — a duo lane, or just walking together — they merge into one blob too big to look like an icon, and the app lost track of you. Five seconds later it rescanned the minimap, where your teammate's icon was now the cleanest candidate, and locked onto that. In the log that showed it, a player was placed on top of their teammate for most of a game: with Ally proximity on they heard each other at full volume throughout, recalls included, and enemies would have heard them from the teammate's spot. Now the app follows you inside the merged blob, on your side of it, and picks your icon back up when you split. Recalling from beside a teammate is recognised (your icon vanishes and only theirs is left), so you go quiet as after any recall rather than being moved onto them.
+- **After losing track of you, the app no longer locks onto an icon it cannot identify far from where you were.** Unless the classifier recognises it, or your movement path is drawn on it, an icon further away than you could have walked since is skipped, and the app keeps searching (you are team-only meanwhile). How far counts as reachable grows at walking speed, so it cannot get stuck.
+
 ## [v0.5.12] — 2026-10-06
 
 ### Added

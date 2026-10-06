@@ -1302,3 +1302,143 @@ describe('RESET pressed when the lock was right', () => {
     expect(distance(records[records.length - 1].px!, records[records.length - 1].truth!)).toBeLessThanOrEqual(3);
   });
 });
+
+describe('walking alongside a teammate (v0.5.12 Shen + Vex log)', () => {
+  // Two teammates in one lane: their icons overlap into one teal blob too wide
+  // to pass as an icon. The tracker used to see no icon of ours at all, give
+  // up after 5s, and rescan — where the teammate's icon was the only clean
+  // candidate, so it locked onto that. The player was then placed on top of
+  // their teammate for most of the game. The classifier is silent here, as it
+  // mostly was for Shen.
+  const OFFSET: Point = { x: 18, y: 0 };
+  const PAIR_STEP: Point = { x: 1, y: 0 };
+  const SOLO: SceneSpec = { ...BACKDROP };
+
+  function together(from: Point, count: number, over: SceneSpec = SOLO): SceneSpec[] {
+    return Array.from({ length: count }, (_, i) => {
+      const self = at(from, PAIR_STEP, i);
+      return { ...over, self, selfTrail: null, allies: [...over.allies!, { x: self.x + OFFSET.x, y: self.y + OFFSET.y }] };
+    });
+  }
+
+  function lockThenJoin(): { specs: SceneSpec[]; joinAt: number; meet: Point } {
+    const lock = walk(16);
+    const meet = at(START, STEP, 16);
+    // The teammate walks in from 50px away and settles 18px beside us.
+    const approach = Array.from({ length: 8 }, (_, i) => {
+      const self = at(meet, PAIR_STEP, i);
+      const gap = 50 - 4 * i;
+      return { ...SOLO, self, selfTrail: null, allies: [...SOLO.allies!, { x: self.x + Math.max(OFFSET.x, gap), y: self.y }] };
+    });
+    return { specs: [...lock, ...approach], joinAt: 16, meet };
+  }
+
+  async function run(specs: SceneSpec[]) {
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    return driveTracker(h, scenes);
+  }
+
+  test('the pair really merges into one blob the icon filter rejects', async () => {
+    const { specs } = lockThenJoin();
+    const pairStart = at(at(START, STEP, 16), PAIR_STEP, 8);
+    const scenes = renderScenes([...specs, ...together(pairStart, 4)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    expect(logs.some(l => l.includes('merged with a teammate'))).toBe(true);
+    expect(records[records.length - 1].state).toBe(TrackingState.LOCKED);
+  });
+
+  test('stays with the player for as long as they walk together, without a hold', async () => {
+    const { specs } = lockThenJoin();
+    const pairStart = at(at(START, STEP, 16), PAIR_STEP, 8);
+    const pair = together(pairStart, 64); // 8s: past the 5s that used to force a rescan
+    const records = await run([...specs, ...pair]);
+    const during = records.slice(specs.length);
+    expect(logs.some(l => l.includes('Hold exceeded'))).toBe(false);
+    for (const r of during) {
+      expect(r.state).toBe(TrackingState.LOCKED);
+      expect(r.holdSec).toBe(0);
+      // On our side of the pair: nearer our icon than the teammate's.
+      const mate = { x: r.truth!.x + OFFSET.x, y: r.truth!.y + OFFSET.y };
+      expect(distance(r.px!, r.truth!)).toBeLessThan(distance(r.px!, mate));
+      expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(8);
+    }
+  });
+
+  test('when they split up, the lock goes with the player, not the teammate', async () => {
+    const { specs } = lockThenJoin();
+    const pairStart = at(at(START, STEP, 16), PAIR_STEP, 8);
+    const pair = together(pairStart, 24);
+    const last = pair[pair.length - 1].self!;
+    const split = Array.from({ length: 24 }, (_, i) => {
+      const self = { x: last.x, y: last.y - i };
+      return { ...SOLO, self, selfTrail: null, allies: [...SOLO.allies!, { x: last.x + OFFSET.x + i, y: last.y + i }] };
+    });
+    const records = await run([...specs, ...pair, ...split]);
+    for (const r of records.slice(-12)) {
+      expect(r.state).toBe(TrackingState.LOCKED);
+      expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    }
+  });
+
+  test('recalling from beside the teammate does not hand the lock to them', async () => {
+    const { specs } = lockThenJoin();
+    const pairStart = at(at(START, STEP, 16), PAIR_STEP, 8);
+    const pair = together(pairStart, 24);
+    const last = pair[pair.length - 1].self!;
+    const mateAt = { x: last.x + OFFSET.x, y: last.y + OFFSET.y };
+    // We recall: our icon is gone; the teammate stays, then walks off.
+    const after = Array.from({ length: 80 }, (_, i) => ({
+      ...SOLO, self: null, allies: [...SOLO.allies!, { x: mateAt.x + Math.floor(i / 2), y: mateAt.y }],
+    }));
+    const records = await run([...specs, ...pair, ...after]);
+    expect(logs.some(l => l.includes('not taking theirs for ours'))).toBe(true);
+    const recallAt = specs.length + pair.length;
+    // Held as lost — so the orchestrator disowns us at 2s — never following the teammate.
+    expect(records[recallAt + 20].holdSec).toBeGreaterThan(2);
+    expect(records[recallAt + 20].holdReason).toBe('no-match');
+    for (const r of records.slice(recallAt)) {
+      const mate = { x: mateAt.x + Math.floor((r.i - recallAt) / 2), y: mateAt.y };
+      if (r.state === TrackingState.LOCKED && r.holdSec === 0) {
+        expect(distance(r.px!, mate)).toBeGreaterThan(12);
+      }
+    }
+  });
+
+  test('the teammate recalling leaves the lock on the player', async () => {
+    const { specs } = lockThenJoin();
+    const pairStart = at(at(START, STEP, 16), PAIR_STEP, 8);
+    const pair = together(pairStart, 24);
+    const last = pair[pair.length - 1].self!;
+    const after = Array.from({ length: 24 }, (_, i) => ({ ...SOLO, self: { x: last.x, y: last.y - i }, selfTrail: null }));
+    const records = await run([...specs, ...pair, ...after]);
+    expect(logs.some(l => l.includes('not taking theirs for ours'))).toBe(false);
+    for (const r of records.slice(-16)) {
+      expect(r.state).toBe(TrackingState.LOCKED);
+      expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    }
+  });
+});
+
+describe('the rescan after a hold runs out', () => {
+  test('does not lock an unidentified teammate icon far from where we were lost', async () => {
+    // Our icon is gone (fog, a merge the tracker could not follow) for long
+    // enough to force a rescan. The backdrop allies are ~150px away; nothing
+    // identifies either. Locking one is how the log put Shen on Vex.
+    const VANISH: Point = at(START, STEP, 15);
+    const scenes = renderScenes([...walk(16), ...vanished(96), ...Array.from({ length: 16 }, () => ({ ...BACKDROP, self: VANISH, selfTrail: null }))]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    expect(logs.some(l => l.includes('Hold exceeded'))).toBe(true);
+    for (const r of records.slice(16, 16 + 96)) {
+      if (r.state === TrackingState.LOCKED && r.holdSec === 0) {
+        for (const ally of BACKDROP.allies!) expect(distance(r.px!, ally)).toBeGreaterThan(20);
+      }
+    }
+    // ...and takes our icon back when it shows up where we were.
+    const last = records[records.length - 1];
+    expect(last.state).toBe(TrackingState.LOCKED);
+    expect(distance(last.px!, VANISH)).toBeLessThanOrEqual(3);
+  });
+});

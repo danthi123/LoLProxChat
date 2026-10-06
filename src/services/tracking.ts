@@ -31,6 +31,12 @@ import {
   MAX_OCCLUDED_MS,
   COVERED_PIXEL_FRACTION,
   OCCLUDER_GRACE_MS,
+  isPossibleStack,
+  findStack,
+  positionInStack,
+  MAX_STACKED_MS,
+  LEFTOVER_MS,
+  rescanReachPx,
   WrongLockEvidence,
   emptyWrongLockEvidence,
   nextWrongLockEvidence,
@@ -142,6 +148,27 @@ export class TrackingService {
   // This frame's red blobs that could be enemy icons over ours — looser than
   // the icon filter, see isPossibleOccluder.
   private occluderBlobs: Blob[] = [];
+  // Teal blobs too big for one icon: ours merged with a teammate's. See
+  // stackStep().
+  private stackBlobs: Blob[] = [];
+  private stacked = false;
+  // Where the teammate's icon sits in the pair (region px), mirrored from ours
+  // through the merged blob's centroid.
+  private stackPartner: { x: number; y: number } | null = null;
+  // A teammate's icon left behind where a pair was, after ours disappeared
+  // out of it (we recalled from beside them): excluded from tracking while it
+  // can be followed, so the tracker does not take it for us. See
+  // resolveStackExit().
+  private leftover: { x: number; y: number } | null = null;
+  private leftoverUntilMs = 0;
+  // When the current stacked episode began; latched (left set) when one ends
+  // by the cap rather than by us reappearing, so it cannot simply restart.
+  private stackedSinceMs = 0;
+  // Set when a hold ran out and the tracker went back to SCANNING: where we
+  // were (region px) and when. The rescan does not lock an unidentified icon
+  // further from there than we could have walked — see handleScanning.
+  private lostAt: { x: number; y: number } | null = null;
+  private lostAtMs = 0;
   // Whether this frame showed anything at all on the minimap — any icon or
   // structure of either colour. See the no-teal branch of handleLocked.
   private minimapReadable = true;
@@ -344,6 +371,7 @@ export class TrackingService {
     }
 
     this.state = TrackingState.SCANNING;
+    this.lostAt = null;
     this.lastPixelPos = null;
     this.lockedTickCount = 0;
     this.scanFrameCount = 0;
@@ -385,6 +413,7 @@ export class TrackingService {
       this.minimapRegion = null;
     }
     this.state = TrackingState.SCANNING;
+    this.lostAt = null;
     this.lastPixelPos = null;
     this.lockedTickCount = 0;
     this.scanFrameCount = 0;
@@ -620,6 +649,8 @@ export class TrackingService {
   onRespawn(): void {
     if (this.state !== TrackingState.DEAD) return;
     this.state = TrackingState.SCANNING;
+    this.lostAt = null;
+    this.leftover = null;
     this.lastPixelPos = null;
     this.deathPosition = null;
     this.lastSeenPosition = null;
@@ -645,6 +676,8 @@ export class TrackingService {
       ? { x: this.lastPixelPos.x - this.minimapRegion.x, y: this.lastPixelPos.y - this.minimapRegion.y }
       : null;
     this.state = TrackingState.SCANNING;
+    this.lostAt = null;
+    this.leftover = null;
     this.avoidPoint = was;
     this.avoidOrigin = was;
     this.avoidUntilMs = performance.now() + RESET_AVOID_MS;
@@ -1121,8 +1154,9 @@ export class TrackingService {
     let mask = this.createMask(frame, region);
     mask = this.dilate(mask, region.width, region.height);
     const allBlobs = this.findBlobs(mask, region.width, region.height);
-    const iconBlobs = this.filterIconBlobs(allBlobs);
+    const iconBlobs = this.excludeLeftover(this.filterIconBlobs(allBlobs));
     this.occluderBlobs = allBlobs.filter(b => isPossibleOccluder(b, this.expectedIconDiam));
+    this.stackBlobs = allBlobs.filter(b => isPossibleStack(b, this.expectedIconDiam));
     this.minimapReadable = allBlobs.length > 0;
 
     // Regenerate the debug-mode filtered image at 5Hz (scan-rate independent).
@@ -1282,6 +1316,20 @@ export class TrackingService {
         ? (clsScore * 0.45 + whiteScore * 0.25 + ringScore * 0.10) / 0.80
         : (whiteScore * 0.35 + ringScore * 0.25) / 0.60;
 
+      // Rescanning after a hold ran out: we were somewhere a moment ago, so an
+      // icon nothing identifies — no classifier vouching for it, no movement
+      // path — further away than we could have walked since is someone else.
+      // Locking it anyway is how the v0.5.12 log put a player on top of their
+      // teammate for most of a game. Such candidates are skipped; with none
+      // left the tracker stays SCANNING (team-only) until something identifies
+      // us or comes within reach. The reach grows at walking speed, so this
+      // cannot stall for good.
+      if (this.lostAt) {
+        const identified = (classifierUsable && clsScore >= 0.5) || whiteScore > 0;
+        const reach = rescanReachPx(this.expectedIconDiam, performance.now() - this.lostAtMs);
+        if (!identified && Math.hypot(b.cx - this.lostAt.x, b.cy - this.lostAt.y) > reach) continue;
+      }
+
       if (score > bestScore) {
         bestScore = score;
         bestBlob = b;
@@ -1309,6 +1357,8 @@ export class TrackingService {
       return;
     }
 
+    if (bestScore === -Infinity) return; // every candidate was out of reach
+
     this.lockOnBlob(bestBlob, 'composite(score=' + bestScore.toFixed(2) + ' ' + bestTerms + ')');
   }
 
@@ -1325,6 +1375,8 @@ export class TrackingService {
     this.wrongLock = emptyWrongLockEvidence();
     this.wrongLockTarget = null;
     this.avoidPoint = null;
+    this.lostAt = null;
+    this.leftover = null;
     this.lockedTickCount = 0;
     this.scanFrameCount = 0;
     this.scanStartMs = performance.now();
@@ -1371,6 +1423,11 @@ export class TrackingService {
     if (shouldForceReacquisition(this.holdStartMs, performance.now())) {
       console.warn('[Tracking] Hold exceeded ' + FORCED_REACQUIRE_HOLD_MS +
         'ms — forcing re-acquisition (back to SCANNING)');
+      this.lostAt = {
+        x: this.lastPixelPos.x - this.minimapRegion.x,
+        y: this.lastPixelPos.y - this.minimapRegion.y,
+      };
+      this.lostAtMs = performance.now();
       this.state = TrackingState.SCANNING;
       this.holdStartMs = 0;
       this.holdReason = null;
@@ -1407,9 +1464,17 @@ export class TrackingService {
       y: this.lastPixelPos.y - this.minimapRegion.y,
     };
 
+    if (this.stacked && !findStack(this.stackBlobs, lastRegion, this.expectedIconDiam)) {
+      if (this.resolveStackExit(tealBlobs, lastRegion)) {
+        const i = tealBlobs.findIndex(b => this.leftover && b.cx === this.leftover.x && b.cy === this.leftover.y);
+        if (i >= 0) tealBlobs.splice(i, 1);
+      }
+    }
+
     // No teal blobs at all — extrapolate position using decaying velocity,
     // unless an enemy icon sitting on us explains why ours is not visible.
     if (tealBlobs.length === 0) {
+      if (this.stackStep(lastRegion)) return;
       if (this.occlusionStep(redBlobs, lastRegion)) return;
       if (this.lockedTickCount === 0) {
         console.log('[Tracking] Extrapolating position (no teal blobs) ' + this.describeLoss(tealBlobs, redBlobs, lastRegion));
@@ -1459,6 +1524,7 @@ export class TrackingService {
     // for ourselves across the map. Real logs showed Phase 2 doing exactly that
     // mid-fight — a confident classifier hit on some other teal blob 3000-7000
     // units away, which put us out of range of the enemy we were standing on.
+    if (!phase1 && this.stackStep(lastRegion)) return;
     if (!phase1 && this.occlusionStep(redBlobs, lastRegion)) return;
 
     // Phase 2: classifier-based long-range reacquire if Phase 1 found nothing
@@ -1497,6 +1563,7 @@ export class TrackingService {
     const newPos = this.pixelToGamePosition(cx, cy, this.minimapRegion);
     this.setLastPosition(newPos, 'classifier-reacquire');
     this.resetOcclusion();
+    this.leftover = null;
     this.wrongLock = emptyWrongLockEvidence();
     this.wrongLockTarget = null;
     this.velocityX = 0;
@@ -1546,6 +1613,10 @@ export class TrackingService {
     this.lockedTickCount = 0;
     this.holdStartMs = 0;
     this.holdReason = null;
+    if (this.stacked) {
+      console.log('[Tracking] Own icon separate from the teammate\'s again after ' +
+        ((performance.now() - this.stackedSinceMs) / 1000).toFixed(2) + 's');
+    }
     this.endOcclusion();
     // After endOcclusion, which clears the coverage flag this sets.
     this.noteIconCoverage(blob, !!occluder);
@@ -1767,6 +1838,127 @@ export class TrackingService {
     this.occludedSinceMs = 0;
     this.occlusionAnchor = null;
     this.lastSeenPartlyCovered = false;
+    this.stacked = false;
+    this.stackedSinceMs = 0;
+    this.stackPartner = null;
+  }
+
+  /**
+   * The merged blob we were following has come apart. If our icon is there on
+   * our side of where the pair was, carry on as normal (separation, or the
+   * teammate recalling). If only the teammate's is left, on their side, ours
+   * vanished out of the pair — a recall, a teleport, a death — and following
+   * the nearest blob on continuity would hand the lock to the teammate. Mark
+   * that icon as left over instead (excludeLeftover); the tracker then holds,
+   * and disowns us, as for any recall.
+   *
+   * Returns true when it marked a leftover this frame.
+   */
+  private resolveStackExit(tealBlobs: Blob[], lastReg: { x: number; y: number }): boolean {
+    const partner = this.stackPartner;
+    this.stacked = false;
+    this.stackPartner = null;
+    const half = this.expectedIconDiam * 0.5;
+    const near = (p: { x: number; y: number }) => {
+      let best: Blob | null = null;
+      let bestD = half;
+      for (const b of tealBlobs) {
+        const d = Math.hypot(b.cx - p.x, b.cy - p.y);
+        if (d <= bestD) { best = b; bestD = d; }
+      }
+      return best;
+    };
+    if (near(lastReg) || !partner) return false;
+    const theirs = near(partner);
+    if (!theirs || this.getClassifierScore(theirs) >= 0.5) return false;
+    this.leftover = { x: theirs.cx, y: theirs.cy };
+    this.leftoverUntilMs = performance.now() + LEFTOVER_MS;
+    console.log('[Tracking] Own icon gone from beside a teammate\'s — not taking theirs for ours');
+    return true;
+  }
+
+  /**
+   * Drop the left-over teammate icon (resolveStackExit) from this frame's
+   * icons, following it as it walks off. It stops being excluded when it can
+   * no longer be followed, when the classifier vouches for it, or after
+   * LEFTOVER_MS.
+   */
+  private excludeLeftover(blobs: Blob[]): Blob[] {
+    if (!this.leftover) return blobs;
+    if (performance.now() > this.leftoverUntilMs) {
+      this.leftover = null;
+      return blobs;
+    }
+    const step = Math.max(3, this.expectedIconDiam * WRONG_LOCK_STILL_FRACTION);
+    let match: Blob | null = null;
+    let matchD = step;
+    for (const b of blobs) {
+      if (b.color !== 'teal') continue;
+      const d = Math.hypot(b.cx - this.leftover.x, b.cy - this.leftover.y);
+      if (d <= matchD) { match = b; matchD = d; }
+    }
+    if (!match || this.getClassifierScore(match) >= 0.5) {
+      this.leftover = null;
+      return blobs;
+    }
+    this.leftover = { x: match.cx, y: match.cy };
+    return blobs.filter(b => b !== match);
+  }
+
+  /**
+   * Our icon has merged with a teammate's into one blob too big to pass as an
+   * icon (isPossibleStack). We are in it: follow it, on our side of the pair
+   * (positionInStack), without starting a hold — a hold would disown us after
+   * 2s and, at 5s, rescan the minimap, where the teammate's icon is the
+   * cleanest candidate left (what the v0.5.12 log showed, repeatedly).
+   *
+   * Capped at MAX_STACKED_MS: a merged blob that outlasts it may be teammates
+   * we left behind (a recall from the middle of a group). Then this ends as
+   * an ordinary hold, and does not restart until we are found again.
+   */
+  private stackStep(lastReg: { x: number; y: number }): boolean {
+    if (!this.minimapRegion) return false;
+    const now = performance.now();
+    const stack = findStack(this.stackBlobs, lastReg, this.expectedIconDiam);
+    if (!stack) {
+      if (this.stacked) {
+        this.stacked = false;
+        console.log('[Tracking] Merged teammate icons gone without ours reappearing — holding as lost');
+      }
+      return false;
+    }
+    if (!this.stacked) {
+      if (this.stackedSinceMs > 0) return false;
+      this.stacked = true;
+      this.stackedSinceMs = now;
+      console.log('[Tracking] Own icon merged with a teammate\'s — following the pair until they separate');
+    } else if (now - this.stackedSinceMs > MAX_STACKED_MS) {
+      this.stacked = false;
+      console.log('[Tracking] Stopped following merged teammate icons (the ' + (MAX_STACKED_MS / 1000) + 's cap) — holding as lost');
+      return false;
+    }
+
+    const toward = { x: lastReg.x + this.velocityX, y: lastReg.y + this.velocityY };
+    const p = positionInStack(stack, toward, this.expectedIconDiam);
+    this.stackPartner = { x: 2 * stack.cx - p.x, y: 2 * stack.cy - p.y };
+    const velWeightOld = Math.pow(0.5, TrackingService.TUNED_FPS * this.lastDtSec);
+    this.velocityX = this.velocityX * velWeightOld + (p.x - lastReg.x) * (1 - velWeightOld);
+    this.velocityY = this.velocityY * velWeightOld + (p.y - lastReg.y) * (1 - velWeightOld);
+    // Counts as a held frame for logging and for weighWrongLock (which leaves
+    // an ambiguous frame alone), but is not a hold: no disown clock.
+    this.lockedTickCount++;
+    this.holdStartMs = 0;
+    this.holdReason = null;
+    this.occluded = false;
+
+    const cx = this.minimapRegion.x + p.x;
+    const cy = this.minimapRegion.y + p.y;
+    this.lastPixelPos = { x: cx, y: cy };
+    this.setLastPosition(this.pixelToGamePosition(cx, cy, this.minimapRegion), 'stacked');
+    if (this.onPositionUpdate && this.lastPosition) {
+      this.onPositionUpdate(this.lastPosition);
+    }
+    return true;
   }
 
   /**
