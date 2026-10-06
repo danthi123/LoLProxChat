@@ -81,6 +81,7 @@ html, body {
 }
 .icon-btn:hover { background: rgba(100, 120, 160, 0.15); }
 .icon-btn.active { color: #e74c4c; border-color: #e74c4c; }
+.icon-btn.searching { color: #4cc3e7; border-color: #4cc3e7; }
 
 .player-list {
   max-height: 300px;

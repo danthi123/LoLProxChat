@@ -4,6 +4,9 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Added
+- **POS button in the panel header**, the same as Settings → Wrong position? → RESET, so it is one click away mid-game, including with the panel collapsed. The header title is shortened to "LPC" to make room.
+
 ## [v0.5.11] — 2026-10-05
 
 ### Fixed
