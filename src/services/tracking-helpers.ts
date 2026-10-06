@@ -354,11 +354,14 @@ export function positionInStack(b: Blob, toward: { x: number; y: number }, expec
   };
 }
 
-/** How long we follow a merged teammate blob before treating it as lost. */
+/**
+ * How long we follow a merged blob wider than about two icons (three or more
+ * teammates) before treating it as lost: it may be teammates we left.
+ */
 export const MAX_STACKED_MS = 15_000;
 
-/** How long a teammate icon left where a pair was stays excluded at most. */
-export const LEFTOVER_MS = 10_000;
+/** Consecutive classifier runs at >= 0.5 that release an excluded bystander icon. */
+export const BYSTANDER_VOUCH_RUNS = 3;
 
 /**
  * How far from where we were lost (region px) a rescan may lock an icon that

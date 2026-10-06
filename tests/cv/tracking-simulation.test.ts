@@ -1421,6 +1421,144 @@ describe('walking alongside a teammate (v0.5.12 Shen + Vex log)', () => {
   });
 });
 
+describe('walking alongside a teammate — review findings', () => {
+  const OFFSET = 18;
+  const SOLO: SceneSpec = { ...BACKDROP };
+  const meet = at(START, STEP, 16);
+
+  async function run(specs: SceneSpec[], classifier: 'zero' | ((i: number) => Point | null) = 'zero') {
+    const scenes = renderScenes(specs);
+    let target: Point | null = null;
+    const scorer = classifier === 'zero' ? new ZeroScorer() : new OracleScorer(() => target && toFramePoint(target));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: scorer });
+    const records: Awaited<ReturnType<typeof driveTracker>> = [];
+    for (let i = 0; i < scenes.length; i++) {
+      if (classifier !== 'zero') target = classifier(i);
+      records.push(...await driveTracker(h, [scenes[i]]));
+    }
+    return records;
+  }
+  const withMate = (self: Point | null, mate: Point): SceneSpec =>
+    ({ ...SOLO, self, selfTrail: null, allies: [...SOLO.allies!, mate] });
+
+  test('teammates walking over the spot we recalled from do not re-own it', async () => {
+    // Recall first (a no-match hold), then a merged pair walks across where
+    // we vanished. Picking that up as "us" would put a player who is in base
+    // back in lane, next to them.
+    const pair = Array.from({ length: 40 }, (_, i) => {
+      const a = { x: meet.x - 40 + 2 * i, y: meet.y };
+      return { ...SOLO, self: null, allies: [...SOLO.allies!, a, { x: a.x + OFFSET, y: a.y }] };
+    });
+    const records = await run([...walk(16), ...vanished(6), ...pair]);
+    expect(logs.some(l => l.includes('merged with a teammate'))).toBe(false);
+    expect(records[16 + 6 + 12].holdSec).toBeGreaterThan(2);
+  });
+
+  test('a duo merged for 20s still ends with the lock on the player', async () => {
+    // Past the old 15s cap. Then we stand still and the teammate walks off.
+    const pair = Array.from({ length: 160 }, () => withMate(meet, { x: meet.x + OFFSET, y: meet.y }));
+    const split = Array.from({ length: 24 }, (_, i) => withMate(meet, { x: meet.x + OFFSET + i, y: meet.y - i }));
+    const records = await run([...walk(17), ...pair, ...split]);
+    expect(logs.some(l => l.includes('Hold exceeded'))).toBe(false);
+    for (const r of records.slice(-8)) {
+      expect(r.state).toBe(TrackingState.LOCKED);
+      expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    }
+  });
+
+  test('a teammate walking through a standing player leaves the lock on the player', async () => {
+    const through = Array.from({ length: 96 }, (_, i) => withMate(meet, { x: meet.x + 40 - i, y: meet.y }));
+    const records = await run([...walk(17), ...through]);
+    for (const r of records.slice(-6)) {
+      expect(r.state).toBe(TrackingState.LOCKED);
+      expect(distance(r.px!, meet)).toBeLessThanOrEqual(3);
+    }
+  });
+
+  test('a teammate who settles almost on top of the player and then leaves does not take the lock along', async () => {
+    // While the two icons overlap deeply the merged blob still passes as one
+    // icon and is followed by its centre — the midpoint. When it widens into
+    // a pair again, our side must come from where we last saw our icon alone,
+    // not from that midpoint, or the estimate drifts off with the teammate.
+    const approach = Array.from({ length: 38 }, (_, i) => withMate(meet, { x: meet.x + 40 - i, y: meet.y }));
+    const linger = Array.from({ length: 16 }, () => withMate(meet, { x: meet.x + 2, y: meet.y }));
+    const leave = Array.from({ length: 60 }, (_, i) => withMate(meet, { x: meet.x + 2 + i, y: meet.y }));
+    const records = await run([...walk(17), ...approach, ...linger, ...leave]);
+    for (const r of records.slice(-6)) {
+      expect(r.state).toBe(TrackingState.LOCKED);
+      expect(distance(r.px!, meet)).toBeLessThanOrEqual(3);
+    }
+  });
+
+  test('one noisy classifier run does not release an excluded teammate', async () => {
+    // Few icons on screen, so normalization can turn a stray raw score into a
+    // confident 1.0 for the teammate on a single run. Three runs in a row are
+    // needed before an excluded icon is let back in.
+    const pair = Array.from({ length: 24 }, (_, i) => {
+      const self = at(meet, { x: 1, y: 0 }, i);
+      return withMate(self, { x: self.x + OFFSET, y: self.y });
+    });
+    const last = pair[pair.length - 1].self!;
+    const left = { x: last.x + OFFSET, y: last.y };
+    const after = Array.from({ length: 64 }, () => withMate(null, left));
+    const n = 16 + 24;
+    // Silent, except for the first run after the exit (one run happens in any
+    // 4 frames = 500ms), which points at the teammate. That is the worst case:
+    // the icon's first score is unsmoothed, so the spike reads 1.0.
+    const records = await run([...walk(16), ...pair, ...after],
+      i => (i < 16 ? at(START, STEP, i) : i >= n && i < n + 4 ? left : null));
+    for (const r of records.slice(n)) {
+      if (r.state === TrackingState.LOCKED && r.holdSec === 0) expect(distance(r.px!, left)).toBeGreaterThan(12);
+    }
+  });
+
+  test('recalling from beside a teammate never hands them the lock, even 20s on', async () => {
+    const pair = Array.from({ length: 24 }, (_, i) => {
+      const self = at(meet, { x: 1, y: 0 }, i);
+      return withMate(self, { x: self.x + OFFSET, y: self.y });
+    });
+    const last = pair[pair.length - 1].self!;
+    const mate = { x: last.x + OFFSET, y: last.y };
+    const after = Array.from({ length: 160 }, (_, i) => withMate(null, { x: mate.x + Math.floor(i / 4), y: mate.y }));
+    const records = await run([...walk(16), ...pair, ...after]);
+    // (driven a frame at a time, so r.i is always 0: index by position)
+    records.forEach((r, i) => {
+      if (i < 16 + 24) return;
+      const m = { x: mate.x + Math.floor((i - 40) / 4), y: mate.y };
+      if (r.state === TrackingState.LOCKED && r.holdSec === 0) expect(distance(r.px!, m)).toBeGreaterThan(12);
+    });
+  });
+
+  test('recalling from 40px beside a teammate (not merged) does not hand them the lock either', async () => {
+    const mate = { x: meet.x + 40, y: meet.y };
+    const records = await run([
+      ...walk(17).map(sc => ({ ...sc, allies: [...SOLO.allies!, mate] })),
+      ...Array.from({ length: 160 }, () => withMate(null, mate)),
+    ]);
+    for (const r of records.slice(17)) {
+      if (r.state === TrackingState.LOCKED && r.holdSec === 0) expect(distance(r.px!, mate)).toBeGreaterThan(12);
+    }
+  });
+
+  test('an excluded icon the classifier keeps vouching for is let go', async () => {
+    // The exit was misjudged: the icon left is ours. A classifier that is sure
+    // of it releases it and the tracker takes it back.
+    const pair = Array.from({ length: 24 }, (_, i) => {
+      const self = at(meet, { x: 1, y: 0 }, i);
+      return withMate(self, { x: self.x + OFFSET, y: self.y });
+    });
+    const last = pair[pair.length - 1].self!;
+    const left = { x: last.x + OFFSET, y: last.y };
+    const after = Array.from({ length: 64 }, () => withMate(null, left));
+    const n = 16 + 24;
+    const records = await run([...walk(16), ...pair, ...after], i => (i < 16 ? at(START, STEP, i) : i < n ? null : left));
+    expect(logs.some(l => l.includes('not taking theirs for ours'))).toBe(true);
+    const back = records.findIndex((r, i) => i > n && r.state === TrackingState.LOCKED && r.holdSec === 0 && distance(r.px!, left) <= 3);
+    expect(back).toBeGreaterThan(n);
+    expect((back - n) * FRAME_MS).toBeLessThanOrEqual(4000);
+  });
+});
+
 describe('the rescan after a hold runs out', () => {
   test('does not lock an unidentified teammate icon far from where we were lost', async () => {
     // Our icon is gone (fog, a merge the tracker could not follow) for long
