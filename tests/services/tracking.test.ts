@@ -71,6 +71,12 @@ describe('TrackingService state transitions', () => {
   test('getLastPosition returns null initially', () => {
     expect(svc.getLastPosition()).toBeNull();
   });
+
+  test('a user position reset is refused while DEAD — the body stays put', () => {
+    svc.onDeath();
+    expect(svc.resetPosition()).toBe(false);
+    expect(svc.getState()).toBe(TrackingState.DEAD);
+  });
 });
 
 describe('setLastPosition jump warning', () => {

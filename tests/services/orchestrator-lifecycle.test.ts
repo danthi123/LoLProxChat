@@ -328,6 +328,39 @@ describe('the game-state poll', () => {
     }
   });
 
+  it('a user position reset rescans and stops vouching for the old spot at once', async () => {
+    const h = await startInGame();
+    h.tracker.moveTo(7000, 7000);
+    await jest.advanceTimersByTimeAsync(300);
+    const sendCoords = (h.signaling as any).sendCoords as jest.Mock;
+    expect(sendCoords.mock.calls.some(c => c[2] === true)).toBe(false);
+
+    h.orchestrator.resetPosition();
+    await jest.advanceTimersByTimeAsync(300);
+    expect(h.tracker.resets).toBe(1);
+    expect(h.tracker.getState()).toBe(TrackingState.SCANNING);
+    expect(sendCoords.mock.calls.some(c => c[2] === true)).toBe(true);
+  });
+
+  it('a user position reset is ignored while dead — we stay at the body', async () => {
+    const h = await startInGame();
+    h.tracker.moveTo(7000, 7000);
+    await jest.advanceTimersByTimeAsync(300);
+    h.gameState.setDead(true, 20);
+    await jest.advanceTimersByTimeAsync(1000);
+    await settle();
+    expect(h.tracker.deaths).toBe(1);
+
+    const sendCoords = (h.signaling as any).sendCoords as jest.Mock;
+    sendCoords.mockClear();
+    h.orchestrator.resetPosition();
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(h.tracker.resets).toBe(0);
+    expect(h.tracker.getState()).toBe(TrackingState.DEAD);
+    expect(sendCoords.mock.calls.length).toBeGreaterThan(0);
+    for (const c of sendCoords.mock.calls) expect(c[2]).toBe(false);
+  });
+
   it('ignores the top-level isDead, which League never actually sends', async () => {
     // Before v0.5.10 death was read from activePlayer.isDead, which does not
     // exist, so no death was ever detected. Only the roster entry counts.

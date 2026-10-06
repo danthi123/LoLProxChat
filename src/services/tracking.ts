@@ -31,6 +31,12 @@ import {
   MAX_OCCLUDED_MS,
   COVERED_PIXEL_FRACTION,
   OCCLUDER_GRACE_MS,
+  WrongLockEvidence,
+  emptyWrongLockEvidence,
+  nextWrongLockEvidence,
+  RESET_AVOID_MS,
+  RESET_OBSERVE_MS,
+  WRONG_LOCK_STILL_FRACTION,
 } from './tracking-helpers';
 
 export enum TrackingState {
@@ -143,6 +149,15 @@ export class TrackingService {
   // Used to make Phase 2 re-acquisition stricter when stationary, so we don't
   // teleport the tracking dot onto a minion wave / turret if the icon flickers.
   private lastMovementMs = 0;
+  // Evidence that the lock is on a teal blob that is not us — see
+  // nextWrongLockEvidence — and, once it is sufficient, where to move to.
+  private wrongLock: WrongLockEvidence = emptyWrongLockEvidence();
+  private wrongLockTarget: { x: number; y: number } | null = null;
+  // Set by resetPosition(): the spot (region px) the user told us we are not
+  // at, and until when the next scan avoids it.
+  private avoidPoint: { x: number; y: number } | null = null;
+  private avoidOrigin: { x: number; y: number } | null = null;
+  private avoidUntilMs = 0;
   private static readonly TUNED_FPS = 8;
 
   // Repeated capture failures are logged at most once per distinct message
@@ -461,6 +476,8 @@ export class TrackingService {
         this.smoothedClassifierScores.set(key, val);
       }
 
+      this.weighWrongLock(tealBlobs, normalizedScores, maxRaw >= MIN_RAW_THRESHOLD);
+
       // Diagnostic log every ~30s, independent of scan rate
       const now = performance.now();
       if (now - this.lastClassifierLogMs >= 30000) {
@@ -474,6 +491,44 @@ export class TrackingService {
     } catch (e) {
       console.error('[Tracking] Classifier inference failed:', e);
     }
+  }
+
+  /**
+   * Fold this classifier run into the evidence that the lock is on a blob that
+   * is not us (nextWrongLockEvidence). Uses this run's normalized scores, not
+   * the EMA: the EMA is what smooths a single wrong run, and the evidence
+   * already needs six of them.
+   *
+   * Only while LOCKED and actually following something — a hold, or an enemy
+   * icon over ours, says nothing about which blob we are on.
+   */
+  private weighWrongLock(tealBlobs: Blob[], scores: number[], discriminating: boolean): void {
+    if (this.state !== TrackingState.LOCKED || !this.lastPixelPos || !this.minimapRegion) return;
+    if (this.lockedTickCount > 0 || this.occluded) return;
+    const last = {
+      x: this.lastPixelPos.x - this.minimapRegion.x,
+      y: this.lastPixelPos.y - this.minimapRegion.y,
+    };
+    const near = computeNearFieldPx(this.expectedIconDiam);
+    let followed = -1;
+    let followedDist = Infinity;
+    for (let i = 0; i < tealBlobs.length; i++) {
+      const d = Math.hypot(tealBlobs[i].cx - last.x, tealBlobs[i].cy - last.y);
+      if (d <= near && d < followedDist) { followed = i; followedDist = d; }
+    }
+    let best = -1;
+    for (let i = 0; i < tealBlobs.length; i++) {
+      if (i === followed) continue;
+      if (best < 0 || scores[i] > scores[best]) best = i;
+    }
+    const { evidence, switchTo } = nextWrongLockEvidence(this.wrongLock, {
+      followed: followed >= 0 ? { x: tealBlobs[followed].cx, y: tealBlobs[followed].cy } : null,
+      followedScore: followed >= 0 ? scores[followed] : 0,
+      best: best >= 0 ? { x: tealBlobs[best].cx, y: tealBlobs[best].cy, score: scores[best] } : null,
+      discriminating,
+    }, performance.now(), this.expectedIconDiam);
+    this.wrongLock = evidence;
+    if (switchTo) this.wrongLockTarget = switchTo;
   }
 
   /**
@@ -574,6 +629,39 @@ export class TrackingService {
     this.holdStartMs = 0;
     this.holdReason = null;
     this.resetOcclusion();
+  }
+
+  /**
+   * The user says the position is wrong ("re-find me"): drop the lock and scan
+   * the minimap again, steering the scan away from where we were.
+   *
+   * For the cases the tracker cannot catch on its own — a lock on something
+   * that is not us, with a classifier too quiet to say so. Returns false while
+   * dead: the position is the body, and the respawn rescans anyway.
+   */
+  resetPosition(): boolean {
+    if (this.state === TrackingState.DEAD) return false;
+    const was = this.state === TrackingState.LOCKED && this.lastPixelPos && this.minimapRegion
+      ? { x: this.lastPixelPos.x - this.minimapRegion.x, y: this.lastPixelPos.y - this.minimapRegion.y }
+      : null;
+    this.state = TrackingState.SCANNING;
+    this.avoidPoint = was;
+    this.avoidOrigin = was;
+    this.avoidUntilMs = performance.now() + RESET_AVOID_MS;
+    this.lastPixelPos = null;
+    this.lockedTickCount = 0;
+    this.scanFrameCount = 0;
+    this.scanStartMs = performance.now();
+    this.holdStartMs = 0;
+    this.holdReason = null;
+    this.velocityX = 0;
+    this.velocityY = 0;
+    this.wrongLock = emptyWrongLockEvidence();
+    this.wrongLockTarget = null;
+    this.resetOcclusion();
+    console.log('[Tracking] Position reset by the user — rescanning' +
+      (was ? ' (avoiding (' + Math.round(was.x) + ',' + Math.round(was.y) + ') for the next lock, within ' + RESET_AVOID_MS / 1000 + 's)' : ''));
+    return true;
   }
 
   // --- Color classification ---
@@ -1090,8 +1178,8 @@ export class TrackingService {
   /**
    * Scan: initial identification of the local player's teal blob.
    * Uses a unified composite score (classifier, movement path, ring quality).
-   * Only used once at game start (or after respawn). Once locked, we never return to SCANNING —
-   * instead we hold position and re-acquire via classifier.
+   * Runs at game start, after respawn, after a hold outlasts
+   * FORCED_REACQUIRE_HOLD_MS, and when the user resets the position.
    */
   private handleScanning(
     iconBlobs: Blob[],
@@ -1101,8 +1189,50 @@ export class TrackingService {
   ): void {
     if (!this.minimapRegion) return;
 
-    const tealBlobs = iconBlobs.filter(b => b.color === 'teal');
+    let tealBlobs = iconBlobs.filter(b => b.color === 'teal');
     if (tealBlobs.length === 0) return;
+    let avoidedSomething = false;
+
+    // After a user reset, leave out the blob we were locked on — the user just
+    // told us it is not them — unless the classifier vouches for it, or it is
+    // the only candidate there is.
+    //
+    // The avoided blob is followed while we scan, and the avoidance dropped the
+    // moment it moves: what RESET is for is a lock stuck on something static
+    // (a ward). A blob that walks away is a champion — quite possibly us, with
+    // RESET pressed on a lock that was right — and the ordinary scan decides.
+    if (this.avoidPoint && performance.now() < this.avoidUntilMs && this.avoidOrigin) {
+      const radius = Math.max(5, this.expectedIconDiam * 0.6);
+      // Follow it in small steps only: a champion moves under a pixel a frame,
+      // and anything further is a different icon or a frame the avoided blob
+      // was not seen on — neither of which says it moved.
+      const still = Math.max(3, this.expectedIconDiam * WRONG_LOCK_STILL_FRACTION);
+      let nearest: Blob | null = null;
+      let nearestDist = still;
+      for (const b of tealBlobs) {
+        const d = Math.hypot(b.cx - this.avoidPoint.x, b.cy - this.avoidPoint.y);
+        if (d <= nearestDist) { nearest = b; nearestDist = d; }
+      }
+      if (nearest) this.avoidPoint = { x: nearest.cx, y: nearest.cy };
+      const moved = Math.hypot(this.avoidPoint.x - this.avoidOrigin.x, this.avoidPoint.y - this.avoidOrigin.y);
+      if (moved > still) {
+        console.log('[Tracking] The spot reset away from moved — it is a champion, not a marker; scanning normally');
+        this.avoidPoint = null;
+      } else if (performance.now() - (this.avoidUntilMs - RESET_AVOID_MS) < RESET_OBSERVE_MS) {
+        // Still there and not moved yet: watch it a little longer before
+        // locking anything, or a champion walking at ordinary speed would be
+        // ruled out before it had covered the distance that clears it.
+        return;
+      } else {
+        const avoid = this.avoidPoint;
+        const others = tealBlobs.filter(b =>
+          Math.hypot(b.cx - avoid.x, b.cy - avoid.y) > radius || this.getClassifierScore(b) >= 0.5);
+        if (others.length > 0 && others.length < tealBlobs.length) {
+          tealBlobs = others;
+          avoidedSomething = true;
+        }
+      }
+    }
 
     this.scanFrameCount++;
 
@@ -1123,6 +1253,7 @@ export class TrackingService {
     // diagnosed from user logs, and a composite alone cannot tell us whether
     // the classifier or the white-pixel heuristic chose the blob.
     let bestTerms = '';
+    let bestWhite = 0;
 
     // The classifier only earns its 0.45 weight if it actually discriminated
     // this frame. updateClassifierScores() zeroes every blob when no raw score
@@ -1154,6 +1285,7 @@ export class TrackingService {
       if (score > bestScore) {
         bestScore = score;
         bestBlob = b;
+        bestWhite = whiteScore;
         bestTerms = 'cls=' + clsScore.toFixed(2) +
           ' white=' + whiteScore.toFixed(2) +
           ' ring=' + ringScore.toFixed(2);
@@ -1167,6 +1299,16 @@ export class TrackingService {
     // position. The classifier still contributes to the composite score above;
     // it's just no longer a veto. The whole classifier-confidence path is being
     // replaced by template matching in v0.4 (docs/plans/2026-06-03-cv-tracking-research.md).
+    // A user reset that ruled out the old spot, with nothing that actually
+    // identifies us — no classifier signal, no movement path — would lock on
+    // whichever icon has the cleanest ring: an arbitrary ally, which Phase 1
+    // then follows and nothing corrects. Wait instead (we are team-only while
+    // scanning) until the player walks or the classifier speaks, for as long
+    // as the reset's window lasts; after that, scan as usual.
+    if (avoidedSomething && !classifierUsable && bestWhite <= 0) {
+      return;
+    }
+
     this.lockOnBlob(bestBlob, 'composite(score=' + bestScore.toFixed(2) + ' ' + bestTerms + ')');
   }
 
@@ -1180,6 +1322,9 @@ export class TrackingService {
     this.lastPixelPos = { x: cx, y: cy };
     this.setLastPosition(this.pixelToGamePosition(cx, cy, this.minimapRegion), 'lockOnBlob');
     this.state = TrackingState.LOCKED;
+    this.wrongLock = emptyWrongLockEvidence();
+    this.wrongLockTarget = null;
+    this.avoidPoint = null;
     this.lockedTickCount = 0;
     this.scanFrameCount = 0;
     this.scanStartMs = performance.now();
@@ -1238,6 +1383,25 @@ export class TrackingService {
     const tealBlobs = iconBlobs.filter(b => b.color === 'teal');
     const redBlobs = this.occluderBlobs;
     const hasClassifier = !!(this.classifier && this.classifier.isLoaded());
+
+    // The classifier has been saying for several seconds that the blob we are
+    // on is not us and another one is (weighWrongLock). Move to it.
+    if (this.wrongLockTarget) {
+      const target = this.wrongLockTarget;
+      this.wrongLockTarget = null;
+      let pick: Blob | null = null;
+      let pickDist = computeNearFieldPx(this.expectedIconDiam);
+      for (const b of tealBlobs) {
+        const d = Math.hypot(b.cx - target.x, b.cy - target.y);
+        if (d <= pickDist) { pick = b; pickDist = d; }
+      }
+      if (pick) {
+        console.warn('[Tracking] Locked on a teal icon the classifier says is not us — moving to the one it says is');
+        this.acquireViaClassifier(pick, this.getClassifierScore(pick));
+        return;
+      }
+    }
+
     const lastRegion = {
       x: this.lastPixelPos.x - this.minimapRegion.x,
       y: this.lastPixelPos.y - this.minimapRegion.y,
@@ -1333,6 +1497,8 @@ export class TrackingService {
     const newPos = this.pixelToGamePosition(cx, cy, this.minimapRegion);
     this.setLastPosition(newPos, 'classifier-reacquire');
     this.resetOcclusion();
+    this.wrongLock = emptyWrongLockEvidence();
+    this.wrongLockTarget = null;
     this.velocityX = 0;
     this.velocityY = 0;
     this.lockedTickCount++;

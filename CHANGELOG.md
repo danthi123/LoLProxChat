@@ -4,6 +4,12 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Fixed
+- **You could go silent for minutes after walking past a ward.** If your icon was briefly hidden (covered by an enemy's) right beside something static and teal on the minimap — a ward, most likely, in the log that showed it — the tracker could come out of it following that instead, and since it stays put and stays visible, nothing moved it back. Everyone else then heard you from the ward's spot, so they stopped hearing you once you walked away, while you could still hear them; one tester was silent for minutes. On the runs where the champion classifier recognised anything, it rated the ward 0.00 and the real icon 1.00. The tracker now acts on that: if the blob it follows has stayed within about a quarter of an icon of one spot for 4 seconds while the classifier keeps rating it as not you, and the same other icon as you, on run after run, it moves to that icon. It does not act on scattered readings, on readings that point at different icons, or while the blob it follows is walking somewhere, so a weak classifier cannot pull a correct lock off a champion that is moving about (a champion standing still or shuffling in place, e.g. last-hitting, is not protected that way). It can take longer, or not happen, for champions the classifier rarely recognises — which is what RESET (below) is for.
+
+### Added
+- **Settings → "Wrong position?" → RESET.** Drops the tracked position and finds your champion on the minimap again, skipping the spot it was stuck on — unless that spot turns out to be moving (then it was probably you, and the normal search decides). **Walk somewhere after pressing it**: if the app does not recognise your champion, your movement is how it tells you apart from the icons around you, and it waits for that rather than guess. Until it finds you, only your team hears you. It does nothing while you are dead (you stay at your body until you respawn).
+
 ## [v0.5.10] — 2026-09-30
 
 ### Fixed

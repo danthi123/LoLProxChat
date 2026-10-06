@@ -11,6 +11,13 @@ import {
   computeNearFieldPx,
   computeViewportCenter,
   describeViewportCenter,
+  emptyWrongLockEvidence,
+  nextWrongLockEvidence,
+  WrongLockEvidence,
+  WrongLockRun,
+  WRONG_LOCK_RUNS,
+  WRONG_LOCK_MIN_MS,
+  WRONG_LOCK_STALE_MS,
 } from '../../src/services/tracking-helpers';
 import type { Blob } from '../../src/services/blob-types';
 
@@ -439,5 +446,96 @@ describe('describeViewportCenter — why a camera frame missed', () => {
   test('computeViewportCenter still returns just the centre', () => {
     expect(computeViewportCenter(mkMask(100, 150, 166, 187), W, H)).toEqual({ cx: 133, cy: 168.5 });
     expect(computeViewportCenter(new Uint8Array(W * H), W, H)).toBeNull();
+  });
+});
+
+describe('nextWrongLockEvidence', () => {
+  const ICON = 30;
+  const WARD = { x: 130, y: 133 };
+  const REAL = { x: 218, y: 204, score: 1 };
+  const against: WrongLockRun = { followed: WARD, followedScore: 0, best: REAL, discriminating: true };
+
+  function feed(runs: WrongLockRun[], startMs = 1000, stepMs = 500) {
+    let ev: WrongLockEvidence = emptyWrongLockEvidence();
+    let switchTo: { x: number; y: number } | null = null;
+    let at = -1;
+    runs.forEach((r, i) => {
+      const out = nextWrongLockEvidence(ev, r, startMs + i * stepMs, ICON);
+      ev = out.evidence;
+      if (out.switchTo && !switchTo) { switchTo = out.switchTo; at = i; }
+    });
+    return { ev, switchTo: switchTo as { x: number; y: number } | null, at };
+  }
+
+  test('switches once enough contrary runs span enough time', () => {
+    const { switchTo, at } = feed(Array(12).fill(against));
+    expect(switchTo).toEqual({ x: REAL.x, y: REAL.y });
+    // Six runs would be 2.5s at 500ms; the time floor is what decides.
+    expect(at).toBe(WRONG_LOCK_MIN_MS / 500);
+    expect(at + 1).toBeGreaterThanOrEqual(WRONG_LOCK_RUNS);
+  });
+
+  test('needs the run count even when the time has passed', () => {
+    const { switchTo, at } = feed(Array(8).fill(against), 1000, 2000);
+    expect(switchTo).not.toBeNull();
+    expect(at + 1).toBe(WRONG_LOCK_RUNS);
+  });
+
+  test('silent runs neither count nor reset', () => {
+    const silent: WrongLockRun = { ...against, discriminating: false };
+    const runs = [against, silent, against, silent, against, silent, against, silent, against, silent, against];
+    expect(feed(runs).switchTo).not.toBeNull();
+    expect(feed(runs.slice(0, 10)).switchTo).toBeNull();
+  });
+
+  test('one run that vouches for the followed blob resets everything', () => {
+    const runs = [...Array(7).fill(against), { ...against, followedScore: 0.6 }, ...Array(5).fill(against)];
+    expect(feed(runs).switchTo).toBeNull();
+  });
+
+  test('a followed blob that moves resets the evidence', () => {
+    // 2px per 500ms run: slower than any champion walks.
+    const walking = Array.from({ length: 12 }, (_, i) => ({ ...against, followed: { x: WARD.x + i * 2, y: WARD.y } }));
+    expect(feed(walking).switchTo).toBeNull();
+  });
+
+  test('the preferred blob must be a different icon, and a clear favourite', () => {
+    expect(feed(Array(12).fill({ ...against, best: { x: WARD.x + 10, y: WARD.y, score: 1 } })).switchTo).toBeNull();
+    expect(feed(Array(12).fill({ ...against, best: { ...REAL, score: 0.9 } })).switchTo).toBeNull();
+    expect(feed(Array(12).fill({ ...against, followedScore: 0.3 })).switchTo).toBeNull();
+    expect(feed(Array(12).fill({ ...against, followed: null })).switchTo).toBeNull();
+  });
+
+  test('noise spread across several allies never adds up', () => {
+    const allies = [{ x: 30, y: 120 }, { x: 250, y: 60 }, { x: 200, y: 260 }];
+    const runs = Array.from({ length: 20 }, (_, i) => ({ ...against, best: { ...allies[i % 3], score: 1 } }));
+    expect(feed(runs).switchTo).toBeNull();
+  });
+
+  test('a stray hit every 12s never adds up, however long it goes on', () => {
+    const silent: WrongLockRun = { ...against, discriminating: false };
+    const runs = Array.from({ length: 24 * 15 }, (_, i) => (i % 24 === 0 ? against : silent));
+    expect(feed(runs).switchTo).toBeNull();
+  });
+
+  test('a discriminating run that does not support the switch resets it', () => {
+    const weak: WrongLockRun = { ...against, followedScore: 0.3 };
+    const runs = [...Array(5).fill(against), weak, ...Array(5).fill(against)];
+    expect(feed(runs).switchTo).toBeNull();
+  });
+
+  test('a preferred icon that walks is still the same icon', () => {
+    const runs = Array.from({ length: 12 }, (_, i) => ({ ...against, best: { x: REAL.x + i * 3, y: REAL.y, score: 1 } }));
+    expect(feed(runs).switchTo).toEqual({ x: REAL.x + 8 * 3, y: REAL.y });
+  });
+
+  test('evidence goes stale', () => {
+    let ev = emptyWrongLockEvidence();
+    for (let i = 0; i < 5; i++) ev = nextWrongLockEvidence(ev, against, 1000 + i * 500, ICON).evidence;
+    expect(ev.runs).toBe(5);
+    const later = nextWrongLockEvidence(ev, against, 3000 + WRONG_LOCK_STALE_MS + 1, ICON);
+    expect(WRONG_LOCK_STALE_MS).toBeLessThanOrEqual(3000);
+    expect(later.switchTo).toBeNull();
+    expect(later.evidence.runs).toBe(1);
   });
 });

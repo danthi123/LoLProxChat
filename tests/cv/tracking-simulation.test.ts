@@ -1081,3 +1081,224 @@ describe('an enemy icon drawn over ours', () => {
     expect(MAX_OCCLUDED_MS).toBe(10_000);
   });
 });
+
+describe('a lock that ends up on a static teal marker (v0.5.10 Briar log)', () => {
+  // The champion's icon goes for a moment right beside something teal that
+  // stays put — a ward, in the log (there an enemy icon covered ours; here it
+  // simply vanishes). Phase 1 follows the nearest blob on continuity, which is
+  // the marker, and nothing moved it back: it stays visible, so there is no
+  // hold. The other player then heard nothing for minutes, scored against the
+  // ward, while the classifier — on the runs where it said anything — rated
+  // the real icon 1.00 and the ward 0.00.
+  const WARD: Point = at(START, STEP, 40);
+  const OVER: SceneSpec = { ...BACKDROP, allies: [...BACKDROP.allies!, WARD] };
+  const AWAY: Point = { x: 215, y: 215 };
+  const AWAY_STEP: Point = { x: 0, y: -1 };
+
+  function specs(afterFrames: number, after?: SceneSpec[]): SceneSpec[] {
+    return [
+      ...walk(29, START, STEP, OVER),
+      ...vanished(8, OVER),
+      ...(after ?? walk(afterFrames, AWAY, AWAY_STEP, OVER)),
+    ];
+  }
+
+  async function drive(classifier: 'oracle' | 'zero' | 'both', afterFrames = 64, resetAt = -1, after?: SceneSpec[]) {
+    const s = specs(afterFrames, after);
+    const scenes = renderScenes(s);
+    let target: Point | null = null;
+    const scorer = classifier === 'oracle'
+      ? new OracleScorer(() => target && toFramePoint(target))
+      : classifier === 'zero' ? new ZeroScorer() : new IndiscriminateScorer();
+    const h = newTracker(scenes.map(sc => sc.frame), { classifier: scorer });
+    const records: Awaited<ReturnType<typeof driveTracker>> = [];
+    for (let i = 0; i < scenes.length; i++) {
+      target = s[i].self ?? null;
+      if (i === resetAt) h.svc.resetPosition();
+      records.push(...await driveTracker(h, [scenes[i]]));
+    }
+    return { records, scenes: s, awayFrom: s.length - afterFrames };
+  }
+
+  test('the scene really strands the lock on the marker', async () => {
+    // Without anything to say otherwise, the lock stays on the ward while the
+    // champion walks off — the failure, reproduced.
+    const { records } = await drive('zero');
+    const last = records[records.length - 1];
+    expect(last.state).toBe(TrackingState.LOCKED);
+    expect(distance(last.px!, WARD)).toBeLessThanOrEqual(3);
+    expect(distance(last.truth!, WARD)).toBeGreaterThan(70);
+  });
+
+  test('a classifier that keeps saying "not us" moves the lock to the real icon', async () => {
+    const { records, awayFrom } = await drive('oracle');
+    // Stranded first: the marker held the lock when the champion reappeared.
+    expect(distance(records[awayFrom + 2].px!, WARD)).toBeLessThanOrEqual(3);
+    const moved = records.findIndex((r, i) => i > awayFrom && distance(r.px!, r.truth!) <= 3);
+    expect(moved).toBeGreaterThan(awayFrom);
+    // Not on the first contrary run: it takes the evidence window (4s, 32 frames).
+    expect((moved - awayFrom) * FRAME_MS).toBeGreaterThanOrEqual(4000);
+    expect((moved - awayFrom) * FRAME_MS).toBeLessThanOrEqual(6500);
+    for (const r of records.slice(moved)) expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    expect(logs.some(l => l.includes('is not us'))).toBe(true);
+  });
+
+  test('a classifier that cannot tell icons apart never moves it', async () => {
+    const { records } = await drive('both');
+    expect(distance(records[records.length - 1].px!, WARD)).toBeLessThanOrEqual(3);
+    expect(logs.some(l => l.includes('is not us'))).toBe(false);
+  });
+
+  test('"Wrong position?" finds the champion when the classifier is no help', async () => {
+    // A model that recognises nothing cannot catch this; the user can. The
+    // only other teal icon nearby is below the champion, so nothing but the
+    // reset's avoidance stops the scan re-picking the ward, which comes first
+    // in raster order. Standing still, the champion carries nothing that
+    // identifies it either, so the scan waits for it to walk.
+    const STAND: Point = { x: 185, y: 175 };
+    const SPARSE: SceneSpec = { ...BACKDROP, allies: [WARD, BACKDROP.allies![1]] };
+    const after = [
+      ...Array.from({ length: 32 }, () => ({ ...SPARSE, self: STAND, selfTrail: null })),
+      ...walk(24, STAND, { x: 0, y: -1 }, SPARSE),
+    ];
+    const stuck = await drive('zero', after.length, -1, after);
+    expect(distance(stuck.records[stuck.awayFrom + 30].px!, WARD)).toBeLessThanOrEqual(3);
+
+    logs.length = 0;
+    const resetAt = stuck.awayFrom + 8;
+    const { records } = await drive('zero', after.length, resetAt, after);
+    expect(logs.some(l => l.includes('Position reset by the user'))).toBe(true);
+    const walkFrom = stuck.awayFrom + 32;
+    // Standing still: no lock at all, rather than an arbitrary one.
+    for (const r of records.slice(resetAt, walkFrom)) expect(r.state).toBe(TrackingState.SCANNING);
+    const relocked = records.findIndex((r, i) => i >= walkFrom && r.state === TrackingState.LOCKED);
+    expect(relocked).toBeGreaterThanOrEqual(walkFrom);
+    for (const r of records.slice(relocked)) {
+      expect(r.state).toBe(TrackingState.LOCKED);
+      expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    }
+  });
+
+  test('a ward vanishing for one frame during the watch neither locks early nor counts as movement', async () => {
+    const STAND: Point = { x: 185, y: 175 };
+    const SPARSE: SceneSpec = { ...BACKDROP, allies: [WARD, BACKDROP.allies![1]] };
+    const NO_WARD: SceneSpec = { ...BACKDROP, allies: [BACKDROP.allies![1]] };
+    const after = Array.from({ length: 40 }, (_, i) =>
+      ({ ...(i === 18 ? NO_WARD : SPARSE), self: STAND, selfTrail: null }));
+    const stuck = await drive('zero', after.length, -1, after);
+    const resetAt = stuck.awayFrom + 8;
+    logs.length = 0;
+    const { records } = await drive('zero', after.length, resetAt, after);
+    expect(logs.some(l => l.includes('not a marker'))).toBe(false);
+    // The watch is 1.5s whether or not the ward was seen on every frame of it:
+    // frame resetAt + k runs (k + 1) * 125ms after the reset, and the ward is
+    // missing at k = 10.
+    for (const r of records.slice(resetAt, resetAt + 11)) expect(r.state).toBe(TrackingState.SCANNING);
+    for (const r of records.slice(resetAt)) {
+      if (r.state === TrackingState.LOCKED) expect(distance(r.px!, WARD)).toBeGreaterThan(30);
+    }
+  });
+});
+
+describe('the wrong-lock check leaves a walking champion alone', () => {
+  test('a classifier sure of a distant ally does not pull a lock that is moving', async () => {
+    // A weak model confidently preferring someone else is the risk this check
+    // carries. What protects a correct lock is that we move: the evidence only
+    // builds while the followed blob stays within a quarter icon (WRONG_LOCK_STILL_FRACTION,
+    // at least 3px) of where it started.
+    // Locked correctly first; from then on the model is sure it is the ally.
+    const FAR_ALLY: Point = BACKDROP.allies![1];
+    const specs = walk(70);
+    const scenes = renderScenes(specs);
+    let target: Point = specs[0].self!;
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new OracleScorer(() => toFramePoint(target)) });
+    const records: Awaited<ReturnType<typeof driveTracker>> = [];
+    for (let i = 0; i < scenes.length; i++) {
+      target = i < 16 ? specs[i].self! : FAR_ALLY;
+      records.push(...await driveTracker(h, [scenes[i]]));
+    }
+    expect(records[15].state).toBe(TrackingState.LOCKED);
+    for (const r of records.slice(16)) expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    expect(logs.some(l => l.includes('is not us'))).toBe(false);
+  });
+});
+
+describe('the wrong-lock check at real walking speed', () => {
+  // ~345 move speed is ~6 px/s on this minimap: 0.75px per 125ms frame.
+  // A champion pacing in a small area — last-hitting, holding a bush — never
+  // leaves a one-icon radius, which is what the first version of the check
+  // used as its "not moving" test.
+  test('a champion pacing back and forth keeps its lock against a confidently wrong model', async () => {
+    const FAR_ALLY: Point = BACKDROP.allies![1];
+    const lockSpecs = walk(16);
+    const centre = lockSpecs[15].self!;
+    const pace = Array.from({ length: 80 }, (_, i) => {
+      const phase = i % 40;
+      const dx = Math.round((phase < 20 ? phase : 40 - phase) * 0.75);
+      return { ...BACKDROP, self: { x: centre.x + dx, y: centre.y }, selfTrail: { x: phase < 20 ? -1 : 1, y: 0 } };
+    });
+    const specs = [...lockSpecs, ...pace];
+    const scenes = renderScenes(specs);
+    let target: Point = specs[0].self!;
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new OracleScorer(() => toFramePoint(target)) });
+    const records: Awaited<ReturnType<typeof driveTracker>> = [];
+    for (let i = 0; i < scenes.length; i++) {
+      target = i < 16 ? specs[i].self! : FAR_ALLY;
+      records.push(...await driveTracker(h, [scenes[i]]));
+    }
+    for (const r of records.slice(16)) expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    expect(logs.some(l => l.includes('is not us'))).toBe(false);
+  });
+});
+
+describe('RESET pressed when the lock was right', () => {
+  const NEAR_ALLY: Point = { x: 120, y: 120 };
+
+  async function resetWhile(motion: (i: number) => Point, scorer: 'zero' | 'oracle', allies: Point[]) {
+    const lockSpecs = walk(16);
+    const from = lockSpecs[15].self!;
+    const over: SceneSpec = { ...BACKDROP, allies };
+    const after = Array.from({ length: 48 }, (_, i) => {
+      const p = motion(i);
+      return { ...over, self: { x: from.x + p.x, y: from.y + p.y }, selfTrail: p.x === 0 && p.y === 0 ? null : { x: -1, y: 0 } };
+    });
+    const specs = [...lockSpecs.map(s => ({ ...s, allies })), ...after];
+    const scenes = renderScenes(specs);
+    let target: Point | null = null;
+    const h = newTracker(scenes.map(s => s.frame), {
+      classifier: scorer === 'oracle' ? new OracleScorer(() => target && toFramePoint(target)) : new ZeroScorer(),
+    });
+    const records: Awaited<ReturnType<typeof driveTracker>> = [];
+    for (let i = 0; i < scenes.length; i++) {
+      target = specs[i].self ?? null;
+      if (i === 16) expect(h.svc.resetPosition()).toBe(true);
+      records.push(...await driveTracker(h, [scenes[i]]));
+    }
+    return records;
+  }
+
+  test('a champion walking at ordinary speed is found again, not an ally', async () => {
+    const records = await resetWhile(i => ({ x: Math.round(i * 0.75), y: 0 }), 'zero', [...BACKDROP.allies!, NEAR_ALLY]);
+    expect(logs.some(l => l.includes('it is a champion, not a marker'))).toBe(true);
+    for (const r of records.slice(-16)) {
+      expect(r.state).toBe(TrackingState.LOCKED);
+      expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    }
+  });
+
+  test('a standing champion the classifier vouches for is found again', async () => {
+    const records = await resetWhile(() => ({ x: 0, y: 0 }), 'oracle', [...BACKDROP.allies!, NEAR_ALLY]);
+    for (const r of records.slice(-16)) {
+      expect(r.state).toBe(TrackingState.LOCKED);
+      expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    }
+  });
+
+  test('the only icon on the minimap is found again within a couple of seconds', async () => {
+    const records = await resetWhile(() => ({ x: 0, y: 0 }), 'zero', []);
+    const relocked = records.findIndex((r, i) => i > 16 && r.state === TrackingState.LOCKED);
+    expect(relocked).toBeGreaterThan(16);
+    expect((relocked - 16) * FRAME_MS).toBeLessThanOrEqual(2500);
+    expect(distance(records[records.length - 1].px!, records[records.length - 1].truth!)).toBeLessThanOrEqual(3);
+  });
+});

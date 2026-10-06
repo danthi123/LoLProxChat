@@ -867,6 +867,17 @@ export class Orchestrator {
     this.broadcastOverlayState();
     return this.muteAllPref;
   }
+  /**
+   * "Wrong position?" in the panel: drop the tracker's lock and find the
+   * champion again. The next position tick sees SCANNING and disowns the old
+   * coordinates, so nobody goes on hearing us from the wrong spot meanwhile.
+   */
+  resetPosition(): void {
+    if (!this.tracking) return;
+    if (!this.tracking.resetPosition()) {
+      console.log('[LoLProxChat] Position reset ignored — dead; we stay at the body until respawn');
+    }
+  }
   toggleMutePlayer(name: string): boolean { return this.audio?.toggleMutePlayer(name) ?? false; }
   setPlayerVolume(name: string, volume: number): void { this.audio?.setPlayerVolume(name, volume); }
   setScanRate(fps: number): void {
