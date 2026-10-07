@@ -48,7 +48,7 @@ const STRINGS = {
   'settings.unnamedOutput': { en: '(unnamed audiooutput)', es: '(dispositivo sin nombre)' },
   'settings.inputMode': { en: 'Input Mode', es: 'Modo de entrada' },
   'settings.alwaysOpen': { en: 'Always Open', es: 'Siempre abierto' },
-  'settings.pushToTalk': { en: 'Push to Talk', es: 'Presionar para hablar' },
+  'settings.pushToTalk': { en: 'Push to Talk', es: 'Pulsar para hablar' },
   'settings.pttKey': { en: 'PTT Key', es: 'Tecla PTT' },
   'settings.pttKeyHint': {
     en: "Push-to-talk key. Default Caps Lock. The LED won't toggle (Discord-style synthetic flip-back).",
@@ -67,7 +67,7 @@ const STRINGS = {
   'settings.forceTurn': { en: 'Hide IP (Force TURN)', es: 'Ocultar IP (forzar TURN)' },
   'settings.forceTurnHint': {
     en: 'Routes all voice through the TURN relay so peers never see your public IP. Adds ~20-100ms latency. Takes effect on next peer connection.',
-    es: 'Envía toda la voz a través del servidor de retransmisión TURN, para que los demás jugadores nunca vean tu IP pública. Añade unos 20-100 ms de latencia. Se aplica a partir de la próxima conexión con otro jugador.',
+    es: 'Envía la voz a través del servidor de retransmisión TURN, para que los demás jugadores nunca vean tu IP pública. Añade unos 20-100 ms de latencia. Se aplica a partir de la próxima conexión con otro jugador.',
   },
   'settings.allyProximity': { en: 'Ally proximity', es: 'Proximidad aliada' },
   'settings.allyProximityHint': {
