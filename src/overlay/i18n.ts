@@ -48,7 +48,7 @@ const STRINGS = {
   'settings.unnamedOutput': { en: '(unnamed audiooutput)', es: '(dispositivo sin nombre)' },
   'settings.inputMode': { en: 'Input Mode', es: 'Modo de entrada' },
   'settings.alwaysOpen': { en: 'Always Open', es: 'Siempre abierto' },
-  'settings.pushToTalk': { en: 'Push to Talk', es: 'Presionar para hablar' },
+  'settings.pushToTalk': { en: 'Push to Talk', es: 'Pulsar para hablar' },
   'settings.pttKey': { en: 'PTT Key', es: 'Tecla PTT' },
   'settings.pttKeyHint': {
     en: "Push-to-talk key. Default Caps Lock. The LED won't toggle (Discord-style synthetic flip-back).",
@@ -60,14 +60,14 @@ const STRINGS = {
     es: 'Atajo opcional para silenciar o activar tu micrófono. Haz clic para asignar una tecla; vuelve a hacer clic para quitarla.',
   },
   'settings.unbound': { en: '(unbound)', es: '(sin asignar)' },
-  'settings.pressKey': { en: 'Press a key…', es: 'Presiona una tecla…' },
+  'settings.pressKey': { en: 'Press a key…', es: 'Pulsa una tecla…' },
   'settings.forbiddenKey': { en: '(LoL/system key — pick another)', es: '(tecla reservada)' },
   'settings.unsupportedKey': { en: '(key not supported)', es: '(tecla no compatible)' },
   'settings.micVolume': { en: 'Mic Volume', es: 'Volumen mic' },
   'settings.forceTurn': { en: 'Hide IP (Force TURN)', es: 'Ocultar IP (forzar TURN)' },
   'settings.forceTurnHint': {
     en: 'Routes all voice through the TURN relay so peers never see your public IP. Adds ~20-100ms latency. Takes effect on next peer connection.',
-    es: 'Envía toda la voz a través del servidor de retransmisión TURN, para que los demás jugadores nunca vean tu IP pública. Añade unos 20-100 ms de latencia. Se aplica a partir de la próxima conexión con otro jugador.',
+    es: 'Envía la voz a través del servidor de retransmisión TURN, para que los demás jugadores nunca vean tu IP pública. Añade unos 20-100 ms de latencia. Se aplica a partir de la próxima conexión con otro jugador.',
   },
   'settings.allyProximity': { en: 'Ally proximity', es: 'Proximidad aliada' },
   'settings.allyProximityHint': {
@@ -82,7 +82,7 @@ const STRINGS = {
   'settings.wrongPosition': { en: 'Wrong position?', es: '¿Posición incorrecta?' },
   'settings.wrongPositionHint': {
     en: "If people near you can't hear you, the app may be tracking the wrong icon on your minimap (it can latch onto a ward you walked past). This drops the current position and finds your champion again; walk somewhere after pressing it so it can tell you apart. Until it finds you, only your team hears you.",
-    es: 'Si los jugadores cercanos no te oyen, puede que la app esté siguiendo el icono equivocado en tu minimapa (puede quedarse pegada a un ward junto al que pasaste). Esto descarta la posición actual y vuelve a buscar a tu campeón; muévete después de presionarlo para que pueda distinguirte. Hasta que te encuentre, solo te oye tu equipo.',
+    es: 'Si los jugadores cercanos no te oyen, puede que la app esté siguiendo el icono equivocado en tu minimapa (puede quedarse pegada a un ward junto al que pasaste). Esto descarta la posición actual y vuelve a buscar a tu campeón; muévete después de pulsarlo para que pueda distinguirte. Hasta que te encuentre, solo te oye tu equipo.',
   },
   'settings.reset': { en: 'RESET', es: 'REINICIAR' },
   'settings.searching': { en: 'SEARCHING', es: 'BUSCANDO' },
