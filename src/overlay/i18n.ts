@@ -60,7 +60,7 @@ const STRINGS = {
     es: 'Atajo opcional para silenciar o activar tu micrófono. Haz clic para asignar una tecla; vuelve a hacer clic para quitarla.',
   },
   'settings.unbound': { en: '(unbound)', es: '(sin asignar)' },
-  'settings.pressKey': { en: 'Press a key…', es: 'Presiona una tecla…' },
+  'settings.pressKey': { en: 'Press a key…', es: 'Pulsa una tecla…' },
   'settings.forbiddenKey': { en: '(LoL/system key — pick another)', es: '(tecla reservada)' },
   'settings.unsupportedKey': { en: '(key not supported)', es: '(tecla no compatible)' },
   'settings.micVolume': { en: 'Mic Volume', es: 'Volumen mic' },
@@ -82,7 +82,7 @@ const STRINGS = {
   'settings.wrongPosition': { en: 'Wrong position?', es: '¿Posición incorrecta?' },
   'settings.wrongPositionHint': {
     en: "If people near you can't hear you, the app may be tracking the wrong icon on your minimap (it can latch onto a ward you walked past). This drops the current position and finds your champion again; walk somewhere after pressing it so it can tell you apart. Until it finds you, only your team hears you.",
-    es: 'Si los jugadores cercanos no te oyen, puede que la app esté siguiendo el icono equivocado en tu minimapa (puede quedarse pegada a un ward junto al que pasaste). Esto descarta la posición actual y vuelve a buscar a tu campeón; muévete después de presionarlo para que pueda distinguirte. Hasta que te encuentre, solo te oye tu equipo.',
+    es: 'Si los jugadores cercanos no te oyen, puede que la app esté siguiendo el icono equivocado en tu minimapa (puede quedarse pegada a un ward junto al que pasaste). Esto descarta la posición actual y vuelve a buscar a tu campeón; muévete después de pulsarlo para que pueda distinguirte. Hasta que te encuentre, solo te oye tu equipo.',
   },
   'settings.reset': { en: 'RESET', es: 'REINICIAR' },
   'settings.searching': { en: 'SEARCHING', es: 'BUSCANDO' },
