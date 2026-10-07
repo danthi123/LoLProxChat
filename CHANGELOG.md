@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.5.15] — 2026-10-07
+
 ### Changed
 - **Spanish wording**, from a Spanish-speaking tester: "Pulsar para hablar" for push to talk (and "pulsar" wherever the panel says press), and a simpler Hide IP tooltip.
 
