@@ -1702,3 +1702,126 @@ describe('re-acquiring across the map (2026-10-07 gcg545 log)', () => {
     expect(distance(records[records.length - 1].px!, FOUNTAIN)).toBeLessThan(12);
   });
 });
+
+describe('the camera says which teammate icon is us (2026-10-08 1hoxklt log)', () => {
+  // In that game the classifier scored Gwen 0% and the fountain lock took
+  // Kayn's icon, which Gwen's tracker then followed for four minutes. What
+  // still told them apart was the camera: Gwen's stayed on Gwen.
+  //
+  // A free camera, not a locked one — the player is inside the rectangle but
+  // well off its centre, which is how most of the testers play.
+  const DECOY_FROM: Point = { x: 200, y: 80 };
+  const SELF_FROM: Point = { x: 80, y: 200 };
+  const SELF_STEP: Point = { x: 0.25, y: -0.1 };
+  const freeCam = (p: Point) => ({ x: p.x - 20, y: p.y - 50, w: 110, h: 80 });
+
+  /** The decoy alone first, so the tracker locks it; then both, with the camera on self. */
+  function wrongStart(
+    seconds: number,
+    camera: (self: Point, decoy: Point, i: number) => SceneSpec['camera'],
+    decoyFrom: Point = DECOY_FROM,
+  ): SceneSpec[] {
+    const intro = Array.from({ length: 32 }, (_, i): SceneSpec => {
+      const decoy = at(decoyFrom, { x: 0, y: 0.05 }, i);
+      return { allies: [decoy], enemies: [{ x: 250, y: 160 }], camera: freeCam(SELF_FROM) };
+    });
+    const both = Array.from({ length: seconds * 8 }, (_, i): SceneSpec => {
+      const decoy = at(decoyFrom, { x: 0, y: 0.05 }, 32 + i);
+      const self = at(SELF_FROM, SELF_STEP, i);
+      return {
+        self, selfTrail: null, allies: [decoy], enemies: [{ x: 250, y: 160 }],
+        camera: camera(self, decoy, i),
+      };
+    });
+    return [...intro, ...both];
+  }
+
+  test('a lock on a teammate the player never looks at moves to the icon they do', async () => {
+    const scenes = renderScenes(wrongStart(40, (self) => freeCam(self)));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    // Really started on the decoy, or this proves nothing.
+    expect(distance(records[40].px!, at(DECOY_FROM, { x: 0, y: 0.05 }, 40))).toBeLessThan(6);
+    const switched = records.findIndex(r => r.truth && r.px && distance(r.px, r.truth) < 6);
+    expect(switched).toBeGreaterThan(32);
+    // Not before the post-lock cooldown and a full window's worth of evidence.
+    expect((switched - 32) * FRAME_MS).toBeGreaterThanOrEqual(10_000);
+    expect((switched - 32) * FRAME_MS).toBeLessThanOrEqual(30_000);
+    for (const r of records.slice(switched)) expect(distance(r.px!, r.truth!)).toBeLessThan(6);
+    expect(logs.some(l => l.includes('moving to the one it keeps on screen'))).toBe(true);
+  });
+
+  /**
+   * Locked on self from the start with the camera on self, then the camera
+   * somewhere else from `awayFrom` to `awayTo` seconds: on the teammate while
+   * `onDecoy(t)`, on an empty stretch of map otherwise.
+   */
+  function lookingAway(seconds: number, awayFrom: number, awayTo: number, onDecoy: (t: number) => boolean): SceneSpec[] {
+    return Array.from({ length: seconds * 8 }, (_, i): SceneSpec => {
+      const self = at(SELF_FROM, SELF_STEP, i);
+      const decoy = at(DECOY_FROM, { x: 0, y: 0.05 }, i);
+      const t = i / 8;
+      const away = t >= awayFrom && t < awayTo;
+      return {
+        self, selfTrail: { x: -SELF_STEP.x, y: -SELF_STEP.y }, allies: i < 16 ? [] : [decoy],
+        enemies: [{ x: 250, y: 160 }],
+        camera: !away ? freeCam(self)
+          : onDecoy(t) ? { x: decoy.x - 35, y: decoy.y - 30, w: 70, h: 60 }
+          : { x: 10, y: 10, w: 110, h: 80 },
+      };
+    });
+  }
+
+  test('watching a teammate for 22s does not move the lock off the player', async () => {
+    // A fight in another lane, or F2 held: 22s of 30 on the teammate leaves
+    // the player on screen about a quarter of the window, still above
+    // CAMERA_DWELL_LOW.
+    const specs = lookingAway(50, 20, 42, () => true);
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+
+    const locked = records.findIndex(r => r.state === TrackingState.LOCKED);
+    expect(distance(records[locked + 1].px!, records[locked + 1].truth!)).toBeLessThan(6);
+    for (const r of records.slice(locked + 1)) expect(distance(r.px!, r.truth!)).toBeLessThan(6);
+    expect(logs.some(l => l.includes('moving to the one it keeps on screen'))).toBe(false);
+  });
+
+  test('a teammate on screen half the time is not enough, even with the player never in view', async () => {
+    // 20s watching an empty stretch of map (an objective), then 15s on the
+    // teammate: the player is off screen for the whole window, but the
+    // teammate is in view only half of it, short of CAMERA_DWELL_HIGH.
+    const specs = lookingAway(55, 20, 55, (t) => t >= 40);
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    const locked = records.findIndex(r => r.state === TrackingState.LOCKED);
+    for (const r of records.slice(locked + 1)) expect(distance(r.px!, r.truth!)).toBeLessThan(6);
+    expect(logs.some(l => l.includes('moving to the one it keeps on screen'))).toBe(false);
+  });
+
+  test('never moves the lock off an icon in a base, where players look elsewhere', async () => {
+    // Shopping, or waiting out a recall: the camera is on the map, not on the
+    // fountain. The same evidence that moves a lock in lane does not move it
+    // out of a base.
+    const BASE: Point = { x: 25, y: 245 };
+    const scenes = renderScenes(wrongStart(40, (self) => freeCam(self), BASE));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    expect(distance(records[40].px!, at(BASE, { x: 0, y: 0.05 }, 40))).toBeLessThan(6);
+    expect(logs.some(l => l.includes('moving to the one it keeps on screen'))).toBe(false);
+  });
+
+  test('two icons the player keeps on screen together are left alone', async () => {
+    // A duo lane: the camera shows both all the time, so it cannot say which
+    // is us, and the lock it has is kept.
+    const scenes = renderScenes(wrongStart(40, (self) => ({ x: self.x - 20, y: 70, w: 170, h: 160 })));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    // The box really does contain the decoy as well.
+    expect(DECOY_FROM.y).toBeGreaterThan(70);
+    expect(logs.some(l => l.includes('moving to the one it keeps on screen'))).toBe(false);
+    expect(distance(records[records.length - 1].px!, at(DECOY_FROM, { x: 0, y: 0.05 }, records.length - 1))).toBeLessThan(6);
+  });
+});

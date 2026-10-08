@@ -681,6 +681,8 @@ export type ViewportMiss =
 
 export interface ViewportResult {
   centre: { cx: number; cy: number } | null;
+  /** The rectangle's edges (region px), present whenever `centre` is. */
+  box?: ViewportBox;
   miss?: ViewportMiss;
   /** Marked pixels seen, so a threshold problem is distinguishable from a shape one. */
   markedPixels: number;
@@ -746,6 +748,7 @@ export function describeViewportCenter(
 
   return {
     centre: { cx: (cols.near + cols.far) / 2, cy: (rows.near + rows.far) / 2 },
+    box: { x0: cols.near, y0: rows.near, x1: cols.far, y1: rows.far },
     markedPixels,
   };
 }
@@ -796,4 +799,156 @@ function spansAgree(edgeLength: number, span: number): boolean {
   if (span <= 0) return false;
   const ratio = edgeLength / span;
   return ratio >= 0.5 && ratio <= 2.0;
+}
+
+// ---------- Camera dwell: which teammate icon is the one we keep on screen ----------
+
+export interface ViewportBox { x0: number; y0: number; x1: number; y1: number }
+
+/**
+ * How far back camera dwell looks. Long enough that glancing at a teammate's
+ * lane, or holding F2-F5 on one for a few seconds, is a minority of the window;
+ * short enough to correct a wrong lock within a minute.
+ */
+export const CAMERA_DWELL_WINDOW_MS = 30_000;
+/** Readable-camera time an icon needs in the window before its dwell counts. */
+export const CAMERA_DWELL_MIN_READABLE_MS = 10_000;
+/** A candidate on screen at least this much of the time is a camera favourite... */
+export const CAMERA_DWELL_HIGH = 0.6;
+/** ...and an icon on screen at most this much is one the player is not watching. */
+export const CAMERA_DWELL_LOW = 0.2;
+/** After any lock or camera switch, how long before the camera may move us. */
+export const CAMERA_SWITCH_COOLDOWN_MS = 15_000;
+/** A track not matched to any icon for this long is forgotten. */
+const CAMERA_TRACK_TTL_MS = 2_000;
+
+interface DwellSample { t: number; dt: number; inView: boolean }
+interface DwellTrack { x: number; y: number; lastMs: number; samples: DwellSample[] }
+
+export interface DwellReading { x: number; y: number; dwell: number; readableMs: number }
+
+/**
+ * Which own-team icon the player keeps on screen.
+ *
+ * The champion classifier cannot tell some teammates apart at all (the
+ * 2026-10-08 test: Gwen 0%, Kayn under 5%), and a wrong pick — usually made in
+ * the fountain, where every icon starts together — then stuck for minutes. The
+ * camera says something the classifier cannot: players keep their own
+ * champion on screen most of the time, locked camera or not, while any one
+ * teammate is only in view now and then. In those games the rectangle was
+ * readable in 65-90% of frames, and centred within an icon of the player when
+ * they were not looking elsewhere.
+ *
+ * So each icon is followed frame to frame, and every frame the rectangle is
+ * readable records whether it was inside it. An icon's dwell is the fraction
+ * of that readable time it spent in view over the last CAMERA_DWELL_WINDOW_MS.
+ * Nothing here decides anything; TrackingService compares dwells.
+ *
+ * Free-camera players are why this is "inside the rectangle" rather than
+ * "near its centre": they keep themselves on screen without centring.
+ */
+export class CameraDwell {
+  private tracks: DwellTrack[] = [];
+
+  reset(): void { this.tracks = []; }
+
+  /**
+   * One frame: the own-team icons (region px) and the camera rectangle, or
+   * null when it could not be read this frame (the frame then counts for no
+   * icon, in view or out).
+   */
+  update(icons: Array<{ x: number; y: number }>, box: ViewportBox | null, now: number, dtMs: number, iconDiam: number): void {
+    const step = Math.max(4, iconDiam);
+    const matched = new Set<DwellTrack>();
+    for (const icon of icons) {
+      let best: DwellTrack | null = null;
+      let bestD = step;
+      for (const t of this.tracks) {
+        if (matched.has(t)) continue;
+        const d = Math.hypot(t.x - icon.x, t.y - icon.y);
+        if (d <= bestD) { best = t; bestD = d; }
+      }
+      if (!best) {
+        best = { x: icon.x, y: icon.y, lastMs: now, samples: [] };
+        this.tracks.push(best);
+      }
+      matched.add(best);
+      best.x = icon.x;
+      best.y = icon.y;
+      best.lastMs = now;
+      if (box) {
+        const m = iconDiam * 0.25;
+        const inView = icon.x >= box.x0 - m && icon.x <= box.x1 + m && icon.y >= box.y0 - m && icon.y <= box.y1 + m;
+        best.samples.push({ t: now, dt: Math.min(dtMs, 500), inView });
+      }
+    }
+    const horizon = now - CAMERA_DWELL_WINDOW_MS;
+    this.tracks = this.tracks.filter(t => now - t.lastMs <= CAMERA_TRACK_TTL_MS);
+    for (const t of this.tracks) {
+      let drop = 0;
+      while (drop < t.samples.length && t.samples[drop].t <= horizon) drop++;
+      if (drop > 0) t.samples.splice(0, drop);
+    }
+  }
+
+  /** Every followed icon's dwell, as of the last update. */
+  readings(): DwellReading[] {
+    return this.tracks.map((t) => {
+      let readable = 0;
+      let inView = 0;
+      for (const s of t.samples) {
+        readable += s.dt;
+        if (s.inView) inView += s.dt;
+      }
+      return { x: t.x, y: t.y, dwell: readable > 0 ? inView / readable : 0, readableMs: readable };
+    });
+  }
+
+}
+
+/**
+ * The reading nearest `at` within `radius`, or null. Takes the list rather than
+ * a CameraDwell so the result is one of its elements: readings() builds new
+ * objects on every call, and cameraSwitchTarget tells the followed icon from
+ * the rest by identity.
+ */
+export function readingNear(readings: DwellReading[], at: { x: number; y: number }, radius: number): DwellReading | null {
+  let best: DwellReading | null = null;
+  let bestD = radius;
+  for (const r of readings) {
+    const d = Math.hypot(r.x - at.x, r.y - at.y);
+    if (d <= bestD) { best = r; bestD = d; }
+  }
+  return best;
+}
+
+/**
+ * The icon the camera says is us, if the evidence is clear: on screen at least
+ * CAMERA_DWELL_HIGH of a full window, and every other icon with enough data at
+ * most CAMERA_DWELL_LOW. Two teammates who stay together are both in view and
+ * neither wins — the camera cannot separate them, and does not try.
+ */
+export function cameraFavourite(readings: DwellReading[]): DwellReading | null {
+  const ready = readings.filter(r => r.readableMs >= CAMERA_DWELL_MIN_READABLE_MS);
+  const high = ready.filter(r => r.dwell >= CAMERA_DWELL_HIGH);
+  if (high.length !== 1) return null;
+  const others = ready.filter(r => r !== high[0]);
+  if (others.some(r => r.dwell > CAMERA_DWELL_LOW)) return null;
+  return high[0];
+}
+
+/**
+ * The icon to move a lock to on camera evidence alone, or null. The icon we
+ * follow has to be one the player has not been watching (at most
+ * CAMERA_DWELL_LOW over a full window) and exactly one other icon one they
+ * have (at least CAMERA_DWELL_HIGH). Unlike cameraFavourite, a third icon the
+ * player also watches does not block it: that is a duo lane, and the icon we
+ * follow is neither of the two.
+ */
+export function cameraSwitchTarget(readings: DwellReading[], followed: DwellReading | null): DwellReading | null {
+  if (followed && !readings.includes(followed)) throw new Error('cameraSwitchTarget: followed is not one of readings');
+  if (!followed || followed.readableMs < CAMERA_DWELL_MIN_READABLE_MS || followed.dwell > CAMERA_DWELL_LOW) return null;
+  const high = readings.filter(r => r !== followed &&
+    r.readableMs >= CAMERA_DWELL_MIN_READABLE_MS && r.dwell >= CAMERA_DWELL_HIGH);
+  return high.length === 1 ? high[0] : null;
 }

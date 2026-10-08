@@ -4,6 +4,10 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Fixed
+- **Tracking could follow a teammate's icon instead of yours for minutes.** All teammates start together in the fountain, and for champions the icon recogniser cannot tell apart the app's first pick was a guess that nothing corrected — in a 5-player test, Gwen's app followed Kayn for four minutes, so she heard Kayn and the enemies near him, and Kayn heard her everywhere. The app now also watches which teammate icon you keep on screen: if the one it follows has hardly been in view for 30 seconds while another has been most of the time, it moves to that one. Free camera works too — you only need to be on screen, not centred. Glancing at another lane, or watching a teammate for under about 20 seconds, does not move it, and nothing changes while you are in base.
+- "Not re-acquiring" log lines are limited to one every 5 seconds.
+
 ## [v0.5.18] — 2026-10-08
 
 ### Changed
