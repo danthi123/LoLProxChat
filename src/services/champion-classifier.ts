@@ -133,6 +133,8 @@ export interface BlobCropBox {
 export interface BlobScorer {
   isLoaded(): boolean;
   scoreBlobsForLocalChampion(frame: CaptureFrame, blobs: BlobCropBox[]): Promise<number[]>;
+  /** The model-input crops of the latest run, for the Debug game bundle. */
+  lastCrops?(): ImageData[];
 }
 
 export class ChampionClassifier implements BlobScorer {
@@ -277,6 +279,13 @@ export class ChampionClassifier implements BlobScorer {
       crops.push(cropCtx.getImageData(0, 0, CROP_SIZE, CROP_SIZE));
     }
 
+    this.latestCrops = crops;
     return this.scoreCrops(crops);
+  }
+
+  private latestCrops: ImageData[] = [];
+
+  lastCrops(): ImageData[] {
+    return this.latestCrops;
   }
 }

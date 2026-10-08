@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod capture;
+mod game_bundle;
 mod game_window;
 mod global_keys;
 mod key_decision;
@@ -56,6 +57,7 @@ fn write_log_lines(state: &tauri::State<LogFile>, lines: &[String]) {
             for line in lines {
                 let _ = writeln!(f, "{}", line);
             }
+            game_bundle::tee(lines);
             // One flush per batch — a crash loses at most the batch the
             // frontend had already handed over.
             let _ = f.flush();
@@ -72,8 +74,11 @@ pub(crate) fn rust_log<S: AsRef<str>>(app: &tauri::AppHandle, msg: S) {
     // Same ISO-8601 UTC shape core/logging.ts writes, so `[rust]` lines and
     // console lines interleave in file order and read as one timeline.
     let now = chrono::Utc::now();
-    let _ = writeln!(f, "{} [rust] {}", now.format("%Y-%m-%dT%H:%M:%S%.3fZ"), msg.as_ref());
+    let line = format!("{} [rust] {}", now.format("%Y-%m-%dT%H:%M:%S%.3fZ"), msg.as_ref());
+    let _ = writeln!(f, "{line}");
     let _ = f.flush();
+    drop(guard);
+    game_bundle::tee(std::slice::from_ref(&line));
 }
 
 // Hit-test box (in window-local px) for which clicks the overlay (panel)
@@ -198,6 +203,11 @@ fn main() {
             // where the outcome is actually known.
             global_keys::setup_hook(app.handle().clone());
 
+            // Zip any game a crash or a mid-game quit left unzipped.
+            let recover_handle = app.handle().clone();
+            let unfinished = game_bundle::unfinished(&recover_handle);
+            std::thread::spawn(move || game_bundle::recover(&recover_handle, unfinished));
+
             for webview in app.webview_windows().values() {
                 mic_permission::allow_microphone(webview);
             }
@@ -292,6 +302,12 @@ fn main() {
             updater::check_for_update,
             updater::download_and_apply_update,
             global_keys::set_ptt_key,
+            game_bundle::bundle_start,
+            game_bundle::bundle_add_file,
+            game_bundle::bundle_finish,
+            global_keys::set_ptt_active,
+            global_keys::default_ptt_key,
+            global_keys::key_name,
             global_keys::set_toggle_key,
         ])
         // Closing the panel ("overlay") window should exit the whole app —

@@ -42,6 +42,9 @@ rather than one you ran from `npm run dev`.
 | 2.3 | Bind PTT to a modifier (e.g. right Alt) and to a mouse side button | Both bind and transmit; the log shows the new `VK 0x..` | `tests/core/keymap.test.ts` (label side) |
 | 2.4 | Hold PTT, alt-tab away, release outside the game | Transmission stops — no stuck-open mic | None |
 | 2.5 | Unbind PTT entirely | Always-open still transmits (the default install) | None |
+| 2.6 | Fresh install, Always Open: type capitals with Caps Lock | Caps Lock works; the PTT button shows the key left of 1 (º on a Spanish layout) | None |
+| 2.7 | Choose Push to Talk in the lobby, then start a game | The mic transmits only while the PTT key is held (it used to be always open until changed in-game) | `orchestrator-lifecycle` settings carry-over test |
+| 2.8 | Debug on, play a game to the end; open Debug Logs | `games/<lobby>_<date>_<time>.zip` holds the game's log, `minimap/` snapshots (only while League was in front) and `crops/` | `game_bundle.rs` unit tests |
 
 ## 3. Click-through and window behaviour
 

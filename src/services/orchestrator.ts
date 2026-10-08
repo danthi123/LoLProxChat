@@ -15,6 +15,8 @@ import { BlobScorer, ChampionClassifier } from './champion-classifier';
 import { VolumeClient } from './volume-client';
 import { getAllyProximity, getCameraListen } from './audio-prefs';
 import { getForceTurnRelay } from './privacy';
+import { DebugBundle } from './debug-bundle';
+import { flushLogBuffer, isLoggingEnabled } from '../core/logging';
 import { getStoredInputDeviceId, getStoredOutputDeviceId } from './devices';
 import { ScreenRect } from '../core/map-calibration';
 import {
@@ -240,6 +242,9 @@ export class Orchestrator {
     }
   }
 
+  private debugBundle: DebugBundle | null = null;
+  private bundleChain: Promise<void> = Promise.resolve();
+
   private lastMicRetryAt = 0;
   private static readonly MIC_RETRY_MS = 10_000;
 
@@ -395,6 +400,20 @@ export class Orchestrator {
       console.warn('[LoLProxChat] Settings unreadable:', e);
     }
 
+    // Debug on: this game's log lines and what the tracker saw go into one
+    // zip named after the lobby (see debug-bundle.ts). Chained, so a quick
+    // end-and-restart can never zip the new game with the old one's finish.
+    if (isLoggingEnabled()) {
+      const roomId = session.roomId;
+      this.bundleChain = this.bundleChain.then(async () => {
+        const bundle = await DebugBundle.start(roomId);
+        if (this.session?.roomId === roomId) {
+          this.debugBundle = bundle;
+          if (bundle) this.tracking?.setDebugSink?.(bundle);
+        }
+      });
+    }
+
     // Initialize audio (mic + WebRTC)
     this.audio = this.deps.createAudio(this.signaling, this.localSummonerName);
     try {
@@ -413,7 +432,8 @@ export class Orchestrator {
     } else {
       console.log('[LoLProxChat] Microphone initialized');
     }
-    // Carry over any mute toggles the user set before/between sessions.
+    // Carry over the panel's settings and mute toggles from before/between sessions.
+    if (Object.keys(this.audioSettings).length) this.audio.updateSettings?.(this.audioSettings as any);
     this.audio.setSelfMuted(this.selfMutedPref);
     this.audio.setMuteAll(this.muteAllPref);
 
@@ -477,6 +497,7 @@ export class Orchestrator {
 
       this.tracking = this.deps.createTracking(resolved.rect, session.mapType);
       this.tracking.loadChampionTemplate(session.localPlayer.championName);
+      if (this.debugBundle) this.tracking.setDebugSink?.(this.debugBundle);
 
       // Set capture bounds in Tauri backend
       await this.tracking.initCaptureBounds();
@@ -945,7 +966,13 @@ export class Orchestrator {
     }, clamped);
   }
   setPTTState(held: boolean): void { this.audio?.setPTTState(held); }
-  updateSettings(settings: any): void { this.audio?.updateSettings(settings); }
+  /** Remembered so each new session's AudioService starts with them: the
+   *  panel sends a setting once, and a new game used to get the defaults. */
+  private audioSettings: Record<string, unknown> = {};
+  updateSettings(settings: any): void {
+    this.audioSettings = { ...this.audioSettings, ...settings };
+    this.audio?.updateSettings(settings);
+  }
   applyInputDevice(id: string | null): Promise<void> | void { return this.audio?.applyInputDevice(id); }
   applyOutputDevice(id: string | null): Promise<void> | void { return this.audio?.applyOutputDevice(id); }
 
@@ -1170,9 +1197,17 @@ export class Orchestrator {
       this.configPollId = null;
     }
 
+    this.tracking?.setDebugSink?.(null);
     this.tracking?.stop();
     this.tracking = null;
     this.volumeClient = null;
+    if (this.debugBundle || isLoggingEnabled()) {
+      this.debugBundle = null;
+      this.bundleChain = this.bundleChain.then(async () => {
+        await flushLogBuffer();
+        await DebugBundle.finish();
+      });
+    }
     this.audio?.cleanup();
     this.signaling.leaveRoom();
     this.gameState.clearSession();

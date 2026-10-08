@@ -32,8 +32,8 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    GetKeyNameTextW, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MAPVK_VSC_TO_VK_EX, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
@@ -45,7 +45,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// push-to-talk users unable to transmit — no key bound — so v0.5.7 restored
 /// the Caps Lock default. See #27; note 4 above covers how the key is left
 /// alone without unbinding it.)
+///
+/// v0.5.17: Caps Lock is no longer the default for new binds (see
+/// `default_ptt_vk`), and no key is watched at all unless the input mode is
+/// push-to-talk (`PTT_ACTIVE`). With Caps Lock bound, the hook cancels every
+/// Caps Lock toggle — which, in always-open mode where nothing needs the key,
+/// just left players unable to type capitals while the app ran.
 static PTT_VK: AtomicU32 = AtomicU32::new(VK_CAPITAL);
+
+/// Whether the input mode is push-to-talk. Off until the overlay says so.
+static PTT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// The key left of 1 (scan code 0x29) under the current keyboard layout:
+/// ` on US, º on Spanish, ^ on German, ² on French. Not used for typing in a
+/// game, and on every layout. Falls back to VK_OEM_3 if the layout has none.
+fn default_ptt_vk() -> u32 {
+    let vk = unsafe { MapVirtualKeyW(0x29, MAPVK_VSC_TO_VK_EX) };
+    if vk == 0 { 0xC0 } else { vk }
+}
 
 /// Currently-bound toggle-self-mute virtual-key code. 0 = unbound.
 static TOGGLE_VK: AtomicU32 = AtomicU32::new(0);
@@ -101,7 +118,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         let Decision { emit, flip_caps, caps_held } = key_decision::decide(
             kb.vkCode,
             edge,
-            PTT_VK.load(Ordering::Relaxed),
+            if PTT_ACTIVE.load(Ordering::Relaxed) { PTT_VK.load(Ordering::Relaxed) } else { 0 },
             TOGGLE_VK.load(Ordering::Relaxed),
             injected,
             CAPS_HELD.load(Ordering::Relaxed),
@@ -206,8 +223,8 @@ pub fn setup_hook(app: AppHandle) {
         // arrive.
         crate::rust_log(
             &app_for_hook,
-            "global_keys: WH_KEYBOARD_LL hook installed; PTT default=CapsLock until the \
-             overlay pushes the stored bind",
+            "global_keys: WH_KEYBOARD_LL hook installed; PTT inactive until the overlay \
+             selects push-to-talk",
         );
 
         let mut msg = MSG::default();
@@ -229,6 +246,41 @@ pub fn setup_hook(app: AppHandle) {
 pub fn set_ptt_key(app: tauri::AppHandle, vk: u32) {
     PTT_VK.store(vk, Ordering::Relaxed);
     crate::rust_log(&app, format!("global_keys: PTT rebound to VK 0x{vk:02X}"));
+}
+
+/// JS-callable: whether the input mode is push-to-talk. While it is not, the
+/// PTT key is left entirely alone — no events, no Caps Lock cancelling.
+#[tauri::command]
+pub fn set_ptt_active(app: tauri::AppHandle, active: bool) {
+    let was = PTT_ACTIVE.swap(active, Ordering::Relaxed);
+    if was != active {
+        crate::rust_log(&app, format!("global_keys: push-to-talk {}", if active { "on" } else { "off" }));
+    }
+}
+
+/// JS-callable: the PTT key for a player who never chose one.
+#[tauri::command]
+pub fn default_ptt_key() -> u32 {
+    default_ptt_vk()
+}
+
+/// JS-callable: the key's name as the current keyboard layout prints it
+/// ("º" rather than the US "\\" for the same VK on a Spanish keyboard), or
+/// None when the layout has no such key.
+#[tauri::command]
+pub fn key_name(vk: u32) -> Option<String> {
+    unsafe {
+        let sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        if sc == 0 {
+            return None;
+        }
+        let mut buf = [0u16; 64];
+        let n = GetKeyNameTextW((sc as i32) << 16, &mut buf);
+        if n <= 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..n as usize]))
+    }
 }
 
 /// JS-callable: rebind the toggle-self-mute key by Win32 virtual-key code.
