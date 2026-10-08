@@ -99,7 +99,7 @@ LoLProxChat collects **no analytics, no telemetry, no fingerprinting, no persist
 
 **[GNU AGPLv3](LICENSE).** Free and open source — use, study, modify, and self-host it, including commercially. The copyleft terms require that if you distribute the app, or run a modified version as a network service, you make the corresponding source available under the AGPLv3. © 2026 Daniel Thiberge.
 
-Champion icons used to train the recognition model come from [Community Dragon](https://www.communitydragon.org/) (a community-maintained mirror of Riot's game assets). They remain Riot Games' intellectual property, are used for training only, and are not distributed with this software.
+Champion icons used to train the recognition model come from [Community Dragon](https://www.communitydragon.org/) (a community-maintained mirror of Riot's game assets). They remain Riot Games' intellectual property and are not distributed with this software: they are used for training, and the app downloads the icons of the skins on your team from Community Dragon to tell your icon from your teammates'. The requests name no game or player, but which icons are fetched, and when, does show Community Dragon your team's champions and skins at that moment; see [`threat-model.md`](docs/threat-model.md).
 
 ---
 
@@ -107,7 +107,7 @@ Champion icons used to train the recognition model come from [Community Dragon](
 
 - [LOL_Minimap_Tracker](https://github.com/Quinntana/LOL_Minimap_Tracker) — minimap champion-tracking reference
 - [LeagueMinimapDetectionCNN](https://github.com/Maknee/LeagueMinimapDetectionCNN) — reference code for minimap detection
-- [Community Dragon](https://www.communitydragon.org/) — champion icon assets used to train the champion-recognition model
+- [Community Dragon](https://www.communitydragon.org/) — champion icon assets used to train the champion-recognition model and to match teammates' icons in game
 - [Tauri](https://tauri.app) — desktop app framework
 - Cloudflare Realtime TURN — managed TURN relay infrastructure
 - Every user who's filed an issue or attached a log — your reports made this app actually work.

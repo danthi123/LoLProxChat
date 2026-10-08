@@ -12,6 +12,7 @@ import { AudioService } from './audio';
 import { TrackingService, TrackingState } from './tracking';
 import { disownAfterSec } from './tracking-helpers';
 import { BlobScorer, ChampionClassifier } from './champion-classifier';
+import { SkinAwareScorer, TeammateSkin, TemplateSet, loadTeamTemplates } from './skin-matcher';
 import { VolumeClient } from './volume-client';
 import { getAllyProximity, getCameraListen } from './audio-prefs';
 import { getForceTurnRelay } from './privacy';
@@ -68,6 +69,9 @@ export interface OrchestratorDeps {
   createTracking(gameRect: ScreenRect, mapType: MapType): TrackingService;
   /** Resolves null when no scorer is available; tracking runs without one. */
   createClassifier(championName: string): Promise<BlobScorer | null>;
+  /** Teammates' minimap icons for this game (skin-matcher.ts). Optional: with
+   *  none, identification is the classifier's alone. */
+  loadSkinTemplates?(team: TeammateSkin[], signal: AbortSignal): Promise<TemplateSet[]>;
   createVolumeClient(): VolumeClient;
   timings: OrchestratorTimings;
 }
@@ -88,6 +92,7 @@ export function defaultDeps(): OrchestratorDeps {
       return classifier;
     },
     createVolumeClient: () => new VolumeClient(),
+    loadSkinTemplates: loadTeamTemplates,
     // The volume tick is 10 Hz because GainNode smoothing turns those steps
     // into a ramp; the other two are housekeeping.
     timings: { gameStatePollMs: 3000, volumeTickMs: 100, configPollMs: 5000 },
@@ -126,6 +131,8 @@ export class Orchestrator {
   // before League flipped isDead does not kill us again.
   private respawnedAtMs = 0;
   private configPollId: number | null = null;
+  /** Cancels this game's teammate icon downloads when it ends. */
+  private skinIconsAbort: AbortController | null = null;
   private gameStatePollId: number | null = null;
   private positionTickRunning = false;
   private sessionActive = false;
@@ -518,16 +525,47 @@ export class Orchestrator {
 
       // Set capture bounds in Tauri backend
       await this.tracking.initCaptureBounds();
+      // The game may have ended while that was awaited.
+      if (this.session !== session || !this.tracking) return;
 
       // Load champion classifier (async, non-blocking — tracking works without it)
+      // and, alongside it, the minimap icons of the skins this team has on,
+      // which sharpen its scores once both are in; see SkinAwareScorer.
+      // Players are told apart by their place in the roster: summoner names can
+      // be blank or repeated (streamer mode).
+      const all = session.allPlayers;
+      const mates = all.filter(p => p.team === session.localPlayer.team);
+      const selfId = 'p' + all.indexOf(session.localPlayer);
+      const scorer = new SkinAwareScorer(selfId, mates.map(p => 'p' + all.indexOf(p)));
+      const tracking = this.tracking;
       this.deps.createClassifier(session.localPlayer.championName).then((classifier) => {
-        if (classifier && this.tracking) {
-          this.tracking.setClassifier(classifier);
+        if (classifier && this.tracking === tracking) {
+          scorer.setInner(classifier);
+          tracking.setClassifier(scorer);
           console.log('[LoLProxChat] Champion classifier loaded');
         }
       }).catch(err => {
         console.warn('[LoLProxChat] Champion classifier failed to load (tracking continues without it):', err);
       });
+      // Every teammate's skin has to be known (and ours among them), or the
+      // icons are not fetched at all.
+      const team: TeammateSkin[] = mates.flatMap(p => (typeof p.skinId === 'number'
+        ? [{ id: 'p' + all.indexOf(p), championName: p.championName, rawChampionName: p.rawChampionName, skinId: p.skinId }]
+        : []));
+      if (this.deps.loadSkinTemplates && mates.length >= 2 && team.length === mates.length) {
+        const iconsAbort = new AbortController();
+        this.skinIconsAbort?.abort();
+        this.skinIconsAbort = iconsAbort;
+        this.deps.loadSkinTemplates(team, iconsAbort.signal).then((sets) => {
+          if (this.tracking !== tracking) return;
+          scorer.setTemplates(sets);
+        }).catch(err => {
+          if (iconsAbort.signal.aborted) return;
+          console.warn('[LoLProxChat] Teammate icons failed to load (the classifier carries on alone):', err);
+        });
+      } else if (mates.length >= 2) {
+        console.log('[Skins] Not matching icons: League did not say which skin every teammate has on');
+      }
 
       // Read minimap scale from League config and apply before starting tracking
       this.readMinimapScale((scale) => {
@@ -1214,6 +1252,8 @@ export class Orchestrator {
       this.configPollId = null;
     }
 
+    this.skinIconsAbort?.abort();
+    this.skinIconsAbort = null;
     this.tracking?.setDebugSink?.(null);
     this.tracking?.stop();
     this.tracking = null;

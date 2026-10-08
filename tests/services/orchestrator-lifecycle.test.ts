@@ -45,6 +45,8 @@ import { installWebAudioFakes } from '../e2e/fakes/webaudio';
 import { FakePeerConnection } from '../e2e/fakes/peer';
 import { ScriptedGameState, player } from '../e2e/fakes/game-state';
 import { ScriptedTracker } from '../e2e/fakes/tracker';
+import { SkinAwareScorer, TeammateSkin, TemplateSet } from '../../src/services/skin-matcher';
+import type { BlobScorer } from '../../src/services/champion-classifier';
 
 installDomShims();
 installWebAudioFakes();
@@ -71,8 +73,12 @@ async function settle(): Promise<void> {
   for (let i = 0; i < 12; i++) await jest.advanceTimersByTimeAsync(0);
 }
 
-function makeHarness(audioOverrides: Record<string, unknown> = {}): Harness {
-  const gameState = new ScriptedGameState(LOCAL, ROSTER, { gameMode: 'CLASSIC', mapNumber: 11 });
+function makeHarness(
+  audioOverrides: Record<string, unknown> = {},
+  roster: Player[] = ROSTER,
+  extraDeps: Partial<OrchestratorDeps> = {},
+): Harness {
+  const gameState = new ScriptedGameState(roster[0].summonerName, roster, { gameMode: 'CLASSIC', mapNumber: 11 });
   const tracker = new ScriptedTracker({ x: 0, y: 0, width: 1920, height: 1080 });
   const audio = {
     initMicrophone: jest.fn(async () => undefined),
@@ -116,6 +122,7 @@ function makeHarness(audioOverrides: Record<string, unknown> = {}): Harness {
       },
     }) as unknown as VolumeClient,
     timings: { gameStatePollMs: 3000, volumeTickMs: 100, configPollMs: 5000 },
+    ...extraDeps,
   };
   harness.orchestrator = new Orchestrator(deps);
   return harness;
@@ -642,5 +649,93 @@ describe('the audio level monitor', () => {
     await second.initMicrophone();
     expect(jest.getTimerCount()).toBe(withOneSession);
     second.cleanup();
+  });
+});
+
+describe('teammate skin icons', () => {
+  // Three of us on ORDER, one enemy; League says which skin each has on
+  // (as Live Client Data spells it: the fake serves the roster raw).
+  const skin = (p: Player, skinID: number | undefined): Player => ({ ...p, skinID }) as unknown as Player;
+  const TEAM: Player[] = [
+    skin(player('PlayerOne', 'LIFE', 'Kayn', 'ORDER'), 15),
+    skin(player('PlayerTwo', 'LIFE', 'Zed', 'CHAOS'), 1),
+    skin(player('PlayerThree', 'LIFE', 'Briar', 'ORDER'), 0),
+    skin(player('PlayerFour', 'LIFE', 'Gwen', 'ORDER'), 11),
+  ];
+  const model: BlobScorer = { isLoaded: () => true, scoreBlobsForLocalChampion: async (_f, b) => b.map(() => 0.1) };
+  /** One template per teammate asked for: enough for setTemplates to accept. */
+  const fakeSets = (team: TeammateSkin[]): TemplateSet[] => team.map(p => ({ id: p.id, vecs: [new Float32Array(4)] }));
+
+  async function start(
+    roster: Player[],
+    classifier: BlobScorer | null,
+  ): Promise<{ h: Harness; load: jest.Mock; signals: AbortSignal[] }> {
+    const signals: AbortSignal[] = [];
+    const load = jest.fn(async (team: TeammateSkin[], signal: AbortSignal) => { signals.push(signal); return fakeSets(team); });
+    const h = makeHarness({}, roster, { createClassifier: async () => classifier, loadSkinTemplates: load });
+    h.orchestrator.start();
+    await settle();
+    return { h, load, signals };
+  }
+
+  it('fetches every teammate\'s icons, us included, and no enemy\'s', async () => {
+    const { h, load } = await start(TEAM, model);
+    expect(load).toHaveBeenCalledTimes(1);
+    const team = load.mock.calls[0][0] as TeammateSkin[];
+    expect(team.map(p => [p.championName, p.skinId])).toEqual([['Kayn', 15], ['Briar', 0], ['Gwen', 11]]);
+    // Told apart by roster position, not by summoner name (blank or repeated
+    // in streamer mode) — so ids are distinct whatever the names are.
+    expect(new Set(team.map(p => p.id)).size).toBe(3);
+    const scorer = h.tracker.classifier as SkinAwareScorer;
+    expect(scorer).toBeInstanceOf(SkinAwareScorer);
+    expect(scorer.isMatching()).toBe(true);
+  });
+
+  it('ids stay distinct when summoner names are all the same', async () => {
+    const same = TEAM.map(p => ({ ...p, summonerName: 'PlayerOne#LIFE' }));
+    const { load } = await start(same, model);
+    expect(load).toHaveBeenCalledTimes(1);
+    const team = load.mock.calls[0][0] as TeammateSkin[];
+    expect(team).toHaveLength(3);
+    expect(new Set(team.map(p => p.id)).size).toBe(3);
+  });
+
+  it('fetches nothing when a teammate\'s skin is unknown', async () => {
+    const roster = TEAM.map((p, i) => (i === 3 ? skin(p, undefined) : p));
+    const { h, load } = await start(roster, model);
+    expect(load).not.toHaveBeenCalled();
+    // The classifier still goes in, matching nothing.
+    expect((h.tracker.classifier as SkinAwareScorer).isMatching()).toBe(false);
+  });
+
+  it('puts nothing in front of the tracker without the classifier', async () => {
+    const { h, load } = await start(TEAM, null);
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(h.tracker.classifierSet).toBe(false);
+  });
+
+  it('starts no download for a game that ended while it was starting', async () => {
+    const load = jest.fn(async (team: TeammateSkin[]) => fakeSets(team));
+    const h = makeHarness({}, TEAM, { createClassifier: async () => model, loadSkinTemplates: load });
+    let release: () => void = () => undefined;
+    h.tracker.initCaptureBounds = () => new Promise<void>((resolve) => { release = resolve; });
+    h.orchestrator.start();
+    await settle();
+    h.gameState.gameEnded();
+    await jest.advanceTimersByTimeAsync(3000);
+    await settle();
+    release();
+    await settle();
+    expect(load).not.toHaveBeenCalled();
+    expect(h.tracker.classifierSet).toBe(false);
+  });
+
+  it('cancels the download when the game ends', async () => {
+    const { h, signals } = await start(TEAM, model);
+    expect(signals[0].aborted).toBe(false);
+    h.gameState.gameEnded();
+    await jest.advanceTimersByTimeAsync(3000);
+    await settle();
+    expect(signals[0].aborted).toBe(true);
   });
 });
