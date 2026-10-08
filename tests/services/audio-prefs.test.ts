@@ -1,5 +1,5 @@
 import {
-  getAllyProximity, setAllyProximity, getCameraListen, setCameraListen,
+  getAllyProximity, setAllyProximity, getCameraListen, setCameraListen, getSharedReset, setSharedReset,
 } from '../../src/services/audio-prefs';
 
 // The node test environment has no localStorage; a plain map is all the
@@ -37,5 +37,26 @@ describe('audio prefs', () => {
     store.set('lolproxchat.cameraListen', '1');
     expect(getAllyProximity()).toBe(true);
     expect(getCameraListen()).toBe(true);
+  });
+
+  test('shared RESET is off until turned on, and anything but "on" reads as off', () => {
+    expect(getSharedReset()).toBe(false);
+    store.set('lolproxchat.sharedReset', 'true');
+    expect(getSharedReset()).toBe(false);
+    setSharedReset(true);
+    expect(store.get('lolproxchat.sharedReset')).toBe('1');
+    expect(getSharedReset()).toBe(true);
+    setSharedReset(false);
+    expect(getSharedReset()).toBe(false);
+  });
+
+  test('shared RESET reads as off when storage cannot be read', () => {
+    const real = (globalThis as any).localStorage;
+    (globalThis as any).localStorage = { getItem: () => { throw new Error('blocked'); } };
+    try {
+      expect(getSharedReset()).toBe(false);
+    } finally {
+      (globalThis as any).localStorage = real;
+    }
   });
 });

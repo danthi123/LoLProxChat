@@ -5,6 +5,11 @@ import type { LivenessTracker } from './heartbeat.js';
 import { validateJoin } from './validate.js';
 import { TokenBucket, LIMITS, type RejectReason } from './rate-limit.js';
 
+/** A shared RESET is relayed at most once per this long in a room... */
+export const SHARED_RESET_ROOM_MS = 15_000;
+/** ...and from any one client once per this long. */
+export const SHARED_RESET_SENDER_MS = 30_000;
+
 /**
  * Close code sent to a socket whose room+name has been taken over by a newer
  * connection. The client treats it as terminal instead of reconnecting — see
@@ -119,6 +124,7 @@ export function handleConnection(
               // falling through would have `join` find this socket's OWN entry as
               // the duplicate and evict the connection that just spoke.
               if (team) rooms.setTeam(ws, team);
+              rooms.setSharedReset(ws, msg.sharedReset === true);
               send(ws, { type: 'room_state', peers: rooms.getOthersInRoom(ws).map(c => c.name) });
               return;
             }
@@ -134,6 +140,7 @@ export function handleConnection(
           }
 
           const { peers, evicted } = rooms.join(room, name, ws, team);
+          rooms.setSharedReset(ws, msg.sharedReset === true);
 
           if (evicted && evicted.ws !== ws) {
             console.log('[ws] takeover: "' + name + '" in room ' + room + ' moved to a newer connection');
@@ -187,6 +194,41 @@ export function handleConnection(
           const others = rooms.getOthersInRoom(ws);
           for (const peer of others) {
             send(peer.ws, { type: 'position', from: info.name, blob: msg.blob });
+          }
+          break;
+        }
+
+        case 'shared_reset': {
+          // The user flipped the shared RESET setting mid-game.
+          if (!rooms.getClientInfo(ws)) {
+            sendError(ws, 'Not in a room');
+            return;
+          }
+          rooms.setSharedReset(ws, msg.on === true);
+          break;
+        }
+
+        case 'reset_all': {
+          // Shared RESET (opt-in): this client's user pressed RESET, and asks
+          // that everyone in the game who has also opted in re-find their own
+          // icon. Acted on only from an opted-in client, relayed only to
+          // opted-in clients — one who has not opted in is never sent a
+          // 'reset' at all — and at most once per SHARED_RESET_ROOM_MS per
+          // room and SHARED_RESET_SENDER_MS per sender, so nobody, an enemy
+          // included, can keep knocking a game's trackers about. The relayed
+          // message carries the sender's name and nothing else.
+          const info = rooms.getClientInfo(ws);
+          if (!info) {
+            sendError(ws, 'Not in a room');
+            return;
+          }
+          if (info.sharedReset !== true) return;
+          const now = Date.now();
+          if (info.lastResetAllMs !== undefined && now - info.lastResetAllMs < SHARED_RESET_SENDER_MS) return;
+          if (!rooms.tryStampRoomReset(info.roomId, now, SHARED_RESET_ROOM_MS)) return;
+          info.lastResetAllMs = now;
+          for (const peer of rooms.getOthersInRoom(ws)) {
+            if (peer.sharedReset === true) send(peer.ws, { type: 'reset', from: info.name });
           }
           break;
         }

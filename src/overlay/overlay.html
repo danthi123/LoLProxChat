@@ -18,6 +18,7 @@
         <button id="btn-collapse" class="icon-btn" title="Collapse">&raquo;</button>
       </div>
     </div>
+    <div id="reset-notice" class="reset-notice hidden"></div>
     <div id="player-list" class="player-list">
       <div class="empty-state" data-i18n="players.waiting">Waiting for nearby players...</div>
     </div>
@@ -75,6 +76,10 @@
       <div class="setting-row">
         <label data-i18n="settings.wrongPosition" data-i18n-title="settings.wrongPositionHint" title="If people near you can't hear you, the app may be tracking the wrong icon on your minimap (it can latch onto a ward you walked past). This drops the current position and finds your champion again; walk somewhere after pressing it so it can tell you apart. Until it finds you, only your team hears you.">Wrong position?</label>
         <button id="btn-reset-position" class="icon-btn">RESET</button>
+      </div>
+      <div class="setting-row">
+        <label data-i18n="settings.sharedReset" data-i18n-title="settings.sharedResetHint" title="When ON, pressing RESET also makes everyone else in the game who has this on find their champion on the minimap again, and their RESETs do the same for you. Off by default. Only works between players who have it on: leave it off and nobody's RESET reaches you. Either team can use it, at most once every 15 seconds per game.">Shared RESET</label>
+        <button id="btn-shared-reset" class="icon-btn">OFF</button>
       </div>
       <div class="setting-row">
         <label data-i18n="settings.debug">Debug</label>

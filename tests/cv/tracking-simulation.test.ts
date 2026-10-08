@@ -1259,7 +1259,7 @@ describe('the wrong-lock check at real walking speed', () => {
 describe('RESET pressed when the lock was right', () => {
   const NEAR_ALLY: Point = { x: 120, y: 120 };
 
-  async function resetWhile(motion: (i: number) => Point, scorer: 'zero' | 'oracle', allies: Point[]) {
+  async function resetWhile(motion: (i: number) => Point, scorer: 'zero' | 'oracle', allies: Point[], how: 'reset' | 'rescan' = 'reset') {
     const lockSpecs = walk(16);
     const from = lockSpecs[15].self!;
     const over: SceneSpec = { ...BACKDROP, allies };
@@ -1276,11 +1276,29 @@ describe('RESET pressed when the lock was right', () => {
     const records: Awaited<ReturnType<typeof driveTracker>> = [];
     for (let i = 0; i < scenes.length; i++) {
       target = specs[i].self ?? null;
-      if (i === 16) expect(h.svc.resetPosition()).toBe(true);
+      if (i === 16) expect(how === 'reset' ? h.svc.resetPosition() : h.svc.rescan()).toBe(true);
       records.push(...await driveTracker(h, [scenes[i]]));
     }
     return records;
   }
+
+  // Shared RESET: another player pressed RESET, so ours rescans — but nobody
+  // said our lock was wrong, so it must not be steered off the icon it had.
+  test('a shared RESET finds a standing champion straight away; a RESET of our own steers off it', async () => {
+    const still = () => ({ x: 0, y: 0 });
+    const soft = await resetWhile(still, 'zero', [...BACKDROP.allies!, NEAR_ALLY], 'rescan');
+    const relocked = soft.findIndex((r, i) => i > 16 && r.state === TrackingState.LOCKED);
+    expect(relocked).toBeGreaterThan(16);
+    expect((relocked - 16) * FRAME_MS).toBeLessThanOrEqual(1_500);
+    for (const r of soft.slice(relocked)) expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    expect(logs.some(l => l.includes('shared RESET from another player'))).toBe(true);
+    expect(logs.some(l => l.includes('avoiding ('))).toBe(false);
+
+    logs.length = 0;
+    const own = await resetWhile(still, 'zero', [...BACKDROP.allies!, NEAR_ALLY], 'reset');
+    const ownRelocked = own.findIndex((r, i) => i > 16 && r.state === TrackingState.LOCKED && distance(r.px!, r.truth!) <= 3);
+    expect(ownRelocked === -1 || (ownRelocked - 16) * FRAME_MS > 1_500).toBe(true);
+  });
 
   test('a champion walking at ordinary speed is found again, not an ally', async () => {
     const records = await resetWhile(i => ({ x: Math.round(i * 0.75), y: 0 }), 'zero', [...BACKDROP.allies!, NEAR_ALLY]);
