@@ -28,12 +28,16 @@ services:
       - "3100:3100"
     environment:
       - PORT=3100
-      # How many reverse proxies of yours sit in front. Unset = 1 (the Caddy /
-      # nginx setup in the docs); "2" for a CDN in front of that proxy, which
-      # ALSO requires configuring the proxy to trust the CDN; "off" to ignore
-      # forwarding headers entirely (no proxy, or a rootless container runtime
-      # that rewrites source addresses). docs/self-hosting.md has the details —
-      # a wrong value here rate-limits every user as if they were one client.
+      # Which addresses your own reverse proxies connect from. "private" for
+      # the Caddy / nginx setup in the docs (a proxy on this host or Docker
+      # network); add your CDN's published ranges if one sits in front of that
+      # proxy ("private,<ranges>"); "off" to ignore forwarding headers entirely
+      # (no proxy, or a rootless container runtime that rewrites source
+      # addresses). docs/self-hosting.md § "Client IP and rate limits" has the
+      # details — a wrong value rate-limits every user as if they were one client.
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
+      # Deprecated hop count, used only while TRUSTED_PROXIES is unset — kept
+      # so a deployment that set it keeps working until it switches over.
       - TRUST_PROXY=${TRUST_PROXY:-}
       # Cloudflare Realtime TURN (preferred)
       - TURN_KEY_ID=${TURN_KEY_ID:-}
