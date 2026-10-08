@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.5.17] — 2026-10-08
+
 ### Fixed
 - **Caps Lock stopped working while the app ran.** With push-to-talk on its default key, Caps Lock, the app cancelled every Caps Lock press so the light would not flicker — even in Always Open mode, where push-to-talk is not used at all. Now the push-to-talk key is only watched in Push to Talk mode, and the default for new players is the key left of 1 (º on Spanish keyboards, ` on US ones), which nobody types with. A key you chose yourself is kept.
 - **Push to Talk chosen before a game was ignored — the mic stayed open.** The input mode applied only to the game in progress, so picking Push to Talk in the lobby (or in the previous game) showed on the panel while the next game transmitted always-open. The choice is now remembered across games and restarts.
