@@ -418,7 +418,7 @@ export class Orchestrator {
   }
 
   private async startSession(session: GameSession): Promise<void> {
-    console.log('[LoLProxChat] Starting session: room=' + session.roomId);
+    console.log('[LoLProxChat] Starting session: room=' + session.roomId + ' team=' + session.localPlayer.team);
     // None of these toggles reach the log any other way (the panel writes them
     // straight to storage), and the 2026-10-07 test could only infer that
     // everyone had both opt-ins on from how the volumes behaved.
