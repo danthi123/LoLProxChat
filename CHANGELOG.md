@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.5.20] — 2026-10-08
+
 ### Fixed
 - **Your icon is now told apart from your teammates' by the skin each of you has on.** The game tells the app which skin every player is wearing, so at the start of a game it downloads those skins' minimap icons and compares each teammate icon on the minimap with them — a question of "which of these two to four pictures is this?" rather than "which of 173 champions?". On the minimap snapshots from the last test game (four players' recordings), it named about two thirds of the 321 own-team icons, never the wrong teammate, and none of the turrets the tracker had mistaken for icons. Most of the icons it left undecided were half covered by an enemy's; it also named Karma and Gwen, whom the recognition model could not place at all. It only switches on when League reports every teammate's skin, and only in front of the recognition model, never in place of it. Icons come from Community Dragon (a community mirror of the game's images). The requests carry no game or player details, but which icons are fetched at the start of a game does show Community Dragon your team's champions and skins (details in `docs/threat-model.md`). Each icon is kept on your PC after the first download.
 - **The icon recogniser was shown badly cut pictures.** It was given the box around everything the icon's ring touched — often half a neighbouring icon or a turret marker — stretched square. It now gets the icon itself, centred, which on real games made it pick the right teammate far more often.
