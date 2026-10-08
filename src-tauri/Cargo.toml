@@ -1,6 +1,6 @@
 [package]
 name = "lolproxchat"
-version = "0.5.17"
+version = "0.5.18"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
