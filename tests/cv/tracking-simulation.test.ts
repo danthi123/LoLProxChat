@@ -1372,6 +1372,23 @@ describe('walking alongside a teammate (v0.5.12 Shen + Vex log)', () => {
     }
   });
 
+  test('the same for a champion whose art is teal (Gwen beside her support)', async () => {
+    // Her hair fills the merged pair past the plain-ring fill cap; before
+    // v0.5.21's review it was not taken for a stack at all, held, and was
+    // rescanned at 5s like the v0.5.12 log.
+    const { specs } = lockThenJoin();
+    const pairStart = at(at(START, STEP, 16), PAIR_STEP, 8);
+    const pair = together(pairStart, 64);
+    const art = (s: SceneSpec): SceneSpec => ({ ...s, selfTealArt: true });
+    const records = await run([...specs, ...pair].map(art));
+    expect(logs.some(l => l.includes('merged with a teammate'))).toBe(true);
+    expect(logs.some(l => l.includes('Hold exceeded'))).toBe(false);
+    for (const r of records.slice(specs.length)) {
+      expect(r.state).toBe(TrackingState.LOCKED);
+      expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(8);
+    }
+  });
+
   test('when they split up, the lock goes with the player, not the teammate', async () => {
     const { specs } = lockThenJoin();
     const pairStart = at(at(START, STEP, 16), PAIR_STEP, 8);
@@ -2005,5 +2022,36 @@ describe('an icon the skin match calls a teammate\'s', () => {
     const lastOnMate = reportsMate.lastIndexOf(true);
     expect((lastOnMate + 1) * FRAME_MS).toBeLessThanOrEqual(1500);
     expect(logs.some(l => l.includes('is a teammate\'s (skin match)'))).toBe(true);
+  });
+
+  test('walking past where an enemy covers us does not end the cover hold', async () => {
+    // We walk under an enemy's icon (the hold that keeps us where we went out
+    // of sight), then a teammate the skin match knows settles beside it. The
+    // teammate is not the icon we follow — ours is under the enemy — so the
+    // lock must not be dropped (v0.5.21 review: it was, for team-only audio
+    // in the middle of a fight).
+    const E: Point = { x: 150, y: 140 };
+    const specs: SceneSpec[] = [];
+    for (let d = 60; d > 0; d--) specs.push({ ...BACKDROP, self: { x: E.x - d, y: E.y }, selfTrail: { x: -1, y: 0 }, enemiesOnTop: [E] });
+    const covered = specs.length;
+    const mateAt = (i: number): Point => ({ x: Math.max(E.x + 20, E.x + 40 - 2 * i), y: E.y });
+    for (let i = 0; i < 30; i++) specs.push({ ...BACKDROP, self: E, enemiesOnTop: [E], allies: [...BACKDROP.allies!, mateAt(i)] });
+    const scenes = renderScenes(specs);
+    let frame = 0;
+    const classifier = new SkinVerdictScorer(
+      () => (frame < covered ? toFramePoint(specs[frame].self!) : null),
+      () => (frame >= covered ? [toFramePoint(mateAt(frame - covered))] : []),
+    );
+    const h = newTracker(scenes.map(s => s.frame), { classifier });
+    const records = [];
+    for (let i = 0; i < scenes.length; i++) {
+      frame = i;
+      records.push(...await driveTracker(h, [scenes[i]]));
+    }
+    for (const r of records.slice(covered)) {
+      expect(r.state).toBe(TrackingState.LOCKED);
+      expect(distance(r.px!, E)).toBeLessThanOrEqual(4);
+    }
+    expect(logs.some(l => l.includes('is a teammate\'s (skin match)'))).toBe(false);
   });
 });

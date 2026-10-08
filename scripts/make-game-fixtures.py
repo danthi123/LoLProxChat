@@ -153,29 +153,60 @@ def match(img, cx, cy, diam, sets):
 # an icon whose art is teal (filledIconRing in tracking-helpers.ts) the centre
 # of its ring ---
 def filled_icon_ring(d, xs, ys):
+    # filledIconRing in src/services/tracking-helpers.ts: fit a circle to the
+    # outermost pixels, trimming what sticks out, then measure from its centre.
     import math
     H, W = d.shape
     x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
-    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    bx, by = (x0 + x1) / 2, (y0 + y1) / 2
     r = (x1 - x0 + 1 + y1 - y0 + 1) / 4
-    radii = []
-    for k in range(48):
-        t = 2 * math.pi * k / 48
-        last = -1
-        rr = 0.0
-        while rr <= r + 3:
-            x, y = round(cx + rr * math.cos(t)), round(cy + rr * math.sin(t))
-            if 0 <= x < W and 0 <= y < H and d[y, x]:
-                last = rr
-            rr += 0.5
-        radii.append(last)
-    med = sorted(radii)[24]
-    if sum(abs(v - med) <= 1.5 for v in radii) / 48 < 0.75:
+
+    def outermost(cx, cy):
+        pts = []
+        for k in range(48):
+            t = 2 * math.pi * k / 48
+            last = (cx, cy, -1)
+            rr = 0.0
+            while rr <= r + 4:
+                x, y = round(cx + rr * math.cos(t)), round(cy + rr * math.sin(t))
+                if 0 <= x < W and 0 <= y < H and d[y, x]:
+                    last = (x, y, rr)
+                rr += 0.5
+            pts.append(last)
+        return pts
+
+    pts = [p for p in outermost(bx, by) if p[2] >= 0]
+
+    def fit(ps):
+        if len(ps) < 3:
+            return None
+        A = np.array([[x, y, 1.0] for x, y, _ in ps])
+        z = np.array([-(x * x + y * y) for x, y, _ in ps])
+        D, E, _ = np.linalg.lstsq(A, z, rcond=None)[0]
+        return -D / 2, -E / 2
+
+    c = fit(pts)
+    for _ in range(3):
+        if c is None:
+            return None
+        dist = [math.hypot(x - c[0], y - c[1]) for x, y, _ in pts]
+        mean = sum(dist) / len(dist)
+        order = sorted(range(len(pts)), key=lambda k: abs(dist[k] - mean))
+        c = fit([pts[k] for k in order[:math.ceil(len(pts) * 0.7)]])
+    if c is None:
         return None
+    cx, cy = c
+    if math.hypot(cx - bx, cy - by) > 4:
+        return None
+    radii = [p[2] for p in outermost(cx, cy)]
+    med = sorted(radii)[24]
+    if med < 0 or sum(abs(v - med) <= 1.5 for v in radii) / 48 < 0.75:
+        return None
+    cr = med * 0.6
     n = hits = 0
-    for y in range(math.ceil(cy - r * 0.6), int(cy + r * 0.6) + 1):
-        for x in range(math.ceil(cx - r * 0.6), int(cx + r * 0.6) + 1):
-            if 0 <= x < W and 0 <= y < H and math.hypot(x - cx, y - cy) <= r * 0.6:
+    for y in range(math.ceil(cy - cr), int(cy + cr) + 1):
+        for x in range(math.ceil(cx - cr), int(cx + cr) + 1):
+            if 0 <= x < W and 0 <= y < H and math.hypot(x - cx, y - cy) <= cr:
                 n += 1
                 hits += bool(d[y, x])
     if n and hits / n > 0.6:

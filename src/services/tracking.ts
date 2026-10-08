@@ -1609,11 +1609,17 @@ export class TrackingService {
     // The icon we follow is a teammate's, the skin match says (excludeTeammates
     // took it out of iconBlobs). Let it go now rather than through a 5s hold,
     // which would keep reporting the teammate's position as ours.
-    {
+    //
+    // Only when it IS the icon we follow: standing where we last were, within
+    // a quarter icon. Not while our icon is covered, merged or held — then our
+    // last position is where ours went out of sight, and a teammate walking
+    // past it is just a teammate; dropping the lock there would cut a cover
+    // hold short in the middle of a fight.
+    if (!this.occluded && !this.stacked && this.holdStartMs === 0) {
       const at = { x: this.lastPixelPos.x - this.minimapRegion.x, y: this.lastPixelPos.y - this.minimapRegion.y };
-      const near = computeNearFieldPx(this.expectedIconDiam);
-      const mate = this.nearestBlob(this.teammateBlobs, at, near);
-      const ours = this.nearestBlob(tealBlobs, at, near);
+      const same = Math.max(3, this.expectedIconDiam * WRONG_LOCK_STILL_FRACTION);
+      const mate = this.nearestBlob(this.teammateBlobs, at, same);
+      const ours = this.nearestBlob(tealBlobs, at, same);
       if (mate && (!ours || Math.hypot(mate.cx - at.x, mate.cy - at.y) < Math.hypot(ours.cx - at.x, ours.cy - at.y))) {
         this.debugSink?.markEvent('teammate');
         console.warn('[Tracking] The icon we were following is a teammate\'s (skin match) — rescanning');

@@ -763,6 +763,34 @@ describe('filledIconRing — an icon whose own art is teal', () => {
     expect(filledIconRing(blob, mask, W, W)).toEqual({ cx: C, cy: C });
   });
 
+  test('Gwen with a minion against her ring is still an icon, centred on the ring (v0.5.21 review)', () => {
+    // The dot widens the box by a few pixels, which put the box centre — and
+    // every measure taken from it — off the ring.
+    const dot = (x: number, y: number) => Math.hypot(x - (C + R + 2), y - (C + 3)) <= 2.5;
+    const { mask, blob } = maskOf(W, (x, y) => ringAt(x, y) || hair(x, y) || dot(x, y));
+    expect(blob.maxX - blob.minX + 1).toBeGreaterThan(2 * R + 3);
+    const at = filledIconRing(blob, mask, W, W)!;
+    expect(at).not.toBeNull();
+    expect(Math.hypot(at.cx - C, at.cy - C)).toBeLessThanOrEqual(1);
+  });
+
+  test('...and with a minion wave against it, the wave is left out of the fit', async () => {
+    const wave = [[C + R + 2, C + 3], [C + R + 3, C - 3], [C + R + 1, C + 8], [C + R + 4, C + 1]];
+    const { mask, blob } = maskOf(W, (x, y) =>
+      ringAt(x, y) || hair(x, y) || wave.some(([dx, dy]) => Math.hypot(x - dx, y - dy) <= 2.5));
+    const at = filledIconRing(blob, mask, W, W)!;
+    expect(at).not.toBeNull();
+    expect(Math.hypot(at.cx - C, at.cy - C)).toBeLessThanOrEqual(1);
+  });
+
+  test('a shallow arc, whose circle is centred far off it: not an icon', () => {
+    const { mask, blob } = maskOf(W, (x, y) => {
+      const d = Math.hypot(x - C, y - (C + 40));
+      return d <= 52 && d > 46 && Math.abs(x - C) <= 13;
+    });
+    expect(filledIconRing(blob, mask, W, W)).toBeNull();
+  });
+
   test('a solid disc is round and ringed too, but teal right through: not an icon', () => {
     const { mask, blob } = maskOf(W, (x, y) => Math.hypot(x - C, y - C) <= R);
     expect(discShare(mask, W, W, C, C, R * 0.6, 1)).toBe(1);

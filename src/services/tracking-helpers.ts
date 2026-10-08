@@ -374,9 +374,20 @@ export function isPossibleOccluder(b: Blob, expectedIconDiam: number): boolean {
  * every time their icons overlapped, and the rescan then locked onto the
  * teammate's icon, the only clean one left.
  */
+/**
+ * Fill cap for a merged blob. Higher than a single icon's 0.40 because a
+ * champion whose art is teal (Gwen, see filledIconRing) fills the pair she is
+ * part of: on the 2026-10-08 recordings every stack-sized teal blob over 0.40
+ * but one was Gwen merged with a teammate, a structure marker or an enemy,
+ * the fullest at 0.56 (the other was a recall swirl, 0.42). A stack is only
+ * ever looked for where we last were (findStack), so a non-icon let through
+ * here costs little.
+ */
+export const STACK_MAX_FILL = 0.60;
+
 export function isPossibleStack(b: Blob, expectedIconDiam: number): boolean {
   if (b.color !== 'teal' || b.pixels < 15) return false;
-  if (b.fillRatio > 0.40 || b.fillRatio < 0.08) return false;
+  if (b.fillRatio > STACK_MAX_FILL || b.fillRatio < 0.08) return false;
   const bw = b.maxX - b.minX + 1;
   const bh = b.maxY - b.minY + 1;
   const single = expectedIconDiam * 1.6;
@@ -1013,9 +1024,11 @@ export function iconCropBox(x: number, y: number, iconDiam: number): BlobCropBox
 // ---------- Icons whose art is teal ----------
 
 /** A filled blob passes as an own-team icon when its teal ends at one radius
- *  at least this share of the way round — a ring round it. On the eleven
- *  2026-10-08 recordings every blob at 0.75 or above was an icon; a turret
- *  ringed by its minions, clear in the middle like an icon, reached 0.69... */
+ *  at least this share of the way round — a ring round it — measured from
+ *  the centre of the circle fitted to it (filledIconRing). On the eleven
+ *  2026-10-08 recordings that takes 279 of the 446 icon-sized filled teal
+ *  blobs, every one an own-team icon (nearly all Gwen); a turret ringed by
+ *  its minions, clear in the middle like an icon, reached 0.69... */
 export const FILLED_RING_MIN_ROUNDNESS = 0.75;
 /** ...and it is not teal right through: within FILLED_RING_CENTRE of the
  *  ring's radius, no more than this share teal (dilated mask). A face is not
@@ -1025,28 +1038,75 @@ export const FILLED_RING_MAX_CENTRE_TEAL = 0.6;
 const FILLED_RING_CENTRE = 0.6;
 const RING_SAMPLES = 48;
 
-/**
- * How round the outline of the `value` pixels around (cx, cy) is: along rays
- * at RING_SAMPLES angles, the share whose outermost such pixel (out to maxR)
- * lies within 1.5 px of the median ray's.
- */
-export function outlineRoundness(
+/** Along each of RING_SAMPLES rays from (cx, cy), the outermost `value` pixel
+ *  out to maxR, and its distance (-1 where the ray meets none). */
+function outermostAlongRays(
   mask: Uint8Array, w: number, h: number, cx: number, cy: number, maxR: number, value: number,
-): number {
-  const radii: number[] = [];
+): Array<{ x: number; y: number; r: number }> {
+  const out: Array<{ x: number; y: number; r: number }> = [];
   for (let k = 0; k < RING_SAMPLES; k++) {
     const t = (2 * Math.PI * k) / RING_SAMPLES;
-    let last = -1;
+    let last = { x: cx, y: cy, r: -1 };
     for (let r = 0; r <= maxR; r += 0.5) {
       const x = Math.round(cx + r * Math.cos(t));
       const y = Math.round(cy + r * Math.sin(t));
-      if (x >= 0 && y >= 0 && x < w && y < h && mask[y * w + x] === value) last = r;
+      if (x >= 0 && y >= 0 && x < w && y < h && mask[y * w + x] === value) last = { x, y, r };
     }
-    radii.push(last);
+    out.push(last);
   }
-  const median = [...radii].sort((a, b) => a - b)[RING_SAMPLES >> 1];
-  return radii.filter(r => Math.abs(r - median) <= 1.5).length / RING_SAMPLES;
+  return out;
 }
+
+const medianOf = (v: number[]): number => [...v].sort((a, b) => a - b)[v.length >> 1];
+
+/**
+ * How round the outline of the `value` pixels around (cx, cy) is: along rays
+ * at RING_SAMPLES angles, the share whose outermost such pixel (out to maxR)
+ * lies within 1.5 px of the median ray's. `radius` is that median.
+ */
+export function outlineFit(
+  mask: Uint8Array, w: number, h: number, cx: number, cy: number, maxR: number, value: number,
+): { roundness: number; radius: number } {
+  const radii = outermostAlongRays(mask, w, h, cx, cy, maxR, value).map(p => p.r);
+  const median = medianOf(radii);
+  return { roundness: radii.filter(r => Math.abs(r - median) <= 1.5).length / RING_SAMPLES, radius: median };
+}
+
+export function outlineRoundness(
+  mask: Uint8Array, w: number, h: number, cx: number, cy: number, maxR: number, value: number,
+): number {
+  return outlineFit(mask, w, h, cx, cy, maxR, value).roundness;
+}
+
+/** Least-squares circle through the points (Kåsa's fit): its centre, or null
+ *  when they do not pin one down. */
+export function fitCircleCentre(pts: Array<{ x: number; y: number }>): { cx: number; cy: number } | null {
+  if (pts.length < 3) return null;
+  // Minimise the sum of (x² + y² + Dx + Ey + F)²: the normal equations, by Cramer's rule.
+  let sxx = 0, sxy = 0, syy = 0, sx = 0, sy = 0, sz = 0, sxz = 0, syz = 0;
+  for (const { x, y } of pts) {
+    const z = x * x + y * y;
+    sxx += x * x; sxy += x * y; syy += y * y; sx += x; sy += y; sz += z; sxz += x * z; syz += y * z;
+  }
+  const n = pts.length;
+  const det3 = (m: number[]) =>
+    m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+  const A = [sxx, sxy, sx, sxy, syy, sy, sx, sy, n];
+  const det = det3(A);
+  if (Math.abs(det) < 1e-9) return null;
+  const rhs = [-sxz, -syz, -sz];
+  const D = det3([rhs[0], A[1], A[2], rhs[1], A[4], A[5], rhs[2], A[7], A[8]]) / det;
+  const E = det3([A[0], rhs[0], A[2], A[3], rhs[1], A[5], A[6], rhs[2], A[8]]) / det;
+  return { cx: -D / 2, cy: -E / 2 };
+}
+
+/** How far filledIconRing lets the fitted ring centre sit from its box's. */
+const FILLED_RING_MAX_SHIFT = 4;
+/** Fitting the ring: this many rounds, each keeping this share of the
+ *  outline points — those closest to the last round's circle. A minion wave
+ *  against the ring covers a fifth of the way round at most. */
+const FILLED_RING_FIT_ROUNDS = 3;
+const FILLED_RING_FIT_KEEP = 0.7;
 
 /** Share of the pixels within `r` of (cx, cy) that equal `value`. */
 export function discShare(
@@ -1085,15 +1145,36 @@ export function filledIconRing(b: Blob, mask: Uint8Array, w: number, h: number):
   const cy = (b.minY + b.maxY) / 2;
   const radius = (bw + bh) / 4;
   const value = b.color === 'teal' ? 1 : 2;
-  if (outlineRoundness(mask, w, h, cx, cy, radius + 3, value) < FILLED_RING_MIN_ROUNDNESS) return null;
-  if (discShare(mask, w, h, cx, cy, radius * FILLED_RING_CENTRE, value) > FILLED_RING_MAX_CENTRE_TEAL) return null;
-  return { cx: Math.round(cx), cy: Math.round(cy) };
+  // Anything touching the ring (a minion's dot) widens the box and moves its
+  // centre off the ring's: measured from the box centre, Gwen with minions
+  // against her ring read 0.67-0.73, and dropped out. So the ring is fitted — a circle through the outermost
+  // pixels, those that stick out of it trimmed away — and measured from its
+  // centre. A fit, not a search for the roundest point nearby: from
+  // slightly off-centre even an oval can look round.
+  const pts = outermostAlongRays(mask, w, h, cx, cy, radius + FILLED_RING_MAX_SHIFT, value).filter(p => p.r >= 0);
+  let fitted = fitCircleCentre(pts);
+  // Each round keeps the points that sit closest to the last circle and fits
+  // again, so what sticks out of the ring drops out as the fit settles on it.
+  for (let round = 0; round < FILLED_RING_FIT_ROUNDS && fitted; round++) {
+    const c = fitted;
+    const dist = pts.map(p => Math.hypot(p.x - c.cx, p.y - c.cy));
+    const kept = pts.map((p, k) => ({ p, d: dist[k] }));
+    const meanR = dist.reduce((a, d) => a + d, 0) / dist.length;
+    kept.sort((a, b) => Math.abs(a.d - meanR) - Math.abs(b.d - meanR));
+    fitted = fitCircleCentre(kept.slice(0, Math.ceil(pts.length * FILLED_RING_FIT_KEEP)).map(o => o.p));
+  }
+  if (!fitted || Math.hypot(fitted.cx - cx, fitted.cy - cy) > FILLED_RING_MAX_SHIFT) return null;
+  const best = { ...fitted, ...outlineFit(mask, w, h, fitted.cx, fitted.cy, radius + FILLED_RING_MAX_SHIFT, value) };
+  if (best.radius < 0 || best.roundness < FILLED_RING_MIN_ROUNDNESS) return null;
+  if (discShare(mask, w, h, best.cx, best.cy, best.radius * FILLED_RING_CENTRE, value) > FILLED_RING_MAX_CENTRE_TEAL) return null;
+  return { cx: Math.round(best.cx), cy: Math.round(best.cy) };
 }
 
 // ---------- Icons the skin match says are a teammate's ----------
 
-/** A teammate verdict must come this many classifier runs in a row to take
- *  us off an icon we are locked on (one bad crop must not)... */
+/** A teammate verdict must come on this many classifier runs, with no "you"
+ *  between (an unsure run neither counts nor resets), to take us off an icon
+ *  we are locked on (one bad crop must not)... */
 export const TEAMMATE_VERDICT_RUNS = 2;
 /** ...and the latest within this, for the icon to be set aside. */
 export const TEAMMATE_VERDICT_TTL_MS = 2000;
@@ -1109,7 +1190,7 @@ interface TeammateMark { x: number; y: number; runs: number; lastMs: number }
  * "cls=0.00 white=1.00").
  *
  * Picking an icon to lock on, one verdict is enough to pass it over; leaving
- * one we are locked on takes two in a row, so one bad crop cannot. Any
+ * one we are locked on takes two, so one bad crop cannot. Any
  * verdict of "you" for the icon clears it at once.
  */
 export class TeammateVerdicts {
