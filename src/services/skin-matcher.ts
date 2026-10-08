@@ -36,9 +36,16 @@ const ICON_BACKDROP = 30;
  *  art than the full circle image, by an amount that varies with HUD scale. */
 const TEMPLATE_ZOOMS = [0.8, 0.9, 1.0];
 /** Crop sizes (fraction of the expected icon diameter) and centre offsets
- *  (px) searched around each blob: blob centres are off by a pixel or two. */
+ *  (px) searched around each blob: blob centres are off by a pixel or two.
+ *  The search is coarse first (every other pixel), then a pixel either way
+ *  around the best spot of each teammate still in contention. */
 const CROP_SCALES = [0.95, 1.05, 1.15];
-const CROP_SHIFTS = [-2, -1, 0, 1, 2];
+const COARSE_SHIFTS = [-2, 0, 2];
+/** Teammates within this of the best coarse score are refined: everyone the
+ *  margin test could turn on. */
+const REFINE_WITHIN = MATCH_MIN_MARGIN + 0.1;
+/** Below this coarse score no refinement can make a match: stop there. */
+const REFINE_MIN = MATCH_MIN_SCORE - 0.1;
 
 let innerCache: Int32Array | null = null;
 /** Indices of the pixels inside the compared circle, for a MATCH_SIZE square. */
@@ -109,8 +116,9 @@ export function sampleSquare(
   const step = side / S;
   const x0 = cx - side / 2;
   const y0 = cy - side / 2;
-  const px = (x: number, y: number, c: number): number =>
-    x < 0 || y < 0 || x >= width || y >= height ? fill : data[(y * width + x) * 4 + c];
+  // Index of each corner's pixel, or -1 outside the buffer (reads as fill).
+  const at = (x: number, y: number): number =>
+    x < 0 || y < 0 || x >= width || y >= height ? -1 : (y * width + x) * 4;
   for (let j = 0; j < S; j++) {
     const sy = y0 + (j + 0.5) * step - 0.5;
     const yA = Math.floor(sy);
@@ -119,10 +127,12 @@ export function sampleSquare(
       const sx = x0 + (i + 0.5) * step - 0.5;
       const xA = Math.floor(sx);
       const fx = sx - xA;
+      const p00 = at(xA, yA), p10 = at(xA + 1, yA), p01 = at(xA, yA + 1), p11 = at(xA + 1, yA + 1);
+      const w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
+      const o = (j * S + i) * 3;
       for (let c = 0; c < 3; c++) {
-        const top = px(xA, yA, c) * (1 - fx) + px(xA + 1, yA, c) * fx;
-        const bottom = px(xA, yA + 1, c) * (1 - fx) + px(xA + 1, yA + 1, c) * fx;
-        out[(j * S + i) * 3 + c] = top * (1 - fy) + bottom * fy;
+        out[o + c] = (p00 < 0 ? fill : data[p00 + c]) * w00 + (p10 < 0 ? fill : data[p10 + c]) * w10 +
+          (p01 < 0 ? fill : data[p01 + c]) * w01 + (p11 < 0 ? fill : data[p11 + c]) * w11;
       }
     }
   }
@@ -170,7 +180,8 @@ export function iconTemplates(rgba: ArrayLike<number>, width: number, height: nu
 
 /** One teammate's templates: every form of the skin they have on. */
 export interface TemplateSet {
-  /** Identifies the player (their summoner name). */
+  /** Identifies the player: unique within the game (summoner names may be
+   *  blank or repeated in streamer mode, so the orchestrator does not use them). */
   id: string;
   vecs: Float32Array[];
 }
@@ -180,7 +191,8 @@ export interface MatchScore { id: string; score: number }
 /**
  * Correlate the icon centred near (cx, cy) in `frame` with every teammate's
  * templates, searching a few crop sizes and centre offsets. Best score per
- * teammate, highest first.
+ * teammate, highest first. Teammates too far behind to matter, and every
+ * teammate when nobody comes close to a match, keep their coarse score.
  */
 export function matchIcon(
   frame: CaptureFrame,
@@ -189,20 +201,38 @@ export function matchIcon(
   iconDiam: number,
   sets: TemplateSet[],
 ): MatchScore[] {
-  const best = new Map<string, number>();
-  for (const k of CROP_SCALES) {
-    for (const dy of CROP_SHIFTS) {
-      for (const dx of CROP_SHIFTS) {
-        const v = normalizedInner(sampleSquare(frame.data, frame.width, frame.height, cx + dx, cy + dy, iconDiam * k));
-        for (const set of sets) {
-          let s = -Infinity;
-          for (const t of set.vecs) s = Math.max(s, dot(v, t));
-          if (s > (best.get(set.id) ?? -Infinity)) best.set(set.id, s);
-        }
+  const best = sets.map(() => -Infinity);
+  const where = sets.map(() => ({ k: 0, dx: 0, dy: 0 }));
+  const tried = new Set<string>();
+  const tryAt = (k: number, dx: number, dy: number): void => {
+    const key = k + ',' + dx + ',' + dy;
+    if (tried.has(key)) return;
+    tried.add(key);
+    const v = normalizedInner(sampleSquare(frame.data, frame.width, frame.height, cx + dx, cy + dy, iconDiam * k));
+    sets.forEach((set, si) => {
+      for (const t of set.vecs) {
+        const s = dot(v, t);
+        if (s > best[si]) { best[si] = s; where[si] = { k, dx, dy }; }
       }
+    });
+  };
+  for (const k of CROP_SCALES) for (const dy of COARSE_SHIFTS) for (const dx of COARSE_SHIFTS) tryAt(k, dx, dy);
+  const top = Math.max(-Infinity, ...best);
+  if (top >= REFINE_MIN) {
+    const contenders = sets.map((_, si) => si).filter(si => best[si] >= top - REFINE_WITHIN);
+    for (const si of contenders) {
+      const { k, dx, dy } = where[si];
+      for (let ddy = -1; ddy <= 1; ddy++) for (let ddx = -1; ddx <= 1; ddx++) tryAt(k, dx + ddx, dy + ddy);
     }
   }
-  return [...best.entries()].map(([id, score]) => ({ id, score })).sort((a, b) => b.score - a.score);
+  return sets.map((set, si) => ({ id: set.id, score: best[si] })).sort((a, b) => b.score - a.score);
+}
+
+/** Whose icon is in `box` (as tracking.ts cuts it, iconCropBox), when the
+ *  match is clear; null when it is not. */
+export function whoseIcon(frame: CaptureFrame, box: BlobCropBox, sets: TemplateSet[]): string | null {
+  const side = Math.min(box.cropW, box.cropH);
+  return decideMatch(matchIcon(frame, box.cropX + box.cropW / 2, box.cropY + box.cropH / 2, side, sets));
 }
 
 /** Whose icon this is, when the match is clear; null when it is not. */
@@ -214,33 +244,65 @@ export function decideMatch(ranked: MatchScore[]): string | null {
 
 // ---------- Which icon files show a given skin ----------
 
+/** Champions whose base-skin icon still carries their pre-release codename
+ *  (Community Dragon's listing for Anivia has `cryophoenix_circle.png` and no
+ *  `anivia_circle.png`) — or, for Orianna, a misspelling. */
+const LEGACY_BASE_NAMES: Record<string, string> = {
+  anivia: 'cryophoenix',
+  blitzcrank: 'steamgolem',
+  chogath: 'greenterror',
+  orianna: 'oriana',
+  rammus: 'armordillo',
+  shaco: 'jester',
+  zilean: 'chronokeeper',
+};
+/** `<alias>_<name>_circle.png` files that are ability icons, not minimap
+ *  icons of a form the champion takes. */
+const NOT_FORMS = new Set(['certaindeath', 'whirlingdeath', 'trueshotbarrage']);
+
 /**
  * The minimap icon files for `skinId` among a champion's HUD directory
- * listing: `<alias>_circle.png` for the base skin (or `_circle_0`),
- * `<alias>_circle_<n>.png` for skin n, and the same for each alternate form
- * (`kayn_ass_circle_15.png`, `kayn_slay_circle_15.png`), whose icon replaces
- * the base one when the champion transforms. A chroma has no icon of its own
- * and wears its parent skin's — the highest-numbered icon below its id.
+ * listing (checked against every champion's listing in October 2026):
+ *
+ * - `<alias>_circle.png` (or `_circle_0`) is the base skin and
+ *   `<alias>_circle_<n>.png` skin n. Seven champions' base icon goes by an old
+ *   codename (LEGACY_BASE_NAMES), and Xin Zhao's redrawn icons are
+ *   `xinzhaorework_circle_<n>`, which count as his ordinary ones.
+ * - Each alternate form has its own set — `kayn_ass_circle_15.png`,
+ *   `quinnvalor_circle.png` — whose icon replaces the base one when the
+ *   champion transforms. Ability icons in the same folder are left out.
+ * - Some skins have several icons for one number — `kayle_circle_4_lvl11`,
+ *   `lux_circle_7_fire`, `kaisa_circle_71_form2` — all of which are kept.
+ *
+ * A chroma has no icon of its own and wears its parent skin's: the highest
+ * number at or below its id, chosen separately for each form.
  */
 export function iconFilesForSkin(listing: string, alias: string, skinId: number): string[] {
   const a = alias.toLowerCase().replace(/[^a-z0-9]/g, '');
-  const re = new RegExp('\\b(' + a + '(?:_[a-z0-9]+)?)_circle(?:_(\\d+))?\\.png\\b', 'gi');
-  const forms = new Map<string, Map<number, string>>();
-  for (const m of listing.matchAll(re)) {
+  const legacy = LEGACY_BASE_NAMES[a];
+  const forms = new Map<string, Map<number, Set<string>>>();
+  for (const m of listing.matchAll(/(?<![a-z0-9_])([a-z0-9_]+?)_circle(?:_(\d+))?((?:_[a-z0-9]+)*)\.png/gi)) {
     const prefix = m[1].toLowerCase();
+    let form: string;
+    if (prefix === legacy) form = '';
+    else if (prefix.startsWith(a)) {
+      form = prefix.slice(a.length).replace(/^_/, '');
+      if (form === 'rework') form = '';
+      if (NOT_FORMS.has(form)) continue;
+    } else continue;
     const n = m[2] === undefined ? 0 : Number(m[2]);
-    if (!forms.has(prefix)) forms.set(prefix, new Map());
-    const byNum = forms.get(prefix)!;
-    // An explicit _circle_0 and a bare _circle are both the base skin; keep the bare one.
-    if (!byNum.has(n) || m[2] === undefined) byNum.set(n, m[0].toLowerCase());
+    if (!forms.has(form)) forms.set(form, new Map());
+    const byNum = forms.get(form)!;
+    if (!byNum.has(n)) byNum.set(n, new Set());
+    byNum.get(n)!.add(m[0].toLowerCase());
   }
-  const files: string[] = [];
+  const files = new Set<string>();
   for (const byNum of forms.values()) {
     let pick = -1;
     for (const n of byNum.keys()) if (n <= skinId && n > pick) pick = n;
-    if (pick >= 0) files.push(byNum.get(pick)!);
+    if (pick >= 0) for (const f of byNum.get(pick)!) files.add(f);
   }
-  return files.sort();
+  return [...files].sort();
 }
 
 /**
@@ -261,20 +323,29 @@ const CACHE_NAME = 'lolproxchat-icons-v1';
 const LISTING_MAX_AGE_MS = 7 * 24 * 3600_000;
 const ICON_MAX_AGE_MS = 30 * 24 * 3600_000;
 const FETCHED_AT = 'x-lolproxchat-fetched';
+const FETCH_TIMEOUT_MS = 10_000;
 
 /**
  * GET through a persistent cache: each icon is downloaded once per install and
  * reused until it is a month old (a week for directory listings, which gain
  * entries with new skins). A stale copy is served when the network fails. The
- * request carries nothing but the file's path — no game, player or room.
+ * request names nothing of ours — no game, player or room — but which files
+ * are asked for, and when, does say which champions and skins a team has on;
+ * see docs/threat-model.md. Gives up after FETCH_TIMEOUT_MS, or when `signal`
+ * aborts.
  */
-async function cachedFetch(url: string, maxAgeMs: number): Promise<Response> {
+async function cachedFetch(url: string, maxAgeMs: number, signal?: AbortSignal): Promise<Response> {
   let cache: Cache | null = null;
   try { cache = await caches.open(CACHE_NAME); } catch { cache = null; }
   const hit = cache ? await cache.match(url).catch(() => undefined) : undefined;
   if (hit && Date.now() - Number(hit.headers.get(FETCHED_AT) ?? 0) < maxAgeMs) return hit;
   try {
-    const resp = await fetch(url, { credentials: 'omit', referrerPolicy: 'no-referrer' });
+    const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+    const resp = await fetch(url, {
+      credentials: 'omit',
+      referrerPolicy: 'no-referrer',
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     if (cache) {
       const body = await resp.clone().blob();
@@ -284,7 +355,7 @@ async function cachedFetch(url: string, maxAgeMs: number): Promise<Response> {
     }
     return resp;
   } catch (e) {
-    if (hit) return hit;
+    if (hit && !signal?.aborted) return hit;
     throw e;
   }
 }
@@ -301,37 +372,35 @@ async function decodeRgba(blob: Blob): Promise<{ data: Uint8ClampedArray; width:
 }
 
 export interface TeammateSkin {
-  /** Summoner name: the id matches are reported under. */
+  /** The id matches are reported under (TemplateSet.id). */
   id: string;
   championName: string;
   rawChampionName?: string;
   skinId: number;
 }
 
-/** Fetch, cache and prepare every teammate's icon templates. A teammate whose
- *  icons cannot be had is left out (and logged); the rest still work. */
-export async function loadTeamTemplates(team: TeammateSkin[]): Promise<TemplateSet[]> {
-  const sets: TemplateSet[] = [];
-  const notes: string[] = [];
-  for (const p of team) {
+/** Fetch, cache and prepare every teammate's icon templates, all at once. A
+ *  teammate whose icons cannot be had is left out (and logged); SkinAwareScorer
+ *  then declines to match at all. Aborting `signal` (the game ended) stops the
+ *  downloads and rejects. */
+export async function loadTeamTemplates(team: TeammateSkin[], signal?: AbortSignal): Promise<TemplateSet[]> {
+  const results = await Promise.all(team.map(async (p): Promise<{ set: TemplateSet | null; note: string }> => {
     const alias = championAlias(p.rawChampionName, p.championName);
     try {
-      const listing = await (await cachedFetch(`${CDRAGON}/${alias}/hud/`, LISTING_MAX_AGE_MS)).text();
+      const listing = await (await cachedFetch(`${CDRAGON}/${alias}/hud/`, LISTING_MAX_AGE_MS, signal)).text();
       const files = iconFilesForSkin(listing, alias, p.skinId);
       if (files.length === 0) throw new Error('no minimap icon in the listing');
-      const vecs: Float32Array[] = [];
-      for (const f of files) {
-        const img = await decodeRgba(await (await cachedFetch(`${CDRAGON}/${alias}/hud/${f}`, ICON_MAX_AGE_MS)).blob());
-        vecs.push(...iconTemplates(img.data, img.width, img.height));
-      }
-      sets.push({ id: p.id, vecs });
-      notes.push(p.championName + ' skin ' + p.skinId + ' (' + files.join(', ') + ')');
+      const images = await Promise.all(files.map(async f =>
+        decodeRgba(await (await cachedFetch(`${CDRAGON}/${alias}/hud/${f}`, ICON_MAX_AGE_MS, signal)).blob())));
+      const vecs = images.flatMap(img => iconTemplates(img.data, img.width, img.height));
+      return { set: { id: p.id, vecs }, note: p.championName + ' skin ' + p.skinId + ' (' + files.join(', ') + ')' };
     } catch (e) {
-      notes.push(p.championName + ' skin ' + p.skinId + ': unavailable (' + String(e) + ')');
+      return { set: null, note: p.championName + ' skin ' + p.skinId + ': unavailable (' + String(e) + ')' };
     }
-  }
-  console.log('[Skins] Teammate icons: ' + notes.join('; '));
-  return sets;
+  }));
+  signal?.throwIfAborted();
+  console.log('[Skins] Teammate icons: ' + results.map(r => r.note).join('; '));
+  return results.flatMap(r => (r.set ? [r.set] : []));
 }
 
 // ---------- The scorer ----------
@@ -342,28 +411,46 @@ export async function loadTeamTemplates(team: TeammateSkin[]): Promise<TemplateS
  * 0, and anything it is unsure of keeps the classifier's score. The tracker
  * normalizes, smooths and gates these exactly as it does the model's.
  *
- * Works before (and without) the model: until it loads, unsure icons score 0.
+ * Only ever stands in front of a loaded model (isLoaded is the model's), so an
+ * unsure icon is scored no differently from a game without skin matching.
+ * Matches anything only once it has icons for every player on the team: with
+ * one missing, that player's icon could pass for someone else's and clear the
+ * margin against the rest.
  */
 export class SkinAwareScorer implements BlobScorer {
   private sets: TemplateSet[] = [];
   private tally = { self: 0, other: 0, unsure: 0 };
   private lastTallyLogMs = 0;
 
-  constructor(private readonly selfId: string, private inner: BlobScorer | null = null) {}
+  /** `teamIds`: every player on the local player's team, `selfId` among them. */
+  constructor(
+    private readonly selfId: string,
+    private readonly teamIds: string[],
+    private inner: BlobScorer | null = null,
+  ) {}
 
   setInner(inner: BlobScorer): void { this.inner = inner; }
 
-  /** Templates for the local player and their teammates; the local player's
-   *  must be among them for a match to vouch for anyone. */
   setTemplates(sets: TemplateSet[]): void {
-    this.sets = sets.some(s => s.id === this.selfId) && sets.length >= 2 ? sets : [];
-    if (sets.length > 0 && this.sets.length === 0) {
-      console.warn('[Skins] Not matching icons: need the local player\'s and at least one teammate\'s');
+    const have = new Set(sets.filter(s => s.vecs.length > 0).map(s => s.id));
+    const missing = this.teamIds.filter(id => !have.has(id));
+    const complete = missing.length === 0 && this.teamIds.includes(this.selfId) && this.teamIds.length >= 2 &&
+      new Set(this.teamIds).size === this.teamIds.length;
+    this.sets = complete ? sets.filter(s => this.teamIds.includes(s.id)) : [];
+    if (!complete) {
+      console.warn('[Skins] Not matching icons: ' + (missing.length > 0
+        ? 'no icons for ' + missing.length + ' of ' + this.teamIds.length + ' players on the team'
+        : 'the team roster is unusable'));
     }
   }
 
   isLoaded(): boolean {
-    return this.sets.length > 0 || !!this.inner?.isLoaded();
+    return !!this.inner?.isLoaded();
+  }
+
+  /** Whether icons are being matched (for tests and the log). */
+  isMatching(): boolean {
+    return this.sets.length > 0;
   }
 
   lastCrops(): ImageData[] {
@@ -371,13 +458,11 @@ export class SkinAwareScorer implements BlobScorer {
   }
 
   async scoreBlobsForLocalChampion(frame: CaptureFrame, blobs: BlobCropBox[]): Promise<number[]> {
-    const model = this.inner?.isLoaded()
-      ? await this.inner.scoreBlobsForLocalChampion(frame, blobs)
-      : blobs.map(() => 0);
+    if (!this.inner?.isLoaded()) return blobs.map(() => 0);
+    const model = await this.inner.scoreBlobsForLocalChampion(frame, blobs);
     if (this.sets.length === 0) return model;
     const scores = blobs.map((b, i) => {
-      const side = Math.min(b.cropW, b.cropH);
-      const who = decideMatch(matchIcon(frame, b.cropX + b.cropW / 2, b.cropY + b.cropH / 2, side, this.sets));
+      const who = whoseIcon(frame, b, this.sets);
       if (who === this.selfId) { this.tally.self++; return Math.max(model[i], SKIN_SELF_RAW); }
       if (who !== null) { this.tally.other++; return 0; }
       this.tally.unsure++;

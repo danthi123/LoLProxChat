@@ -15,6 +15,7 @@ import { FrameSource, TauriFrameSource } from './frame-source';
 import {
   computeMaxJumpPx,
   computeReacquireThreshold,
+  iconCropBox,
   pickBestBlobInRange,
   pickClassifierReacquisition,
   reacquireThresholdAt,
@@ -497,13 +498,7 @@ export class TrackingService {
     // 2026-10-08 crops, cutting them this way instead made the model rank the
     // right teammate first for Briar, Ekko and Kayn every time, at 3-10x the
     // confidence of a crop just 20% looser.
-    const side = Math.max(4, this.expectedIconDiam);
-    const crops = tealBlobs.map(b => ({
-      cropX: Math.round(region.x + b.cx - side / 2),
-      cropY: Math.round(region.y + b.cy - side / 2),
-      cropW: side,
-      cropH: side,
-    }));
+    const crops = tealBlobs.map(b => iconCropBox(region.x + b.cx, region.y + b.cy, this.expectedIconDiam));
 
     try {
       const rawScores = await this.classifier.scoreBlobsForLocalChampion(frame, crops);

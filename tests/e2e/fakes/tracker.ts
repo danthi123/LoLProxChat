@@ -49,6 +49,7 @@ export class ScriptedTracker {
   deaths = 0;
   respawns = 0;
   classifierSet = false;
+  classifier: unknown = null;
   appliedMinimapScale: number | null = null;
 
   private onPositionUpdate: ((pos: Position) => void) | null = null;
@@ -60,7 +61,7 @@ export class ScriptedTracker {
 
   loadChampionTemplate(_championName: string): void { /* colour filter, nothing to load */ }
   async initCaptureBounds(): Promise<void> { /* no backend to tell */ }
-  setClassifier(_c: unknown): void { this.classifierSet = true; }
+  setClassifier(c: unknown): void { this.classifierSet = true; this.classifier = c; }
   setMinimapScaleFromConfig(scale: number): void { this.appliedMinimapScale = scale; }
   setMinimapRegion(_r: unknown): void { /* calibration is not exercised here */ }
 

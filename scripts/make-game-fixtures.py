@@ -5,12 +5,19 @@ zips (games/<lobby>_<date>_<time>.zip in a tester's log folder).
 
 For every own-team icon on every minimap snapshot in each zip, this cuts a
 patch around it and labels it with the teammate whose minimap icon it
-correlates with best — the same method src/services/skin-matcher.ts uses, in
-an independent implementation — keeping only clear matches (score >= 0.6,
-margin >= 0.2, as the app). It also writes contact sheets of the labelled
-patches: LOOK AT THEM before trusting a new batch. A label the sheet shows to
-be wrong goes in overrides.json ({"<patch file>": "<champion alias>" or null
-to drop it}) and the script is rerun.
+correlates with best — the method src/services/skin-matcher.ts uses, in an
+independent implementation (PIL resampling, its own crop search). The labels
+are deliberately looser than the app's thresholds (score >= 0.45, margin >=
+0.1 against the app's 0.6 and 0.2), so the set holds icons the app should
+leave undecided as well as ones it should name: the test checks that it never
+names the wrong teammate, not merely that two implementations agree.
+
+Because labels come from the same idea as the thing tested, they must be
+checked by eye: the script writes a contact sheet per teammate per game. LOOK
+AT THEM before trusting a new batch. A label the sheet shows to be wrong goes
+in overrides.json ({"<patch file>": "<champion alias>", "nobody" for a
+turret or minion cluster the detector took for an icon — which the matcher
+must then name no one for — or null to drop it}) and the script is rerun.
 
 The roster comes from each zip's log (the local champion and the ALLY peers).
 Which skin each player had on is in the log from v0.5.20 ("[Skins] Teammate
@@ -39,7 +46,7 @@ ROOT = os.path.join(os.path.dirname(__file__), '..')
 OUT = os.path.join(ROOT, 'tests', 'cv', 'fixtures-games')
 CD = 'https://raw.communitydragon.org/latest/game/assets/characters'
 S = 32
-MIN_SCORE, MIN_MARGIN = 0.6, 0.2
+LABEL_MIN_SCORE, LABEL_MIN_MARGIN = 0.45, 0.1
 
 
 def fetch(url):
@@ -55,24 +62,52 @@ def alias_of(name):
 
 def icon_files(alias):
     html = fetch(f'{CD}/{alias}/hud/').decode('utf8', 'replace')
-    return sorted(set(m.lower() for m in re.findall(alias + r'(?:_[a-z0-9]+)?_circle(?:_\d+)?\.png', html, re.I)))
+    return sorted(set(m.lower() for m in re.findall(r'(?<![a-z0-9_])[a-z0-9_]+?_circle(?:_\d+)?(?:_[a-z0-9]+)*\.png', html, re.I)))
 
 
-def files_for_skin(files, skin):
-    """Each form's icon for `skin`: its own, else the highest below it (a
-    chroma wears its parent's), as iconFilesForSkin in skin-matcher.ts."""
+LEGACY = {'anivia': 'cryophoenix', 'blitzcrank': 'steamgolem', 'chogath': 'greenterror', 'orianna': 'oriana',
+          'rammus': 'armordillo', 'shaco': 'jester', 'zilean': 'chronokeeper'}
+NOT_FORMS = {'certaindeath', 'whirlingdeath', 'trueshotbarrage'}
+
+
+def icon_forms(alias, files):
+    """{form: {skin number: [files]}}, by the rules of iconFilesForSkin in
+    skin-matcher.ts."""
     forms = {}
     for f in files:
-        m = re.match(r'(.+?)_circle(?:_(\d+))?\.png$', f)
+        m = re.match(r'([a-z0-9_]+?)_circle(?:_(\d+))?((?:_[a-z0-9]+)*)\.png$', f)
+        if not m:
+            continue
+        pre = m.group(1)
+        if pre == LEGACY.get(alias):
+            form = ''
+        elif pre.startswith(alias):
+            form = pre[len(alias):].lstrip('_')
+            form = '' if form == 'rework' else form
+            if form in NOT_FORMS:
+                continue
+        else:
+            continue
         n = int(m.group(2)) if m.group(2) else 0
-        if n not in forms.setdefault(m.group(1), {}) or not m.group(2):
-            forms[m.group(1)][n] = f
+        forms.setdefault(form, {}).setdefault(n, []).append(f)
+    return forms
+
+
+def files_for_skin(alias, files, skin):
+    """Each form's icons for `skin`: its own, else the highest below it (a
+    chroma wears its parent's)."""
     out = []
-    for by_num in forms.values():
+    for by_num in icon_forms(alias, files).values():
         below = [n for n in by_num if n <= skin]
         if below:
-            out.append(by_num[max(below)])
+            out += by_num[max(below)]
     return sorted(out)
+
+
+def all_skins(alias, files):
+    """Every minimap icon of the champion, when the log does not say which
+    skin was on: a harder test than the app faces."""
+    return sorted(f for by_num in icon_forms(alias, files).values() for fs in by_num.values() for f in fs)
 
 
 # --- the matcher, independently of the TypeScript one ---
@@ -113,7 +148,8 @@ def match(img, cx, cy, diam, sets):
     return sorted(best.items(), key=lambda kv: -kv[1])
 
 
-# --- own-team icons, as tracking.ts finds them (teal ring, dilated, sized) ---
+# --- own-team icons, as tracking.ts finds them (teal ring, dilated, sized),
+# centred where it centres them: the rounded mean of the blob's pixels ---
 def teal_icons(img, diam):
     a = np.asarray(img, dtype=np.int32)
     r, g, b = a[..., 0], a[..., 1], a[..., 2]
@@ -137,7 +173,7 @@ def teal_icons(img, diam):
             bw, bh = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
             fill = len(pts) / (bw * bh)
             if 0.6 * diam <= bw <= 1.6 * diam and 0.6 * diam <= bh <= 1.6 * diam and fill <= 0.4:
-                out.append(((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2))
+                out.append((round(sum(xs) / len(xs)), round(sum(ys) / len(ys))))
     return out
 
 
@@ -172,8 +208,7 @@ def main(zips):
         for n in names:
             alias = alias_of(n)
             files = icon_files(alias)
-            if n in skins:
-                files = files_for_skin(files, skins[n])
+            files = files_for_skin(alias, files, skins[n]) if n in skins else all_skins(alias, files)
             game['roster'].append({'champion': n, 'alias': alias, 'icons': files})
             sets[alias] = []
             for f in files:
@@ -191,16 +226,26 @@ def main(zips):
             diam = round(img.width * 0.087)
             for (cx, cy) in teal_icons(img, diam):
                 ranked = match(img, cx, cy, diam, sets)
-                label = ranked[0][0] if ranked[0][1] >= MIN_SCORE and ranked[0][1] - ranked[1][1] >= MIN_MARGIN else None
+                margin = ranked[0][1] - (ranked[1][1] if len(ranked) > 1 else 0)
+                label = ranked[0][0] if ranked[0][1] >= LABEL_MIN_SCORE and margin >= LABEL_MIN_MARGIN else None
                 side = diam * 2
                 patch_file = f'{stem}_{os.path.basename(name)[:-4]}_{int(cx)}x{int(cy)}.rgba'
                 if patch_file in overrides:
                     label = overrides[patch_file]
+                elif label is None:
+                    # Too unclear to label automatically: kept for a person
+                    # to label in overrides.json, and left out of the test
+                    # until then.
+                    label = '?'
                 if label is None:
                     continue
-                patch = img.crop((round(cx - side / 2), round(cy - side / 2), round(cx - side / 2) + side, round(cy - side / 2) + side))
+                x0, y0 = cx - side // 2, cy - side // 2
+                patch = img.crop((x0, y0, x0 + side, y0 + side))
                 open(os.path.join(OUT, 'patches', patch_file), 'wb').write(patch.convert('RGBA').tobytes())
-                game['patches'].append({'file': patch_file, 'side': side, 'diam': diam, 'label': label})
+                # The icon's centre within the patch, for the test to cut its
+                # crop exactly as tracking.ts would.
+                game['patches'].append({'file': patch_file, 'side': side, 'diam': diam,
+                                        'cx': cx - x0, 'cy': cy - y0, 'label': label})
         print(f"{zp}: {len(game['patches'])} labelled icons, roster {', '.join(names)}")
         index['games'].append(game)
     json.dump(index, open(os.path.join(OUT, 'index.json'), 'w'), indent=1)

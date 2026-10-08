@@ -1,24 +1,38 @@
 // Real minimap icons from real games, against the skin matcher.
 //
 // Built by scripts/make-game-fixtures.py from testers' Debug zips: each patch
-// is an own-team icon cut from a minimap snapshot and labelled with the
-// teammate it is (by an independent implementation of the same correlation,
-// with the labels checked by eye on the contact sheets the script writes).
-// Riot's art is not committed, so tests/cv/fixtures-games/ is gitignored and
-// this suite skips itself when it has not been built.
+// is an own-team icon cut from a minimap snapshot, centred where tracking.ts
+// centres it, and labelled with the teammate it is. The labels come from an
+// independent implementation of the same correlation run with looser
+// thresholds than the app's, then checked by eye on contact sheets and
+// corrected (overrides.json) — including "nobody" for the turret and minion
+// clusters the detector takes for icons. Icons that labelling could not call
+// (mostly ones half under an enemy's) were labelled by eye where a person can
+// tell whose they are: they are what the app's thresholds are there for.
+// Lowering the 0.6 score floor makes this suite fail; the 0.2 margin is not
+// exercised (no wrong teammate here scores within 0.2 of a right one above
+// 0.6) and stays for teammates whose icons look alike. Riot's art is not committed, so
+// tests/cv/fixtures-games/ is gitignored and this suite skips itself when it
+// has not been built.
 //
 // What it guards: the TypeScript matcher, run exactly as the app runs it, on
 // real minimap rendering — the thing the synthetic suites cannot show. A
-// change to cropping, resampling or the thresholds that makes it name the
-// wrong teammate, or stop naming the right one, fails here.
+// change to cropping, resampling, the search or the thresholds that makes it
+// name the wrong teammate (or anyone, for a turret), or stop naming the right
+// one, fails here. Its limits: four recordings of one 3v2 custom game, and
+// rosters that offer every skin of each champion (the logs predate the skin
+// line), which is harder than a real game but not the same.
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { TemplateSet, decideMatch, iconTemplates, matchIcon } from '../../src/services/skin-matcher';
+import { TemplateSet, iconTemplates, whoseIcon } from '../../src/services/skin-matcher';
+import { iconCropBox } from '../../src/services/tracking-helpers';
 
 const DIR = path.join(__dirname, 'fixtures-games');
 
-interface Patch { file: string; side: number; diam: number; label: string }
+/** `label` is a roster alias, "nobody" for something that is not a teammate's
+ *  icon, or "?" for one nobody has labelled yet (skipped). */
+interface Patch { file: string; side: number; diam: number; cx: number; cy: number; label: string }
 interface Game {
   zip: string;
   roster: Array<{ champion: string; alias: string; icons: string[] }>;
@@ -53,18 +67,24 @@ maybe('the skin matcher on real games\' icons', () => {
         }),
       }));
       let right = 0;
+      let icons = 0;
       const wrong: string[] = [];
-      for (const p of game.patches) {
+      for (const p of game.patches.filter(q => q.label !== '?')) {
         const raw = fs.readFileSync(path.join(DIR, 'patches', p.file));
         const frame = { width: p.side, height: p.side, data: new Uint8ClampedArray(raw) as Uint8ClampedArray<ArrayBuffer> };
-        const who = decideMatch(matchIcon(frame, p.side / 2, p.side / 2, p.diam, sets));
+        const who = whoseIcon(frame, iconCropBox(p.cx, p.cy, p.diam), sets);
+        if (p.label !== 'nobody') icons++;
+        if (who === null) continue;
         if (who === p.label) right++;
-        else if (who !== null) wrong.push(p.file + ' -> ' + who + ' (is ' + p.label + ')');
+        else wrong.push(p.file + ' -> ' + who + ' (is ' + p.label + ')');
       }
       // eslint-disable-next-line no-console
-      console.log(game.zip + ': ' + right + '/' + game.patches.length + ' named, ' + wrong.length + ' wrong');
+      console.log(game.zip + ': ' + right + '/' + icons + ' icons named, ' +
+        game.patches.filter(q => q.label === 'nobody').length + ' non-icons, ' + wrong.length + ' wrong');
       expect(wrong).toEqual([]);
-      expect(right / game.patches.length).toBeGreaterThanOrEqual(0.85);
+      // A third of these icons are half under an enemy's, so leaving some
+      // undecided is right; naming 63-76% per recording is where it stands.
+      expect(right / icons).toBeGreaterThanOrEqual(0.6);
     });
   }
 });

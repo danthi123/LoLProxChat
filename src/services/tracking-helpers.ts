@@ -5,6 +5,7 @@
 
 import type { Blob } from './blob-types';
 import type { Position } from '../core/types';
+import type { BlobCropBox } from './champion-classifier';
 
 /**
  * Maximum allowed per-frame jump distance, in minimap pixels. Allows normal
@@ -1000,4 +1001,11 @@ export function cameraSwitchTarget(readings: DwellReading[], followed: DwellRead
   if (!followed || !dwellCounts(followed) || followed.dwell > CAMERA_DWELL_LOW) return null;
   const high = readings.filter(r => r !== followed && dwellCounts(r) && r.dwell >= CAMERA_DWELL_HIGH);
   return high.length === 1 && !high[0].rejected ? high[0] : null;
+}
+
+/** The square, one icon across, that the classifier and the skin matcher are
+ *  given for an icon whose centre is at (x, y) in the frame. */
+export function iconCropBox(x: number, y: number, iconDiam: number): BlobCropBox {
+  const side = Math.max(4, iconDiam);
+  return { cropX: Math.round(x - side / 2), cropY: Math.round(y - side / 2), cropW: side, cropH: side };
 }
