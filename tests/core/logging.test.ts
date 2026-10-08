@@ -200,14 +200,25 @@ describe('log buffering', () => {
     const second = await import('../../src/core/logging');
     const invoke = core.invoke as unknown as jest.Mock;
 
-    // Importing the second copy silences the console again, so it has to
-    // re-enable before it can produce a line of its own.
-    second.setLoggingEnabled(true);
+    // Debug was switched on through the first copy; the second sees it, and
+    // loading it did not switch it back off. v0.5.17's background bundle read
+    // false here forever and never started a game's debug zip.
+    expect(second.isLoggingEnabled()).toBe(true);
     console.log('from-second');
     await second.flushLogBuffer();
 
     // The second copy's invoke ships BOTH lines: with a per-module buffer,
     // 'from-first' would still be stranded in the first copy's array.
     expect(allLines(invoke).map(body)).toEqual(['from-first', 'from-second']);
+  });
+
+  test('Debug switched off through one copy is off for the other', async () => {
+    const first = await loadLogging();
+    first.logging.setLoggingEnabled(true);
+    jest.resetModules();
+    await import('@tauri-apps/api/core');
+    const second = await import('../../src/core/logging');
+    first.logging.setLoggingEnabled(false);
+    expect(second.isLoggingEnabled()).toBe(false);
   });
 });

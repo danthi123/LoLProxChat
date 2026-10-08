@@ -86,9 +86,10 @@ const panel = document.getElementById('panel')!;
 const settingsPanel = document.getElementById('settings-panel')!;
 const dragHandle = document.getElementById('drag-handle')!;
 
-// Debug overlay state — always starts off; user toggles per session.
+// Debug overlay state — always starts off; user toggles per session. (The
+// logging module starts silenced; switching it off here as well would undo a
+// Debug state the other bundle's copy had already set.)
 let debugEnabled = false;
-setLoggingEnabled(false);
 
 // Every toggle shows ON/OFF in the panel language.
 const onOff = (on: boolean): string => t(on ? 'settings.on' : 'settings.off');

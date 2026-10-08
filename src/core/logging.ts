@@ -37,6 +37,14 @@ interface LogBufferState {
   /** A drain is queued on the chain; further triggers must not queue another. */
   scheduled: boolean;
   unloadHooked: boolean;
+  /**
+   * Whether Debug logging is on. Shared like the rest of this state: the
+   * background and overlay scripts are separate bundles, each with its own
+   * copy of this module, and the overlay is the one that switches Debug on.
+   * As a module variable the background's copy read false forever, so v0.5.17
+   * never started a game's debug zip.
+   */
+  enabled: boolean;
 }
 
 // webpack emits background.js and overlay.js as separate bundles and
@@ -48,6 +56,7 @@ interface LogBufferState {
 const STATE_KEY = Symbol.for('lolproxchat.logbuffer');
 const globalSlots = globalThis as unknown as Record<symbol, LogBufferState | undefined>;
 
+const firstCopy = globalSlots[STATE_KEY] === undefined;
 const state: LogBufferState = globalSlots[STATE_KEY] ?? {
   // Captured by whichever copy loads first, i.e. while console is still
   // pristine. A second copy capturing the already-patched functions would
@@ -65,6 +74,7 @@ const state: LogBufferState = globalSlots[STATE_KEY] ?? {
   inFlight: Promise.resolve(),
   scheduled: false,
   unloadHooked: false,
+  enabled: true,
 };
 globalSlots[STATE_KEY] = state;
 
@@ -131,11 +141,9 @@ function makeWrapper(orig: ConsoleWriter, level: string) {
 // Initial state mirrors what console actually does (un-patched).
 // We immediately silence at module-load below so anything imported
 // after this module sees a silent console.
-let enabled = true;
-
 export function setLoggingEnabled(value: boolean): void {
-  if (value === enabled) return;
-  enabled = value;
+  if (value === state.enabled) return;
+  state.enabled = value;
   if (value) {
     console.log = makeWrapper(state.originals.log, 'log');
     console.warn = makeWrapper(state.originals.warn, 'warn');
@@ -170,8 +178,10 @@ export function setLoggingEnabled(value: boolean): void {
 }
 
 export function isLoggingEnabled(): boolean {
-  return enabled;
+  return state.enabled;
 }
 
 // Silence at module load — anything that imports this gets a quiet console.
-setLoggingEnabled(false);
+// Only the first copy does: a second bundle loading later must not switch off
+// Debug logging the first one already turned on.
+if (firstCopy) setLoggingEnabled(false);

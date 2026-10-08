@@ -4,6 +4,9 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Fixed
+- **Debug never saved the per-game zip.** The panel and the part of the app that runs the game each kept their own copy of the Debug switch, and the game side always read it as off — so v0.5.17 made no zips at all. It is now one shared switch. Turning Debug on during a game also starts that game's zip now (Debug is off every time the app launches).
+
 ## [v0.5.17] — 2026-10-08
 
 ### Fixed
