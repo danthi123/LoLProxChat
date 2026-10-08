@@ -76,10 +76,11 @@ rather than one you ran from `npm run dev`.
 
 | # | Steps | Expected | Automated cover |
 |---|---|---|---|
-| 6.1 | Both players on the same team, far apart | Full volume regardless of distance | `tests/e2e/session.e2e.test.ts` (E2) |
+| 6.1 | Both players on the same team, far apart, with Ally proximity OFF | Full volume regardless of distance. With it ON (the default), they fade like enemies | `tests/e2e/session.e2e.test.ts` (E2) |
 | 6.2 | Opposing teams, walk into and out of each other's vision range | Fades in around vision range and out again | `tests/e2e/session.e2e.test.ts` (E3, E4) |
 | 6.3 | Die and respawn | Voice continues; tracking re-acquires at the fountain | `tests/cv/tracking-simulation.test.ts`, `tests/services/orchestrator-lifecycle.test.ts` |
 | 6.4 | BOTH players turn on "voice on camera"; one pans the camera onto the other, champions far apart | The one looking hears the other; the other does not hear them. With either player's setting off, neither hears the other | `tests/e2e/session.e2e.test.ts` (E5) |
+| 6.4b | Fresh install (or first launch after updating from v0.5.17): open Settings; turn Ally proximity off and restart | Both Ally proximity and Voice on camera show ON at first; after the restart Ally proximity is still OFF | `tests/services/audio-prefs.test.ts`, `tests/e2e/session.e2e.test.ts` (E2) |
 | 6.5 | End the game, then start a second one without restarting the app | The second session joins cleanly, and the log shows one meter loop, not two | `tests/services/orchestrator-lifecycle.test.ts` |
 | 6.6 | Restart the app mid-game while the other player stays in | The restarted client rejoins under the same name and voice comes back | `tests/e2e/session.e2e.test.ts` (E7), server takeover path |
 | 6.7 | One player closes their laptop lid / drops the network without quitting | The other stops hearing them within ~60s (one to two 30 s heartbeat sweeps) rather than holding them at full volume | `server/tests/heartbeat.test.ts` |

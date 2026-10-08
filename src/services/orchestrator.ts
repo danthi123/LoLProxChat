@@ -230,6 +230,7 @@ export class Orchestrator {
       }
 
       this.retryBlockedMicrophone();
+      this.ensureDebugBundle();
 
       // Refresh overlay even between sessions so lifecycle text stays current
       if (!this.session) {
@@ -244,6 +245,31 @@ export class Orchestrator {
 
   private debugBundle: DebugBundle | null = null;
   private bundleChain: Promise<void> = Promise.resolve();
+
+  private bundleStarting = false;
+  private bundleFailedFor: GameSession | null = null;
+
+  /**
+   * Start this game's debug zip if Debug is on and none is running. Called at
+   * session start and from the 3 s poll, so turning Debug on mid-game starts
+   * one too (Debug always starts off at launch, and testers turn it on late).
+   */
+  private ensureDebugBundle(): void {
+    const session = this.session;
+    if (!session || this.debugBundle || this.bundleStarting || !isLoggingEnabled()) return;
+    if (this.bundleFailedFor === session) return;  // one attempt per game, not one per poll
+    this.bundleStarting = true;
+    const roomId = session.roomId;
+    this.bundleChain = this.bundleChain.then(async () => {
+      const bundle = await DebugBundle.start(roomId);
+      this.bundleStarting = false;
+      if (!bundle) this.bundleFailedFor = session;
+      if (this.session === session) {
+        this.debugBundle = bundle;
+        if (bundle) this.tracking?.setDebugSink?.(bundle);
+      }
+    });
+  }
 
   private lastMicRetryAt = 0;
   private static readonly MIC_RETRY_MS = 10_000;
@@ -403,16 +429,7 @@ export class Orchestrator {
     // Debug on: this game's log lines and what the tracker saw go into one
     // zip named after the lobby (see debug-bundle.ts). Chained, so a quick
     // end-and-restart can never zip the new game with the old one's finish.
-    if (isLoggingEnabled()) {
-      const roomId = session.roomId;
-      this.bundleChain = this.bundleChain.then(async () => {
-        const bundle = await DebugBundle.start(roomId);
-        if (this.session?.roomId === roomId) {
-          this.debugBundle = bundle;
-          if (bundle) this.tracking?.setDebugSink?.(bundle);
-        }
-      });
-    }
+    this.ensureDebugBundle();
 
     // Initialize audio (mic + WebRTC)
     this.audio = this.deps.createAudio(this.signaling, this.localSummonerName);

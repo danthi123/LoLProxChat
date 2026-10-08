@@ -47,6 +47,11 @@ beforeEach(() => {
   resetTauriFake();
   resetEventFake();
   clearStoredPrefs();
+  // Ally proximity and voice on camera both default ON (v0.5.18). Every test
+  // here starts from plain proximity and turns on what it is about; the
+  // defaults themselves are checked in E2 and in tests/services/audio-prefs.test.ts.
+  setAllyProximity(false);
+  setCameraListen(false);
 });
 
 afterEach(async () => {
@@ -93,7 +98,21 @@ describe('E1 join, presence and peer connection', () => {
   });
 });
 
-describe('E2 allies are audible at any distance', () => {
+describe('E2 allies are audible at any distance with ally proximity off', () => {
+  it('asks the server for ally proximity on a fresh install', async () => {
+    clearStoredPrefs();
+    const { players, a, b } = roster('ORDER');
+    const [one, two] = track(makeClient(a, players), makeClient(b, players));
+    one.tracker.moveTo(1000, 1000);
+    two.tracker.moveTo(1200, 1000);
+    await startAll([one, two]);
+    await waitForMesh(one, two);
+
+    const exchange = await waitFor(() => volumesFor(a)[0], 'a volume exchange');
+    expect(exchange.request.allyProximity).toBe(true);
+    await waitFor(() => one.tracker.cameraTrackingEnabled, 'camera tracking to be on by default');
+  });
+
   it('holds a teammate at 1.0 across the whole map, and the server is what says so', async () => {
     const { players, a, b } = roster('ORDER');
     const [one, two] = track(makeClient(a, players), makeClient(b, players));
@@ -275,7 +294,6 @@ describe('E5 voice on camera is mutual opt-in and one-way (#36)', () => {
     await startAll([one, two]);
     await waitForMesh(one, two);
 
-    setCameraListen(false);
     one.tracker.lookAt(12000, 12100);
     await waitFor(() => volumesFor(a).length > 4, 'several volume exchanges to go by');
 

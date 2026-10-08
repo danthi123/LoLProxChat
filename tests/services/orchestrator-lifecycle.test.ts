@@ -182,6 +182,19 @@ describe('the Debug game bundle', () => {
     expect(order).toEqual(['bundle_start', 'bundle_finish']);
   });
 
+  it('starts when Debug is switched on mid-game (it always starts off at launch)', async () => {
+    const h = await startInGame();
+    expect(invokeMock.mock.calls.some((c) => c[0] === 'bundle_start')).toBe(false);
+    setLoggingEnabled(true);
+    await jest.advanceTimersByTimeAsync(3000);
+    await settle();
+    expect(invokeMock.mock.calls.filter((c) => c[0] === 'bundle_start')).toHaveLength(1);
+    await jest.advanceTimersByTimeAsync(9000);
+    await settle();
+    expect(invokeMock.mock.calls.filter((c) => c[0] === 'bundle_start')).toHaveLength(1);
+    void h;
+  });
+
   it('stays out of the way with Debug off', async () => {
     await startInGame();
     expect(invokeMock.mock.calls.some((c) => String(c[0]).startsWith('bundle_'))).toBe(false);

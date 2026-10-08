@@ -20,7 +20,7 @@ LoLProxChat is built to stay within the categories Riot Games explicitly publish
 - ❌ No automation, scripting, or bot behavior — the app never takes any in-game action on your behalf.
 - ❌ No decision-making aids — no enemy ult timers, no warned-by, no jungle timers, no skill suggestions.
 - ❌ No warded-by indicators, no enemy item builds, no spectator-mode data.
-- ⚠️ **Proximity audio does not respect fog of war.** Hearing is computed from distance alone, so an enemy in a brush or behind a wall is as audible as one standing in the open at the same range. While dead you stay audible, and can hear, at your body. The opt-in "Voice on camera" setting widens that further, though only between two players who have both turned it on. All three are covered below — this is the app's one real departure from "no exposure of obfuscated information", and it is stated here rather than buried.
+- ⚠️ **Proximity audio does not respect fog of war.** Hearing is computed from distance alone, so an enemy in a brush or behind a wall is as audible as one standing in the open at the same range. While dead you stay audible, and can hear, at your body. The "Voice on camera" setting widens that further, though only between two players who both have it on — and since v0.5.18 it is on by default. All three are covered below — this is the app's one real departure from "no exposure of obfuscated information", and it is stated here rather than buried.
 - ❌ No in-game advertising (banned by Riot in May 2025).
 - ❌ No paid tier or freemium gating — Riot's monetization rules require a free tier; LoLProxChat is fully open source and free.
 
@@ -52,7 +52,7 @@ That is a real widening, and it is stated here because the argument above does n
 
 What bounds it is the same as everything else here: the ~1350-unit hearing radius from a fixed point (the body cannot move), only players running this app, voice and never game audio, and nothing about *which* enemy or exactly where. The alternative — dead players silent to enemies — was considered and set aside because players testing the app expected enemies to keep hearing them while dead; it is a small, contained change around `onDeath` in `src/services/tracking.ts` and the orchestrator's dead-state path if that judgement changes.
 
-## Specifically: "Voice on camera" (opt-in on both sides, default OFF, one-way)
+## Specifically: "Voice on camera" (mutual, default ON since v0.5.18, one-way)
 
 Added in v0.5.8 for [#36](https://github.com/danthi123/LoLProxChat/issues/36), reworked in v0.5.9. When enabled, you hear the map from **the centre of your in-game camera** as well as from your champion. The camera position is read the same way as everything else — off the minimap, by finding the camera-viewport rectangle the game already draws there.
 
@@ -66,13 +66,13 @@ Three things bound it.
 
 **3. It only works between two players who have both turned it on, and that is enforced on the server.** Your client publishes your camera centre to the server only while the setting is on, and the server uses your camera against a player only when *they* have published one too. If you leave it off you publish nothing, nobody else's camera can reach you, and you are heard only by players actually near you on the map — whatever anyone else has chosen. Publishing the camera *is* the opt-in: the server reads your own camera from that published copy when it answers you, and ignores the pre-v0.5.9 `listenPosition` request field, which let a client name a listening point of its own and so skip the opt-in.
 
-**It is one-way.** Your camera is a point you listen *from*, never a point you are heard at: pan onto a fight and you hear it, but the people in it hear you only if they are near your champion or their own camera is on you. A v0.5.9 test build briefly made it two-way, on the argument that listening should cost the listener something. Players testing it found the result worse to play with — hearing someone because they happened to glance at you is unpredictable, while being heard only where your champion stands is not — and the two-way version did not add a protection the mutual opt-in lacks. Between two players who have both opted in, listening is free, and both of them chose that.
+**It is one-way.** Your camera is a point you listen *from*, never a point you are heard at: pan onto a fight and you hear it, but the people in it hear you only if they are near your champion or their own camera is on you. A v0.5.9 test build briefly made it two-way, on the argument that listening should cost the listener something. Players testing it found the result worse to play with — hearing someone because they happened to glance at you is unpredictable, while being heard only where your champion stands is not — and the two-way version did not add a protection the mutual opt-in lacks. Between two players who both have it on, listening is free, and either of them can turn it off.
 
 So a player in a competitive game can turn it off and know exactly what they have: plain proximity, no camera reach in either direction, unaffected by what their opponents do. That is the property that was missing.
 
-It ships because it is what people making content with the app asked for, and because the alternative — everyone hearing everything, which is what a plain Discord call already gives them — is no better. It is **off by default and stays off until you turn it on**, and the setting says plainly what it does.
+It ships because it is what people making content with the app asked for, and because the alternative — everyone hearing everything, which is what a plain Discord call already gives them — is no better. Up to v0.5.17 it was off by default. **Since v0.5.18 it is on by default** at the maintainer's decision; an install that had it off is switched on by that update. That makes the widening something a player has to turn off rather than turn on, and we say so here rather than leave the earlier wording standing. The setting's tooltip says plainly what it does, and the mutual rule above still means one player turning it off is enough to take them out of it entirely.
 
-If you play ranked, leave it off. If Riot objects to this feature specifically, it is a single self-contained toggle and it can be removed without touching the rest of the app.
+If you play ranked, turn it off. If Riot objects to this feature specifically, it is a single self-contained toggle and it can be removed without touching the rest of the app.
 
 ## Riot Developer Portal status
 

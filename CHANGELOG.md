@@ -4,6 +4,13 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Changed
+- **Ally proximity and Voice on camera are now on by default.** Out of the box, teammates fade with distance like enemies, and you also hear from wherever your camera is looking (between players who both have it on). Either can be turned off in Settings. Before, both were off by default, and turning one off was saved as "no choice made" — so if you had turned one off, this update turns it back on once; turn it off again and it now stays off.
+- **With Ally proximity on, a teammate the app has not found yet is heard by their team at full volume** — at the start of a game, after a recall it lost track of, or after RESET — instead of going silent to their own team until found. Needs the matching server build.
+
+### Fixed
+- **Debug never saved the per-game zip.** The panel and the part of the app that runs the game each kept their own copy of the Debug switch, and the game side always read it as off — so v0.5.17 made no zips at all. It is now one shared switch. Turning Debug on during a game also starts that game's zip now (Debug is off every time the app launches).
+
 ## [v0.5.17] — 2026-10-08
 
 ### Fixed

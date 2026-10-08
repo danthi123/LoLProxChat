@@ -71,13 +71,13 @@ const STRINGS = {
   },
   'settings.allyProximity': { en: 'Ally proximity', es: 'Proximidad aliada' },
   'settings.allyProximityHint': {
-    en: 'When ON, teammates fade with distance just like enemies. When OFF (default), teammates are always at full volume. Takes effect on the next position update.',
-    es: 'Si está activado, el volumen de tus compañeros baja con la distancia, igual que el de los enemigos. Si está desactivado (por defecto), siempre oyes a tus compañeros a todo volumen. Se aplica en la siguiente actualización de posición.',
+    en: 'When ON (default), teammates fade with distance just like enemies. When OFF, teammates are always at full volume. Takes effect on the next position update.',
+    es: 'Si está activado (por defecto), el volumen de tus compañeros baja con la distancia, igual que el de los enemigos. Si está desactivado, siempre oyes a tus compañeros a todo volumen. Se aplica en la siguiente actualización de posición.',
   },
   'settings.cameraListen': { en: 'Voice on camera', es: 'Oír desde la cámara' },
   'settings.cameraListenHint': {
-    en: "When ON, you also hear the map from wherever your camera is looking, not just from your champion. One-way: the people you listen in on only hear you if they are near your champion or looking at you themselves. Only works between players who BOTH have it on: leave it off and nobody's camera can reach you, only players actually near you on the map. Off by default, because it lets you hear enemies your champion could not see.",
-    es: 'Si está activado, también oyes el mapa desde donde esté mirando tu cámara, no solo desde tu campeón. Funciona en un solo sentido: los jugadores a los que escuchas así solo te oyen si están cerca de tu campeón o si ellos mismos te están mirando. Solo funciona si ambos jugadores lo tienen activado: si lo dejas desactivado, la cámara de nadie te alcanza y solo te oyen los jugadores que de verdad están cerca de ti en el mapa. Viene desactivado porque te permite oír a enemigos que tu campeón no podría ver.',
+    en: "When ON, you also hear the map from wherever your camera is looking, not just from your champion. One-way: the people you listen in on only hear you if they are near your champion or looking at you themselves. Only works between players who BOTH have it on: leave it off and nobody's camera can reach you, only players actually near you on the map. On by default. It lets you hear enemies your champion could not see, so turn it off for plain proximity.",
+    es: 'Si está activado, también oyes el mapa desde donde esté mirando tu cámara, no solo desde tu campeón. Funciona en un solo sentido: los jugadores a los que escuchas así solo te oyen si están cerca de tu campeón o si ellos mismos te están mirando. Solo funciona si ambos jugadores lo tienen activado: si lo dejas desactivado, la cámara de nadie te alcanza y solo te oyen los jugadores que de verdad están cerca de ti en el mapa. Viene activado por defecto. Te permite oír a enemigos que tu campeón no podría ver, así que desactívalo si quieres proximidad pura.',
   },
   'settings.wrongPosition': { en: 'Wrong position?', es: '¿Posición incorrecta?' },
   'settings.wrongPositionHint': {
