@@ -10,6 +10,7 @@ import {
   ScreenRect,
 } from '../core/map-calibration';
 import { BlobScorer } from './champion-classifier';
+import type { TrackingDebugSink } from './debug-bundle';
 import { FrameSource, TauriFrameSource } from './frame-source';
 import {
   computeMaxJumpPx,
@@ -103,6 +104,12 @@ export class TrackingService {
 
   // Champion classifier (ONNX model)
   private classifier: BlobScorer | null = null;
+  /** Debug only: saves minimap snapshots and classifier crops for the game's zip. */
+  private debugSink: TrackingDebugSink | null = null;
+
+  setDebugSink(sink: TrackingDebugSink | null): void {
+    this.debugSink = sink;
+  }
   // Cached classifier scores per blob (refreshed periodically, not every frame)
   private classifierScores: Map<string, number> = new Map();
   /** The latest run's un-normalized model output per blob — what a far
@@ -536,6 +543,17 @@ export class TrackingService {
 
       this.weighWrongLock(tealBlobs, normalizedScores, maxRaw >= MIN_RAW_THRESHOLD);
 
+      const images = this.debugSink ? this.classifier.lastCrops?.() : undefined;
+      if (this.debugSink && images && images.length === tealBlobs.length) {
+        this.debugSink.onClassifierRun(tealBlobs.map((b, i) => ({
+          image: images[i],
+          cx: b.cx,
+          cy: b.cy,
+          raw: rawScores[i] ?? 0,
+          smoothed: this.classifierScores.get(b.cx + ',' + b.cy) ?? 0,
+        })));
+      }
+
       // Diagnostic log every ~30s, independent of scan rate
       const now = performance.now();
       if (now - this.lastClassifierLogMs >= 30000) {
@@ -725,6 +743,7 @@ export class TrackingService {
     this.wrongLock = emptyWrongLockEvidence();
     this.wrongLockTarget = null;
     this.resetOcclusion();
+    this.debugSink?.markEvent('reset');
     console.log('[Tracking] Position reset by the user — rescanning' +
       (was ? ' (avoiding (' + Math.round(was.x) + ',' + Math.round(was.y) + ') for the next lock, within ' + RESET_AVOID_MS / 1000 + 's)' : ''));
     return true;
@@ -1184,6 +1203,7 @@ export class TrackingService {
 
     // Create filtered mask and find blobs
     const region = this.minimapRegion;
+    this.debugSink?.onFrame(frame, region);
     let mask = this.createMask(frame, region);
     mask = this.dilate(mask, region.width, region.height);
     const allBlobs = this.findBlobs(mask, region.width, region.height);
@@ -1446,6 +1466,7 @@ export class TrackingService {
 
     const bw = blob.maxX - blob.minX + 1;
     const bh = blob.maxY - blob.minY + 1;
+    this.debugSink?.markEvent('lock');
     console.log('[Tracking] SCANNING -> LOCKED via ' + reason +
       ': center=(' + cx + ',' + cy + ')' +
       ' size=' + bw + 'x' + bh + ' pixels=' + blob.pixels +
@@ -1476,6 +1497,7 @@ export class TrackingService {
     // (issue #7) showed holds up to 44s with phantom coords flowing the
     // whole time.
     if (shouldForceReacquisition(this.holdStartMs, performance.now())) {
+      this.debugSink?.markEvent('hold-exceeded');
       console.warn('[Tracking] Hold exceeded ' + FORCED_REACQUIRE_HOLD_MS +
         'ms — forcing re-acquisition (back to SCANNING)');
       this.lostAt = {
@@ -1531,6 +1553,7 @@ export class TrackingService {
       if (this.stackStep(lastRegion)) return;
       if (this.occlusionStep(redBlobs, lastRegion)) return;
       if (this.lockedTickCount === 0) {
+        this.debugSink?.markEvent('lost');
         console.log('[Tracking] Extrapolating position (no teal blobs) ' + this.describeLoss(tealBlobs, redBlobs, lastRegion));
       }
       // Our icon is missing with no other own-team icon in sight. If anything
@@ -1598,6 +1621,7 @@ export class TrackingService {
     // Phase 3: no blob matched at all — extrapolate
     if (!phase1) {
       if (this.lockedTickCount === 0) {
+        this.debugSink?.markEvent('lost');
         console.log('[Tracking] Extrapolating position (no match in range) ' +
           this.describeLoss(tealBlobs, redBlobs, lastReg, maxJumpPx));
         this.holdStartMs = performance.now();
@@ -1636,6 +1660,7 @@ export class TrackingService {
           this.farRefusalLoggedHold !== this.holdStartMs) {
         if (score < threshold) {
           this.farRefusalLoggedHold = this.holdStartMs;
+          this.debugSink?.markEvent('far-refused');
           console.log('[Tracking] Not re-acquiring at game(' + Math.round(at.x) + ',' + Math.round(at.y) +
             '): ' + Math.round(Math.hypot(at.x - lastSeen.x, at.y - lastSeen.y)) +
             ' units from where we were seen ' + holdSec.toFixed(1) + 's ago needs cls>=' +
@@ -1666,6 +1691,7 @@ export class TrackingService {
     this.velocityX = 0;
     this.velocityY = 0;
     this.lockedTickCount++;
+    this.debugSink?.markEvent('reacquired');
     console.log('[Tracking] Re-acquired via classifier (cls=' + clsScore.toFixed(2) +
       '): pixel(' + cx + ',' + cy + ')' +
       ' game(' + Math.round(newPos.x) + ',' + Math.round(newPos.y) + ')');

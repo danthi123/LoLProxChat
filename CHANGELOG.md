@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Fixed
+- **Caps Lock stopped working while the app ran.** With push-to-talk on its default key, Caps Lock, the app cancelled every Caps Lock press so the light would not flicker — even in Always Open mode, where push-to-talk is not used at all. Now the push-to-talk key is only watched in Push to Talk mode, and the default for new players is the key left of 1 (º on Spanish keyboards, ` on US ones), which nobody types with. A key you chose yourself is kept.
+- **Push to Talk chosen before a game was ignored — the mic stayed open.** The input mode applied only to the game in progress, so picking Push to Talk in the lobby (or in the previous game) showed on the panel while the next game transmitted always-open. The choice is now remembered across games and restarts.
+
+### Changed
+- **Champion classifier refreshed** for game patch 16.20.1 (the shipped model was from 16.13.1): about 90 skin icons released since, including skins for Vladimir, Gwen, Kayle, Yunara, Caitlyn, Orianna, Aurelion Sol and Yasuo.
+
+### Added
+- **One zip per game in Debug mode.** With Debug on, each game is saved as `games/<lobby>_<date>_<time>.zip` in the log folder (Settings → Debug Logs → OPEN): that game's log, a minimap snapshot every 10 seconds and at every tracking event, and the icon crops the champion classifier scored, named with their scores. Two playtests showed the classifier recognising almost no one; these images are what can show why. Minimap snapshots are only taken while League is the window in front, so an alt-tab never ends up in one. The newest 20 games are kept; a game interrupted by a crash or quit is zipped at the next launch. Nothing leaves your PC unless you send it.
+
 ## [v0.5.16] — 2026-10-07
 
 ### Fixed

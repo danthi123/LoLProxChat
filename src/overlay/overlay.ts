@@ -1,5 +1,6 @@
 import { setLoggingEnabled } from '../core/logging';
 import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 import {
   checkForUpdate,
   downloadAndApply,
@@ -325,7 +326,11 @@ btnCameraListen.addEventListener('click', () => {
 // + push to Rust.
 const PTT_VK_KEY = 'lolproxchat.pttVk';
 const TOGGLE_VK_KEY = 'lolproxchat.toggleVk';
-const DEFAULT_PTT_VK: number | null = 0x14;  // Caps Lock — matches Rust default (v0.5.6 unbound it but that stranded PTT users; v0.5.7 restored it, see #27)
+// The key left of 1 on this keyboard layout (º on Spanish, ` on US), asked of
+// Rust at startup. Until v0.5.16 this was Caps Lock, whose toggle the hook has
+// to cancel on every press — which left testers unable to type capitals. A
+// stored bind, Caps Lock included, is kept. VK_OEM_3 until Rust answers.
+let DEFAULT_PTT_VK: number | null = 0xC0;
 const FORBIDDEN_CODES = new Set([
   'Escape', 'Tab',
   // Common LoL bindings — would conflict with gameplay even though our
@@ -340,13 +345,31 @@ const FORBIDDEN_CODES = new Set([
 // localized too: Caps Lock is Bloq Mayús on a Spanish keyboard).
 const bindRelabelers: Array<() => void> = [];
 
+/** Layout names for the OEM punctuation keys, whose US names mislead on
+ *  other layouts (VK_OEM_5 is "\\" on US and "º" on Spanish). */
+const layoutKeyNames = new Map<number, string>();
+function keyLabel(vk: number): string {
+  return layoutKeyNames.get(vk) ?? translateKey(humanizeVk(vk));
+}
+async function learnKeyName(vk: number): Promise<void> {
+  if (vk < 0xBA || layoutKeyNames.has(vk)) return;
+  try {
+    const name = await invoke<string | null>('key_name', { vk });
+    if (name) {
+      layoutKeyNames.set(vk, name);
+      bindRelabelers.forEach((f) => f());
+    }
+  } catch { /* the US name stays */ }
+}
+
 function setupBindButton(buttonId: string, storageKey: string, backgroundCmd: string, defaultVk: number | null): void {
   const btn = document.getElementById(buttonId) as HTMLButtonElement;
   if (!btn) return;
   const stored = localStorage.getItem(storageKey);
   let boundVk = stored !== null ? parseInt(stored, 10) : defaultVk;
+  if (boundVk) void learnKeyName(boundVk);
   const label = (): string =>
-    boundVk !== null && !Number.isNaN(boundVk) && boundVk > 0 ? translateKey(humanizeVk(boundVk)) : t('settings.unbound');
+    boundVk !== null && !Number.isNaN(boundVk) && boundVk > 0 ? keyLabel(boundVk) : t('settings.unbound');
   btn.textContent = label();
   // Mid-capture the button shows the prompt (or a 1.5s rejection, which then
   // restores label() in whatever language is current by then).
@@ -383,18 +406,24 @@ function setupBindButton(buttonId: string, storageKey: string, backgroundCmd: st
       localStorage.setItem(storageKey, String(vk));
       sendToBackground(backgroundCmd, { vk });
       boundVk = vk;
+      void learnKeyName(vk);
       restore(label());
     };
     window.addEventListener('keydown', onKey, true);
   });
 }
 
-queueMicrotask(() => {
+queueMicrotask(async () => {
+  try {
+    DEFAULT_PTT_VK = await invoke<number>('default_ptt_key');
+  } catch { /* keep VK_OEM_3 */ }
   setupBindButton('btn-bind-ptt', PTT_VK_KEY, 'setPttKey', DEFAULT_PTT_VK);
   setupBindButton('btn-bind-toggle', TOGGLE_VK_KEY, 'setToggleKey', null);
-  // Push any stored bindings to Rust on startup so user prefs survive restart.
+  // Push the PTT key to Rust on startup — the stored bind, or the default the
+  // button shows, so the label and the watched key always agree.
   const ptt = localStorage.getItem(PTT_VK_KEY);
-  if (ptt !== null) sendToBackground('setPttKey', { vk: parseInt(ptt, 10) });
+  const pttVk = ptt !== null ? parseInt(ptt, 10) : DEFAULT_PTT_VK;
+  if (pttVk !== null && !Number.isNaN(pttVk)) sendToBackground('setPttKey', { vk: pttVk });
   const toggle = localStorage.getItem(TOGGLE_VK_KEY);
   if (toggle !== null) sendToBackground('setToggleKey', { vk: parseInt(toggle, 10) });
 });
@@ -444,10 +473,26 @@ if (panelEl) {
 }
 window.addEventListener('DOMContentLoaded', syncOverlayHeight);
 
-document.getElementById('input-mode')!.addEventListener('change', (e) => {
-  const mode = (e.target as HTMLSelectElement).value;
+// The input mode is remembered, and pushed at load as well as on change: it
+// used to be neither, so Push to Talk chosen in the lobby (or in the previous
+// game) showed on the panel while the next game's mic ran always-open. The
+// keyboard hook only watches the push-to-talk key in push-to-talk mode.
+const INPUT_MODE_KEY = 'lolproxchat.inputMode';
+const inputModeSelect = document.getElementById('input-mode') as HTMLSelectElement;
+function applyInputMode(): void {
+  const mode = inputModeSelect.value;
   sendToBackground('updateSettings', { inputMode: mode });
+  sendToBackground('setPttActive', { active: mode === 'ptt' });
+}
+try {
+  const storedMode = localStorage.getItem(INPUT_MODE_KEY);
+  if (storedMode === 'ptt' || storedMode === 'always') inputModeSelect.value = storedMode;
+} catch { /* default: Always Open */ }
+inputModeSelect.addEventListener('change', () => {
+  try { localStorage.setItem(INPUT_MODE_KEY, inputModeSelect.value); } catch { /* still applied */ }
+  applyInputMode();
 });
+applyInputMode();
 
 const volumeInput = document.getElementById('input-volume') as HTMLInputElement;
 const volumeLabel = document.getElementById('volume-label')!;

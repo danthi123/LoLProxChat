@@ -40,6 +40,7 @@ import { VolumeClient } from '../../src/services/volume-client';
 import { PeerConnection } from '../../src/services/peer-connection';
 import { Player } from '../../src/core/types';
 import { installDomShims } from '../e2e/setup/dom';
+import { setLoggingEnabled } from '../../src/core/logging';
 import { installWebAudioFakes } from '../e2e/fakes/webaudio';
 import { FakePeerConnection } from '../e2e/fakes/peer';
 import { ScriptedGameState, player } from '../e2e/fakes/game-state';
@@ -160,6 +161,42 @@ describe('defaultDeps', () => {
       volumeTickMs: 100,
       configPollMs: 5000,
     });
+  });
+});
+
+describe('the Debug game bundle', () => {
+  afterEach(() => setLoggingEnabled(false));
+
+  it('opens one zip per game, named after the lobby, and closes it when the game ends', async () => {
+    setLoggingEnabled(true);
+    const h = await startInGame();
+    const roomId = (h.orchestrator as unknown as { session: { roomId: string } }).session.roomId;
+    const starts = invokeMock.mock.calls.filter((c) => c[0] === 'bundle_start');
+    expect(starts).toHaveLength(1);
+    expect(starts[0][1].name.startsWith(roomId + '_')).toBe(true);
+
+    h.gameState.state = { ...h.gameState.state, isInGame: false, gameFlowPhase: 'EndOfGame' };
+    await jest.advanceTimersByTimeAsync(3000);
+    await settle();
+    const order = invokeMock.mock.calls.map((c) => c[0]).filter((c) => c.startsWith('bundle_'));
+    expect(order).toEqual(['bundle_start', 'bundle_finish']);
+  });
+
+  it('stays out of the way with Debug off', async () => {
+    await startInGame();
+    expect(invokeMock.mock.calls.some((c) => String(c[0]).startsWith('bundle_'))).toBe(false);
+  });
+});
+
+describe('panel settings across sessions', () => {
+  it('a setting chosen before the game reaches its audio (Push to Talk was ignored)', async () => {
+    const updateSettings = jest.fn();
+    const h = makeHarness({ updateSettings });
+    h.orchestrator.updateSettings({ inputMode: 'ptt' });
+    h.orchestrator.updateSettings({ inputVolume: 0.5 });
+    h.orchestrator.start();
+    await settle();
+    expect(updateSettings).toHaveBeenCalledWith({ inputMode: 'ptt', inputVolume: 0.5 });
   });
 });
 

@@ -23,10 +23,21 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetClientRect, GetSystemMetrics, GetWindowTextW, GetWindowThreadProcessId,
+    FindWindowW, GetClientRect, GetForegroundWindow, GetSystemMetrics, GetWindowTextW, GetWindowThreadProcessId,
     IsIconic, IsWindowVisible, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
+
+/// Whether the League game window is the one in front — the Debug bundle's
+/// minimap snapshots are a screen capture, and with anything else in front
+/// they would be a picture of that instead.
+pub fn league_is_foreground() -> bool {
+    let class: Vec<u16> = GAME_WINDOW_CLASS.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let Ok(game) = FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) else { return false };
+        !game.0.is_null() && game == GetForegroundWindow()
+    }
+}
 
 /// The game client's window class. The League *client* (store, lobby, champ
 /// select) is a different process and class — `LeagueClientUx.exe` / RCLIENT —

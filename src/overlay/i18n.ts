@@ -51,8 +51,8 @@ const STRINGS = {
   'settings.pushToTalk': { en: 'Push to Talk', es: 'Pulsar para hablar' },
   'settings.pttKey': { en: 'PTT Key', es: 'Tecla PTT' },
   'settings.pttKeyHint': {
-    en: "Push-to-talk key. Default Caps Lock. The LED won't toggle (Discord-style synthetic flip-back).",
-    es: 'Tecla para hablar (PTT). Por defecto, Bloq Mayús. Su luz no se encenderá (se revierte al instante, como hace Discord).',
+    en: 'Push-to-talk key, used only in Push to Talk mode. Default: the key left of 1 (` on US keyboards, º on Spanish ones).',
+    es: 'Tecla para hablar (PTT), solo en el modo Pulsar para hablar. Por defecto, la tecla a la izquierda del 1 (º en teclados españoles).',
   },
   'settings.toggleKey': { en: 'Toggle-mute Key', es: 'Tecla de silencio' },
   'settings.toggleKeyHint': {

@@ -48,6 +48,10 @@ window.addEventListener('overlayAction', ((event: CustomEvent) => {
       invoke('set_ptt_key', { vk: payload.vk })
         .catch((e) => console.warn('[Background] set_ptt_key failed:', e));
       break;
+    case 'setPttActive':
+      invoke('set_ptt_active', { active: !!payload.active })
+        .catch((e) => console.warn('[Background] set_ptt_active failed:', e));
+      break;
     case 'setToggleKey':
       invoke('set_toggle_key', { vk: payload.vk })
         .catch((e) => console.warn('[Background] set_toggle_key failed:', e));
