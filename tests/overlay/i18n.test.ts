@@ -3,6 +3,7 @@ import * as path from 'path';
 import { allKeys, t, translateKey, translateStatus } from '../../src/overlay/i18n';
 import { WARN_NOT_FOUND, WARN_IMPLAUSIBLE, WARN_QUERY_FAILED } from '../../src/core/game-window';
 import { WARN_MINIMAP_TOO_LARGE, WARN_CALIBRATION_OUTSIDE_CAPTURE } from '../../src/services/tracking';
+import { STATUS_MIC_BLOCKED } from '../../src/services/orchestrator';
 
 const root = path.join(__dirname, '../..');
 
@@ -57,7 +58,7 @@ describe('status lines from the services', () => {
     const lines = [
       ...orchestratorStatuses(),
       WARN_NOT_FOUND, WARN_IMPLAUSIBLE, WARN_QUERY_FAILED,
-      WARN_MINIMAP_TOO_LARGE, WARN_CALIBRATION_OUTSIDE_CAPTURE,
+      WARN_MINIMAP_TOO_LARGE, WARN_CALIBRATION_OUTSIDE_CAPTURE, STATUS_MIC_BLOCKED,
     ];
     expect(lines.length).toBeGreaterThan(15);
     for (const line of lines) {

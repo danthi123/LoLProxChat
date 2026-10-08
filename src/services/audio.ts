@@ -195,8 +195,22 @@ export class AudioService {
     this.peerFactory = peerFactory;
   }
 
+  /**
+   * Build the send/receive graph. A microphone that cannot be opened no longer
+   * aborts the session: the graph is built without it — the outgoing track is
+   * silence — so the player still hears everyone, and `getMicError()` says why
+   * they are not heard. A later input-device change retries the microphone
+   * into the same graph without renegotiating.
+   */
   async initMicrophone(): Promise<void> {
-    this.localStream = await this.acquireMicStream();
+    try {
+      this.localStream = await this.acquireMicStream();
+      this.micError = null;
+    } catch (e) {
+      this.localStream = null;
+      this.micError = describeMicError(e);
+      console.error('[Audio] Microphone unavailable — listening only: ' + this.micError);
+    }
 
     this.audioContext = new AudioContext();
     if (this.audioContext.state === 'suspended') {
@@ -206,7 +220,6 @@ export class AudioService {
     // (Chromium 110+, which WebView2 evergreen ships).
     await this.applyStoredOutputDevice();
 
-    this.micSource = this.audioContext.createMediaStreamSource(this.localStream);
     this.gainNode = this.audioContext.createGain();
     this.gainNode.gain.value = this.settings.inputVolume;
     const destination = this.audioContext.createMediaStreamDestination();
@@ -214,7 +227,10 @@ export class AudioService {
     // Simple straight-through chain: mic → gain → destination. Noise
     // suppression is handled by the browser's native DSP (set via the
     // getUserMedia constraints above) which runs off the JS main thread.
-    this.micSource.connect(this.gainNode);
+    this.micSource = this.localStream
+      ? this.audioContext.createMediaStreamSource(this.localStream)
+      : null;
+    this.micSource?.connect(this.gainNode);
     this.gainNode.connect(destination);
     console.log('[Audio] Using native browser noise suppression');
 
@@ -227,17 +243,21 @@ export class AudioService {
 
     // Attach analysers to monitor whether the mic is actually producing audio
     // and whether the WebRTC-output stream contains audio. Reported every 2s.
-    this.startAudioLevelMonitor(this.micSource, destination);
+    this.startAudioLevelMonitor(destination);
+  }
+
+  private micError: string | null = null;
+
+  /** Why the microphone could not be opened, or null while it works. */
+  getMicError(): string | null {
+    return this.micError;
   }
 
   private micLevelAnalyser: AnalyserNode | null = null;
   private outputLevelAnalyser: AnalyserNode | null = null;
   private levelMonitorId: number | null = null;
 
-  private startAudioLevelMonitor(
-    micSource: MediaStreamAudioSourceNode,
-    outputDest: MediaStreamAudioDestinationNode,
-  ): void {
+  private startAudioLevelMonitor(outputDest: MediaStreamAudioDestinationNode): void {
     if (!this.audioContext) return;
     // Defensive: never stack two monitors on one service instance.
     if (this.levelMonitorId !== null) {
@@ -246,7 +266,7 @@ export class AudioService {
     }
     this.micLevelAnalyser = this.audioContext.createAnalyser();
     this.micLevelAnalyser.fftSize = 1024;
-    micSource.connect(this.micLevelAnalyser);
+    this.micSource?.connect(this.micLevelAnalyser);
 
     // The destination node is a sink — to monitor its output we need to
     // re-source from its stream via a second source node.
@@ -715,8 +735,19 @@ export class AudioService {
       noiseSuppression: true,
       autoGainControl: true,
     };
-    if (inputId) constraints.deviceId = { exact: inputId };
-    return navigator.mediaDevices.getUserMedia({ audio: constraints });
+    if (!inputId) return navigator.mediaDevices.getUserMedia({ audio: constraints });
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        audio: { ...constraints, deviceId: { exact: inputId } },
+      });
+    } catch (e) {
+      // A chosen device that is gone (unplugged headset) would otherwise fail
+      // every retry for good; the Windows default is better than silence.
+      const name = (e as { name?: unknown } | null)?.name;
+      if (name !== 'NotFoundError' && name !== 'OverconstrainedError') throw e;
+      console.warn('[Audio] Chosen input device unavailable (' + name + ') — using the default');
+      return navigator.mediaDevices.getUserMedia({ audio: constraints });
+    }
   }
 
   private async applyStoredOutputDevice(): Promise<void> {
@@ -740,14 +771,27 @@ export class AudioService {
     }
     try {
       const newStream = await this.acquireMicStream();
+      // The session may have ended while the device was opening; a stream
+      // nobody will stop keeps the microphone captured until the app exits.
+      if (this.disposed || !this.audioContext || !this.gainNode) {
+        newStream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       this.micSource?.disconnect();
       this.localStream?.getTracks().forEach((t) => t.stop());
       this.localStream = newStream;
       this.micSource = this.audioContext.createMediaStreamSource(newStream);
       this.micSource.connect(this.gainNode);
+      // The level meter follows the live source; before this it kept reading
+      // the first device's node after a switch.
+      if (this.micLevelAnalyser) this.micSource.connect(this.micLevelAnalyser);
+      this.micError = null;
       this.updateLocalTrackState();
       console.log('[Audio] Input device switched');
     } catch (e) {
+      // Only a session that never had a working mic reports this one; a failed
+      // switch away from a working device leaves that device in place.
+      if (!this.localStream) this.micError = describeMicError(e);
       console.warn('[Audio] applyInputDevice failed:', e);
     }
   }
@@ -764,6 +808,7 @@ export class AudioService {
     // Set first: a creation still awaiting its ICE fetch checks this and closes
     // itself instead of inserting into a map nobody will iterate again.
     this.disposed = true;
+    this.micError = null;
     this.peerCreations.clear();
     this.peerClaimIds.clear();
     this.pendingSignals.clear();
@@ -795,4 +840,21 @@ export class AudioService {
     this.audioContext?.close();
     this.audioContext = null;
   }
+}
+
+/**
+ * One line for the log. A DOMException's name is what tells the cases apart:
+ * NotAllowedError is a permission (WebView2's own or Windows' privacy switch),
+ * NotFoundError / OverconstrainedError a device that is gone, NotReadableError
+ * a device another program holds exclusively.
+ */
+export function describeMicError(e: unknown): string {
+  if (e && typeof e === 'object') {
+    const name = (e as { name?: unknown }).name;
+    const message = (e as { message?: unknown }).message;
+    if (typeof name === 'string' && name) {
+      return typeof message === 'string' && message ? name + ': ' + message : name;
+    }
+  }
+  return String(e);
 }

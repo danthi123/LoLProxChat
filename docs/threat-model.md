@@ -227,7 +227,7 @@ All limits return `429` / `413` / WS close `1008` cleanly — legitimate clients
 
 ## Duplicate names in a room
 
-**Risk:** A room is keyed by a deterministic hash of the sorted scoreboard names (`generateRoomId`, `src/core/room.ts`), which is unkeyed — anyone who knows the ten player names of a live match, from the scoreboard, a stream or match history, can derive the room id without being in the game. Player names are similarly public. So an outsider can connect and claim another player's name.
+**Risk:** A room is keyed by a deterministic hash of the sorted scoreboard names (`generateRoomId`, `src/core/room.ts`; a streamer-mode client hashes the Riot IDs its roster still carries, which are the same names), which is unkeyed — anyone who knows the ten player names of a live match, from the scoreboard, a stream or match history, can derive the room id without being in the game. Player names are similarly public. So an outsider can connect and claim another player's name.
 
 **Status:** Bounded, and narrower than it was. The server keeps one entry per name per room and hands the name to the newest connection, closing the previous one with WebSocket code 4000. An outsider claiming a name therefore evicts that player rather than sitting alongside them.
 

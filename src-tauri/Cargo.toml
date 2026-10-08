@@ -20,5 +20,9 @@ windows = { version = "0.58", features = [
   "Win32_Foundation",
 ] }
 
+# Same versions wry 0.54 builds against, so the webview handle's COM types match.
+webview2-com = "0.38"
+windows-core = "0.61"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

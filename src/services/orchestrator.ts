@@ -14,6 +14,8 @@ import { disownAfterSec } from './tracking-helpers';
 import { BlobScorer, ChampionClassifier } from './champion-classifier';
 import { VolumeClient } from './volume-client';
 import { getAllyProximity, getCameraListen } from './audio-prefs';
+import { getForceTurnRelay } from './privacy';
+import { getStoredInputDeviceId, getStoredOutputDeviceId } from './devices';
 import { ScreenRect } from '../core/map-calibration';
 import {
   GameWindowInfoDto,
@@ -89,6 +91,10 @@ export function defaultDeps(): OrchestratorDeps {
     timings: { gameStatePollMs: 3000, volumeTickMs: 100, configPollMs: 5000 },
   };
 }
+
+/** Panel status while the session runs listening only. */
+export const STATUS_MIC_BLOCKED =
+  'Microphone blocked — listening only. Check Windows microphone privacy settings';
 
 export class Orchestrator {
   private readonly deps: OrchestratorDeps;
@@ -221,6 +227,8 @@ export class Orchestrator {
         this.endSession();
       }
 
+      this.retryBlockedMicrophone();
+
       // Refresh overlay even between sessions so lifecycle text stays current
       if (!this.session) {
         this.broadcastOverlayState();
@@ -230,6 +238,25 @@ export class Orchestrator {
     } finally {
       this.gameStatePollRunning = false;
     }
+  }
+
+  private lastMicRetryAt = 0;
+  private static readonly MIC_RETRY_MS = 10_000;
+
+  /** While listening only, try the microphone again — the player may have
+   *  just flipped Windows' privacy switch or plugged a headset in. */
+  private retryBlockedMicrophone(): void {
+    const audio = this.audio;
+    if (!this.sessionActive || !audio || !audio.getMicError?.()) return;
+    const now = Date.now();
+    if (now - this.lastMicRetryAt < Orchestrator.MIC_RETRY_MS) return;
+    this.lastMicRetryAt = now;
+    void Promise.resolve(audio.applyInputDevice(null)).then(() => {
+      if (this.audio === audio && !audio.getMicError()) {
+        console.log('[LoLProxChat] Microphone available — no longer listening only');
+        this.broadcastOverlayState();
+      }
+    });
   }
 
   private async pollForLiveClientData(): Promise<void> {
@@ -354,16 +381,37 @@ export class Orchestrator {
 
   private async startSession(session: GameSession): Promise<void> {
     console.log('[LoLProxChat] Starting session: room=' + session.roomId);
+    // None of these toggles reach the log any other way (the panel writes them
+    // straight to storage), and the 2026-10-07 test could only infer that
+    // everyone had both opt-ins on from how the volumes behaved.
+    // A diagnostic must never be what stops a session, storage or no storage.
+    try {
+      console.log('[LoLProxChat] Settings: allyProximity=' + getAllyProximity() +
+        ' voiceOnCamera=' + getCameraListen() +
+        ' hideIp=' + getForceTurnRelay() +
+        ' inputDevice=' + (getStoredInputDeviceId() ? 'chosen' : 'default') +
+        ' outputDevice=' + (getStoredOutputDeviceId() ? 'chosen' : 'default'));
+    } catch (e) {
+      console.warn('[LoLProxChat] Settings unreadable:', e);
+    }
 
     // Initialize audio (mic + WebRTC)
     this.audio = this.deps.createAudio(this.signaling, this.localSummonerName);
     try {
       await this.audio.initMicrophone();
-      console.log('[LoLProxChat] Microphone initialized');
     } catch (e) {
-      console.error('[LoLProxChat] Mic init failed — aborting session:', e);
+      console.error('[LoLProxChat] Audio init failed — aborting session:', e);
       this.audio = null;
       return;
+    }
+    // A blocked microphone used to abort the session here, leaving a player
+    // who could not be heard unable to hear anyone either, behind a panel that
+    // looked normal. Now the session goes on listening only, the panel says so,
+    // and the microphone is retried until it opens.
+    if (this.audio.getMicError?.()) {
+      this.lastMicRetryAt = Date.now();
+    } else {
+      console.log('[LoLProxChat] Microphone initialized');
     }
     // Carry over any mute toggles the user set before/between sessions.
     this.audio.setSelfMuted(this.selfMutedPref);
@@ -752,6 +800,8 @@ export class Orchestrator {
     const gs = this.lastGameState;
     if (!gs || !gs.isLeagueRunning) return 'Waiting for League of Legends';
     if (this.session) {
+      // Not being heard at all outranks anything about proximity.
+      if (this.audio?.getMicError?.()) return STATUS_MIC_BLOCKED;
       // Proximity being off is the whole story for this session, and unlike a
       // geometry warning it never resolves itself.
       if (this.session.proximityDisabledReason) return this.session.proximityDisabledReason;

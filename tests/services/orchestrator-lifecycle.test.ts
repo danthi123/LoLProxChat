@@ -31,7 +31,7 @@ jest.mock('@tauri-apps/api/core', () => ({
 jest.mock('@tauri-apps/api/event', () => ({ emit: jest.fn(async () => undefined) }));
 
 import { invoke } from '@tauri-apps/api/core';
-import { Orchestrator, OrchestratorDeps, defaultDeps } from '../../src/services/orchestrator';
+import { Orchestrator, OrchestratorDeps, defaultDeps, STATUS_MIC_BLOCKED } from '../../src/services/orchestrator';
 import { AudioService } from '../../src/services/audio';
 import { GameStateService } from '../../src/services/game-state';
 import { SignalingService } from '../../src/services/signaling';
@@ -70,7 +70,7 @@ async function settle(): Promise<void> {
   for (let i = 0; i < 12; i++) await jest.advanceTimersByTimeAsync(0);
 }
 
-function makeHarness(): Harness {
+function makeHarness(audioOverrides: Record<string, unknown> = {}): Harness {
   const gameState = new ScriptedGameState(LOCAL, ROSTER, { gameMode: 'CLASSIC', mapNumber: 11 });
   const tracker = new ScriptedTracker({ x: 0, y: 0, width: 1920, height: 1080 });
   const audio = {
@@ -85,6 +85,7 @@ function makeHarness(): Harness {
     handleSignal: jest.fn(async () => undefined),
     disconnectPeer: jest.fn(),
     cleanup: jest.fn(),
+    ...audioOverrides,
   };
   const signaling = {
     joinRoom: jest.fn(),
@@ -120,8 +121,8 @@ function makeHarness(): Harness {
 }
 
 /** Start the orchestrator and run one game-state poll to completion. */
-async function startInGame(): Promise<Harness> {
-  const harness = makeHarness();
+async function startInGame(audioOverrides: Record<string, unknown> = {}): Promise<Harness> {
+  const harness = makeHarness(audioOverrides);
   harness.orchestrator.start();
   await settle();
   return harness;
@@ -159,6 +160,40 @@ describe('defaultDeps', () => {
       volumeTickMs: 100,
       configPollMs: 5000,
     });
+  });
+});
+
+describe('a blocked microphone', () => {
+  // 2026-10-07: XadowAsol's mic was refused at every session start, which
+  // aborted the session — he heard no one, and the panel did not say why.
+  function blockedMic() {
+    let error: string | null = 'NotAllowedError: Permission denied';
+    return {
+      getMicError: jest.fn(() => error),
+      applyInputDevice: jest.fn(async () => { error = null; }),
+    };
+  }
+  const status = (h: Harness) =>
+    (h.orchestrator as unknown as { computeLifecycleStatus(): string }).computeLifecycleStatus();
+
+  it('keeps the session, listening only, and says so on the panel', async () => {
+    const h = await startInGame(blockedMic());
+    expect(h.signaling.joinRoom).toHaveBeenCalledTimes(1);
+    expect(h.tracker.started).toBe(true);
+    expect(status(h)).toBe(STATUS_MIC_BLOCKED);
+  });
+
+  it('retries the microphone every 10 s until it opens', async () => {
+    const mic = blockedMic();
+    const h = await startInGame(mic);
+    await jest.advanceTimersByTimeAsync(9000);
+    expect(mic.applyInputDevice).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(3000);
+    await settle();
+    expect(mic.applyInputDevice).toHaveBeenCalledTimes(1);
+    expect(status(h)).not.toBe(STATUS_MIC_BLOCKED);
+    await jest.advanceTimersByTimeAsync(30000);
+    expect(mic.applyInputDevice).toHaveBeenCalledTimes(1);
   });
 });
 

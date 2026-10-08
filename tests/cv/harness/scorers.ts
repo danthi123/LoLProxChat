@@ -36,12 +36,14 @@ export class ZeroScorer implements BlobScorer {
  */
 export class OracleScorer implements BlobScorer {
   runs = 0;
-  constructor(private readonly target: () => Point | null) {}
+  /** `raw` is what the model outputs for the target: 1 for certainty, or a
+   *  near-silent model's best guess (normalization still makes it 1.0). */
+  constructor(private readonly target: () => Point | null, private readonly raw = 1) {}
   isLoaded(): boolean { return true; }
   async scoreBlobsForLocalChampion(_frame: CaptureFrame, blobs: BlobCropBox[]): Promise<number[]> {
     this.runs++;
     const t = this.target();
-    return blobs.map(b => (t && cropContains(b, t) ? 1 : 0));
+    return blobs.map(b => (t && cropContains(b, t) ? this.raw : 0));
   }
 }
 
