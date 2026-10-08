@@ -18,7 +18,12 @@
 
 import { MAP_DIMENSIONS } from '../../src/core/types';
 import { TrackingState } from '../../src/services/tracking';
-import { FORCED_REACQUIRE_HOLD_MS, MAX_OCCLUDED_MS } from '../../src/services/tracking-helpers';
+import {
+  CAMERA_DWELL_MIN_READABLE_MS,
+  CAMERA_SWITCH_COOLDOWN_MS,
+  FORCED_REACQUIRE_HOLD_MS,
+  MAX_OCCLUDED_MS,
+} from '../../src/services/tracking-helpers';
 import { driveTracker, FRAME_MS, metrics, newTracker } from './harness/drive';
 import {
   IndiscriminateScorer,
@@ -1744,9 +1749,12 @@ describe('the camera says which teammate icon is us (2026-10-08 1hoxklt log)', (
     // Really started on the decoy, or this proves nothing.
     expect(distance(records[40].px!, at(DECOY_FROM, { x: 0, y: 0.05 }, 40))).toBeLessThan(6);
     const switched = records.findIndex(r => r.truth && r.px && distance(r.px, r.truth) < 6);
+    const locked = records.findIndex(r => r.state === TrackingState.LOCKED);
     expect(switched).toBeGreaterThan(32);
-    // Not before the post-lock cooldown and a full window's worth of evidence.
-    expect((switched - 32) * FRAME_MS).toBeGreaterThanOrEqual(10_000);
+    // Not within the cooldown after the lock, nor before 10s of evidence on
+    // both icons; and well inside a window once both hold.
+    expect((switched - locked) * FRAME_MS).toBeGreaterThanOrEqual(CAMERA_SWITCH_COOLDOWN_MS);
+    expect((switched - 32) * FRAME_MS).toBeGreaterThanOrEqual(CAMERA_DWELL_MIN_READABLE_MS);
     expect((switched - 32) * FRAME_MS).toBeLessThanOrEqual(30_000);
     for (const r of records.slice(switched)) expect(distance(r.px!, r.truth!)).toBeLessThan(6);
     expect(logs.some(l => l.includes('moving to the one it keeps on screen'))).toBe(true);
@@ -1801,6 +1809,29 @@ describe('the camera says which teammate icon is us (2026-10-08 1hoxklt log)', (
     expect(logs.some(l => l.includes('moving to the one it keeps on screen'))).toBe(false);
   });
 
+  test('a classifier that recognises the icon we follow outranks the camera', async () => {
+    // 40s watching a teammate: on camera evidence alone that moves the lock
+    // (the control run); with the model genuinely recognising the player, it
+    // does not.
+    const specs = lookingAway(60, 20, 60, () => true);
+    let base = 0;
+    const selfNow = () => toFramePoint(at(SELF_FROM, SELF_STEP, Math.round((performance.now() - base) / FRAME_MS) - 1));
+    const control = renderScenes(specs);
+    const hc = newTracker(control.map(s => s.frame), { classifier: new ZeroScorer() });
+    await driveTracker(hc, control);
+    expect(logs.some(l => l.includes('moving to the one it keeps on screen'))).toBe(true);
+
+    logs.length = 0;
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new OracleScorer(selfNow, 0.6) });
+    base = performance.now();
+    const records = await driveTracker(h, scenes);
+    expect(logs.some(l => /Classifier scores: .*raw=0\.600/.test(l))).toBe(true);
+    expect(logs.some(l => l.includes('moving to the one it keeps on screen'))).toBe(false);
+    const r = records[records.length - 1];
+    expect(distance(r.px!, r.truth!)).toBeLessThan(6);
+  });
+
   test('never moves the lock off an icon in a base, where players look elsewhere', async () => {
     // Shopping, or waiting out a recall: the camera is on the map, not on the
     // fountain. The same evidence that moves a lock in lane does not move it
@@ -1811,6 +1842,54 @@ describe('the camera says which teammate icon is us (2026-10-08 1hoxklt log)', (
     const records = await driveTracker(h, scenes);
     expect(distance(records[40].px!, at(BASE, { x: 0, y: 0.05 }, 40))).toBeLessThan(6);
     expect(logs.some(l => l.includes('moving to the one it keeps on screen'))).toBe(false);
+  });
+
+  test('after RESET, the scan locks the icon the camera keeps on screen', async () => {
+    // Locked on the decoy; the user presses RESET with 12s of camera history
+    // behind them. The scan rules the decoy out and the camera names the
+    // player at once, instead of waiting for them to walk.
+    const scenes = renderScenes(wrongStart(13, (self) => freeCam(self)));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const first = await driveTracker(h, scenes.slice(0, 32 + 11 * 8));
+    expect(distance(first[first.length - 1].px!, first[first.length - 1].truth!)).toBeGreaterThan(50);
+    h.svc.resetPosition();
+    const after = await driveTracker(h, scenes.slice(32 + 11 * 8));
+    const lockLine = logs.find(l => l.includes('SCANNING -> LOCKED via camera('));
+    expect(lockLine).toBeDefined();
+    const relocked = after.findIndex(r => r.state === TrackingState.LOCKED);
+    expect(relocked * FRAME_MS).toBeLessThanOrEqual(1_500);
+    for (const r of after.slice(relocked)) expect(distance(r.px!, r.truth!)).toBeLessThan(6);
+    // And the icon reset away from stays out of the camera's picks after the
+    // scan's own avoidance has ended with this lock.
+    const decoyNow = at(DECOY_FROM, { x: 0, y: 0.05 }, scenes.length - 1);
+    const readings = (h.svc as any).cameraDwell.readings(performance.now());
+    expect(readings.find((x: any) => distance(x, decoyNow) < 6).rejected).toBe(true);
+  });
+
+  test('a rescan does not take a far teammate the camera was watching while we were in base', async () => {
+    // Shopping in the fountain with the camera on a teammate in lane, then our
+    // icon lost in the fountain long enough to rescan. The teammate is the
+    // camera's clear favourite, and far out of walking reach.
+    const BASE_SELF: Point = { x: 30, y: 240 };
+    const lane = (i: number) => at(DECOY_FROM, { x: 0, y: 0.05 }, i);
+    const specs: SceneSpec[] = [
+      ...Array.from({ length: 20 * 8 }, (_, i): SceneSpec => ({
+        self: BASE_SELF, allies: i < 16 ? [] : [lane(i)], enemies: [{ x: 250, y: 160 }],
+        camera: { x: lane(i).x - 35, y: lane(i).y - 30, w: 70, h: 60 },
+      })),
+      ...Array.from({ length: 10 * 8 }, (_, i): SceneSpec => ({
+        self: null, allies: [lane(160 + i)], enemies: [{ x: 250, y: 160 }],
+        camera: { x: lane(160 + i).x - 35, y: lane(160 + i).y - 30, w: 70, h: 60 },
+      })),
+    ];
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    // It did rescan, and never put us on the teammate.
+    expect(records.some(r => r.state === TrackingState.SCANNING && r.i > 160)).toBe(true);
+    for (const r of records) {
+      if (r.px) expect(distance(r.px, lane(r.i))).toBeGreaterThan(40);
+    }
   });
 
   test('two icons the player keeps on screen together are left alone', async () => {

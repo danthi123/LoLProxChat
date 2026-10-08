@@ -819,13 +819,41 @@ export const CAMERA_DWELL_HIGH = 0.6;
 export const CAMERA_DWELL_LOW = 0.2;
 /** After any lock or camera switch, how long before the camera may move us. */
 export const CAMERA_SWITCH_COOLDOWN_MS = 15_000;
-/** A track not matched to any icon for this long is forgotten. */
-const CAMERA_TRACK_TTL_MS = 2_000;
+/**
+ * A track not matched to any icon for this long is forgotten. Icons drop out
+ * of detection for seconds at a time in fights (merged with an enemy's, or
+ * covered) — in the 2026-10-08 games a mid laner's was missing from about a
+ * third of the snapshots — and forgetting them sooner kept wiping the history
+ * the switch needs.
+ */
+const CAMERA_TRACK_TTL_MS = 5_000;
 
-interface DwellSample { t: number; dt: number; inView: boolean }
-interface DwellTrack { x: number; y: number; lastMs: number; samples: DwellSample[] }
+interface DwellSample { t: number; dt: number; readable: boolean; inView: boolean }
+interface DwellTrack { x: number; y: number; lastMs: number; samples: DwellSample[]; rejectedUntilMs: number }
 
-export interface DwellReading { x: number; y: number; dwell: number; readableMs: number }
+export interface DwellReading {
+  x: number;
+  y: number;
+  /** Share of the readable time this icon spent inside the rectangle. */
+  dwell: number;
+  /** Time this icon was seen with the rectangle readable... */
+  readableMs: number;
+  /** ...out of all the time it was seen, in the window. */
+  seenMs: number;
+  /** The user reset away from this icon recently; never a camera pick. */
+  rejected: boolean;
+}
+
+/**
+ * The rectangle has to have been readable for at least this share of the time
+ * an icon was seen for its dwell to mean anything. It reads as nothing when
+ * clipped by the map's edge, so a top or bot laner's camera on themselves in
+ * that corner goes uncounted while every glance elsewhere counts: their own
+ * icon would score near 0% on the frames that remain.
+ */
+export const CAMERA_DWELL_MIN_READABLE_SHARE = 0.5;
+/** How long an icon the user reset away from stays out of the camera's picks. */
+export const CAMERA_REJECT_MS = 60_000;
 
 /**
  * Which own-team icon the player keeps on screen.
@@ -858,29 +886,29 @@ export class CameraDwell {
    * icon, in view or out).
    */
   update(icons: Array<{ x: number; y: number }>, box: ViewportBox | null, now: number, dtMs: number, iconDiam: number): void {
-    const step = Math.max(4, iconDiam);
     const matched = new Set<DwellTrack>();
     for (const icon of icons) {
       let best: DwellTrack | null = null;
-      let bestD = step;
+      let bestD = Infinity;
       for (const t of this.tracks) {
         if (matched.has(t)) continue;
+        // An icon walks about a third of its own width a second; one unseen
+        // for a while may turn up that much further away.
+        const reach = Math.max(4, iconDiam * (1 + 0.3 * (now - t.lastMs) / 1000));
         const d = Math.hypot(t.x - icon.x, t.y - icon.y);
-        if (d <= bestD) { best = t; bestD = d; }
+        if (d <= reach && d < bestD) { best = t; bestD = d; }
       }
       if (!best) {
-        best = { x: icon.x, y: icon.y, lastMs: now, samples: [] };
+        best = { x: icon.x, y: icon.y, lastMs: now, samples: [], rejectedUntilMs: 0 };
         this.tracks.push(best);
       }
       matched.add(best);
       best.x = icon.x;
       best.y = icon.y;
       best.lastMs = now;
-      if (box) {
-        const m = iconDiam * 0.25;
-        const inView = icon.x >= box.x0 - m && icon.x <= box.x1 + m && icon.y >= box.y0 - m && icon.y <= box.y1 + m;
-        best.samples.push({ t: now, dt: Math.min(dtMs, 500), inView });
-      }
+      const m = iconDiam * 0.25;
+      const inView = !!box && icon.x >= box.x0 - m && icon.x <= box.x1 + m && icon.y >= box.y0 - m && icon.y <= box.y1 + m;
+      best.samples.push({ t: now, dt: Math.min(dtMs, 500), readable: !!box, inView });
     }
     const horizon = now - CAMERA_DWELL_WINDOW_MS;
     this.tracks = this.tracks.filter(t => now - t.lastMs <= CAMERA_TRACK_TTL_MS);
@@ -892,16 +920,32 @@ export class CameraDwell {
   }
 
   /** Every followed icon's dwell, as of the last update. */
-  readings(): DwellReading[] {
+  readings(now = Infinity): DwellReading[] {
     return this.tracks.map((t) => {
+      let seen = 0;
       let readable = 0;
       let inView = 0;
       for (const s of t.samples) {
-        readable += s.dt;
+        seen += s.dt;
+        if (s.readable) readable += s.dt;
         if (s.inView) inView += s.dt;
       }
-      return { x: t.x, y: t.y, dwell: readable > 0 ? inView / readable : 0, readableMs: readable };
+      return {
+        x: t.x, y: t.y, dwell: readable > 0 ? inView / readable : 0,
+        readableMs: readable, seenMs: seen, rejected: now < t.rejectedUntilMs,
+      };
     });
+  }
+
+  /** Keep the icon nearest `at` (within `radius`) out of camera picks until `untilMs`. */
+  reject(at: { x: number; y: number }, radius: number, untilMs: number): void {
+    let best: DwellTrack | null = null;
+    let bestD = radius;
+    for (const t of this.tracks) {
+      const d = Math.hypot(t.x - at.x, t.y - at.y);
+      if (d <= bestD) { best = t; bestD = d; }
+    }
+    if (best) best.rejectedUntilMs = untilMs;
   }
 
 }
@@ -928,10 +972,16 @@ export function readingNear(readings: DwellReading[], at: { x: number; y: number
  * most CAMERA_DWELL_LOW. Two teammates who stay together are both in view and
  * neither wins — the camera cannot separate them, and does not try.
  */
+/** Enough readable history, and readable enough of the time, to count. */
+function dwellCounts(r: DwellReading): boolean {
+  return r.readableMs >= CAMERA_DWELL_MIN_READABLE_MS &&
+    r.readableMs >= CAMERA_DWELL_MIN_READABLE_SHARE * r.seenMs;
+}
+
 export function cameraFavourite(readings: DwellReading[]): DwellReading | null {
-  const ready = readings.filter(r => r.readableMs >= CAMERA_DWELL_MIN_READABLE_MS);
+  const ready = readings.filter(dwellCounts);
   const high = ready.filter(r => r.dwell >= CAMERA_DWELL_HIGH);
-  if (high.length !== 1) return null;
+  if (high.length !== 1 || high[0].rejected) return null;
   const others = ready.filter(r => r !== high[0]);
   if (others.some(r => r.dwell > CAMERA_DWELL_LOW)) return null;
   return high[0];
@@ -947,8 +997,7 @@ export function cameraFavourite(readings: DwellReading[]): DwellReading | null {
  */
 export function cameraSwitchTarget(readings: DwellReading[], followed: DwellReading | null): DwellReading | null {
   if (followed && !readings.includes(followed)) throw new Error('cameraSwitchTarget: followed is not one of readings');
-  if (!followed || followed.readableMs < CAMERA_DWELL_MIN_READABLE_MS || followed.dwell > CAMERA_DWELL_LOW) return null;
-  const high = readings.filter(r => r !== followed &&
-    r.readableMs >= CAMERA_DWELL_MIN_READABLE_MS && r.dwell >= CAMERA_DWELL_HIGH);
-  return high.length === 1 ? high[0] : null;
+  if (!followed || !dwellCounts(followed) || followed.dwell > CAMERA_DWELL_LOW) return null;
+  const high = readings.filter(r => r !== followed && dwellCounts(r) && r.dwell >= CAMERA_DWELL_HIGH);
+  return high.length === 1 && !high[0].rejected ? high[0] : null;
 }

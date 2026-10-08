@@ -31,6 +31,7 @@ import {
   CAMERA_DWELL_WINDOW_MS,
   CAMERA_DWELL_MIN_READABLE_MS,
   CAMERA_DWELL_LOW,
+  CAMERA_DWELL_MIN_READABLE_SHARE,
 } from '../../src/services/tracking-helpers';
 import type { Blob } from '../../src/services/blob-types';
 
@@ -634,17 +635,61 @@ describe('CameraDwell', () => {
     expect(a.readableMs).toBeLessThanOrEqual(CAMERA_DWELL_WINDOW_MS);
   });
 
-  test('an icon gone for more than two seconds starts again with no history', () => {
+  test('counts the time an icon was seen with the rectangle unreadable, apart', () => {
+    const d = new CameraDwell();
+    let k = 0;
+    feed(d, 0, 20, () => [{ x: 150, y: 140 }], () => (k++ % 2 === 0 ? null : BOX));
+    const [a] = d.readings();
+    expect(a.seenMs).toBeCloseTo(20_000, -3);
+    expect(a.readableMs).toBeCloseTo(10_000, -3);
+  });
+
+  test('reject() marks the nearest icon until the given time', () => {
+    const d = new CameraDwell();
+    const now = feed(d, 0, 2, () => [{ x: 150, y: 140 }, { x: 20, y: 20 }], () => BOX);
+    d.reject({ x: 152, y: 141 }, 24, now + 1_000);
+    expect(d.readings(now).map(x => x.rejected)).toEqual([true, false]);
+    expect(d.readings(now + 1_000).map(x => x.rejected)).toEqual([false, false]);
+  });
+
+  test('keeps an icon\'s history through a few seconds undetected, not longer', () => {
+    // Missing for 4s (merged with an enemy in a fight) and turning up a little
+    // further on: the same icon, history intact.
     const d = new CameraDwell();
     let now = feed(d, 0, 20, () => [{ x: 150, y: 140 }], () => BOX);
-    now = feed(d, now, 3, () => [], () => BOX);
-    feed(d, now, 1, () => [{ x: 150, y: 140 }], () => BOX);
+    now = feed(d, now, 4, () => [], () => BOX);
+    now = feed(d, now, 1, () => [{ x: 170, y: 140 }], () => BOX);
+    expect(d.readings()).toHaveLength(1);
+    expect(d.readings()[0].readableMs).toBeGreaterThan(15_000);
+    // Gone for 6s: forgotten.
+    now = feed(d, now, 6, () => [], () => BOX);
+    feed(d, now, 1, () => [{ x: 170, y: 140 }], () => BOX);
     expect(d.readings()[0].readableMs).toBeLessThanOrEqual(1_000);
   });
 });
 
 describe('cameraFavourite and cameraSwitchTarget', () => {
-  const r = (dwell: number, readableMs = 20_000, x = 0) => ({ x, y: 0, dwell, readableMs });
+  const r = (dwell: number, readableMs = 20_000, x = 0, rejected = false) =>
+    ({ x, y: 0, dwell, readableMs, seenMs: readableMs, rejected });
+
+  test('an icon seen mostly with the rectangle unreadable does not count', () => {
+    // A laner in the map's corner, where the camera on them reads as nothing:
+    // only their glances elsewhere were counted.
+    const cornered = { ...r(0.0, 12_000, 1), seenMs: 30_000 };
+    const watched = r(0.7, 20_000, 2);
+    expect(12_000 / 30_000).toBeLessThan(CAMERA_DWELL_MIN_READABLE_SHARE);
+    expect(cameraSwitchTarget([cornered, watched], cornered)).toBeNull();
+    expect(cameraFavourite([{ ...r(0.9, 12_000), seenMs: 30_000 }, r(0)])).toBeNull();
+    // Readable enough of the time, it counts.
+    const fine = { ...r(0.0, 16_000, 1), seenMs: 30_000 };
+    expect(cameraSwitchTarget([fine, watched], fine)).toBe(watched);
+  });
+
+  test('an icon the user reset away from is never the camera pick', () => {
+    expect(cameraFavourite([r(0.8, 20_000, 0, true), r(0.1)])).toBeNull();
+    const followed = r(0.1, 20_000, 1);
+    expect(cameraSwitchTarget([followed, r(0.8, 20_000, 2, true)], followed)).toBeNull();
+  });
 
   test('a favourite needs a clear lead, and enough readable time', () => {
     expect(cameraFavourite([r(0.8), r(0.1), r(0.0)])).toEqual(r(0.8));

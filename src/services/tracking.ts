@@ -53,6 +53,7 @@ import {
   cameraSwitchTarget,
   readingNear,
   CAMERA_SWITCH_COOLDOWN_MS,
+  CAMERA_REJECT_MS,
   isInBaseZone,
 } from './tracking-helpers';
 
@@ -743,6 +744,9 @@ export class TrackingService {
     this.avoidPoint = was;
     this.avoidOrigin = was;
     this.avoidUntilMs = performance.now() + RESET_AVOID_MS;
+    // The scan's avoidance ends at its lock; this keeps the camera from moving
+    // us straight back onto the icon the user just rejected once it may.
+    if (was) this.cameraDwell.reject(was, computeNearFieldPx(this.expectedIconDiam), performance.now() + CAMERA_REJECT_MS);
     this.lastPixelPos = null;
     this.lockedTickCount = 0;
     this.scanFrameCount = 0;
@@ -1376,13 +1380,21 @@ export class TrackingService {
     // The icon the player has kept on screen while the others were not is us,
     // whatever the classifier makes of it. Not one the user just reset away
     // from: they have told us that one is wrong.
-    const favourite = cameraFavourite(this.cameraDwell.readings());
+    //
+    // Within walking reach of where a hold ran out, like any icon nothing
+    // else identifies: after a recall the player's camera is often still on
+    // the lane, on whichever teammate is there, while their own icon sits in
+    // the fountain where the camera is not.
+    const favourite = cameraFavourite(this.cameraDwell.readings(performance.now()));
     if (favourite) {
       const near = computeNearFieldPx(this.expectedIconDiam);
       const resetRadius = Math.max(5, this.expectedIconDiam * 0.6);
       const avoided = this.avoidPoint && performance.now() < this.avoidUntilMs &&
         Math.hypot(favourite.x - this.avoidPoint.x, favourite.y - this.avoidPoint.y) <= resetRadius;
-      const pick = avoided ? null : this.nearestBlob(tealBlobs, favourite, near);
+      const outOfReach = this.lostAt &&
+        Math.hypot(favourite.x - this.lostAt.x, favourite.y - this.lostAt.y) >
+          rescanReachPx(this.expectedIconDiam, performance.now() - this.lostAtMs);
+      const pick = avoided || outOfReach ? null : this.nearestBlob(tealBlobs, favourite, near);
       if (pick) {
         this.lockOnBlob(pick, 'camera(on screen ' + Math.round(favourite.dwell * 100) + '% of the last ' +
           Math.round(favourite.readableMs / 1000) + 's)');
@@ -1710,7 +1722,11 @@ export class TrackingService {
     const here = this.pixelToGamePosition(this.lastPixelPos.x, this.lastPixelPos.y, region);
     if (isInBaseZone(here, MAP_DIMENSIONS[this.mapType])) return false;
     const near = computeNearFieldPx(this.expectedIconDiam);
-    const readings = this.cameraDwell.readings();
+    // The model recognising the icon we follow outranks where the camera has
+    // been: then the player has simply been watching someone else.
+    const followedBlob = this.nearestBlob(tealBlobs, at, near);
+    if (followedBlob && this.getClassifierScore(followedBlob, this.rawClassifierScores) >= FAR_REACQUIRE_MIN_RAW) return false;
+    const readings = this.cameraDwell.readings(now);
     const followed = readingNear(readings, at, near);
     const target = cameraSwitchTarget(readings, followed);
     if (!target || Math.hypot(target.x - at.x, target.y - at.y) <= near) return false;
@@ -1726,16 +1742,17 @@ export class TrackingService {
   /** Every 30s with two or more own-team icons in view: each one's dwell. */
   private logCameraDwell(now: number): void {
     if (now - this.lastDwellLogMs < 30_000) return;
-    const readings = this.cameraDwell.readings();
+    const readings = this.cameraDwell.readings(now);
     if (readings.length < 2 || !this.minimapRegion) return;
     this.lastDwellLogMs = now;
     const at = this.lastPixelPos && this.state === TrackingState.LOCKED
       ? { x: this.lastPixelPos.x - this.minimapRegion.x, y: this.lastPixelPos.y - this.minimapRegion.y }
       : null;
     const followed = at ? readingNear(readings, at, computeNearFieldPx(this.expectedIconDiam)) : null;
-    console.log('[Tracking] Camera dwell (on screen / readable s): ' + readings.map(r =>
+    console.log('[Tracking] Camera dwell (on screen / readable of seen): ' + readings.map(r =>
       '(' + Math.round(r.x) + ',' + Math.round(r.y) + ')' + (r === followed ? '*' : '') + '=' +
-      Math.round(r.dwell * 100) + '%/' + Math.round(r.readableMs / 1000) + 's').join(' '));
+      Math.round(r.dwell * 100) + '%/' + Math.round(r.readableMs / 1000) + 's of ' + Math.round(r.seenMs / 1000) + 's' +
+      (r.rejected ? ' (reset away)' : '')).join(' '));
   }
 
   /**
@@ -1787,7 +1804,7 @@ export class TrackingService {
   /** Phase 2 success path: snap position, reset velocity, log, fire callback. */
   private acquireViaClassifier(blob: Blob, clsScore: number, via?: string): void {
     if (!this.minimapRegion) return;
-    if (via) this.lastLockChangeMs = performance.now();
+    this.lastLockChangeMs = performance.now();
     const cx = this.minimapRegion.x + blob.cx;
     const cy = this.minimapRegion.y + blob.cy;
     this.lastPixelPos = { x: cx, y: cy };
