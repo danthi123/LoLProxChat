@@ -80,6 +80,23 @@ export function ring(
   }
 }
 
+/**
+ * Teal art inside an icon's ring, touching it — Gwen's cyan hair framing her
+ * face: everything but the centre of the portrait and its lower edge. The teal
+ * test merges it with the ring into one blob too filled to pass as a bare ring
+ * (fill about 0.5 at the default diameter, against Gwen's 0.41-0.63 in real
+ * games), while the face in the middle stays clear of teal, as hers does.
+ */
+export function tealArt(f: SynthFrame, cx: number, cy: number, diam: number, color: Rgb): void {
+  const r = diam / 2 - 0.5;
+  for (let dy = Math.floor(-r); dy <= Math.ceil(r); dy++) {
+    for (let dx = Math.floor(-r); dx <= Math.ceil(r); dx++) {
+      const d = Math.hypot(dx, dy);
+      if (d <= r && d > r * 0.5 && dy <= r * 0.5) setPixel(f, cx + dx, cy + dy, color);
+    }
+  }
+}
+
 /** A filled disc — a turret's map icon, and the shape filterIconBlobs must reject. */
 export function disc(f: SynthFrame, cx: number, cy: number, radius: number, color: Rgb): void {
   for (let dy = -radius; dy <= radius; dy++) {

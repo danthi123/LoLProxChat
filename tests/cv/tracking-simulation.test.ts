@@ -28,6 +28,7 @@ import { driveTracker, FRAME_MS, metrics, newTracker } from './harness/drive';
 import {
   IndiscriminateScorer,
   OracleScorer,
+  SkinVerdictScorer,
   SpikingScorer,
   UnloadedScorer,
   ZeroScorer,
@@ -1902,5 +1903,107 @@ describe('the camera says which teammate icon is us (2026-10-08 1hoxklt log)', (
     expect(DECOY_FROM.y).toBeGreaterThan(70);
     expect(logs.some(l => l.includes('moving to the one it keeps on screen'))).toBe(false);
     expect(distance(records[records.length - 1].px!, at(DECOY_FROM, { x: 0, y: 0.05 }, records.length - 1))).toBeLessThan(6);
+  });
+});
+
+describe('a champion whose art is teal (2026-10-08 evening log, two Gwens)', () => {
+  // Gwen's cyan hair passes the teal test and merges with her ring into a blob
+  // too filled for a bare ring: until v0.5.21 the tracker threw her icon away
+  // on every frame, so a Gwen was tracked on nobody's screen — her own
+  // tracker followed teammates instead.
+  test('is found and followed', async () => {
+    const scenes = renderScenes(walk(30).map(s => ({ ...s, selfTealArt: true })));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const m = metrics(await driveTracker(h, scenes));
+    expect(m.lockFrame).toBeGreaterThanOrEqual(0);
+    expect(m.lockFrame).toBeLessThanOrEqual(12);
+    expect(m.maxErrorPx).toBeLessThanOrEqual(3);
+  });
+
+  test('a turret and a minion wave still are not icons', async () => {
+    // Nothing but the backdrop's turret and minions on our side: no lock.
+    const scenes = renderScenes(Array.from({ length: 30 }, () => ({
+      enemies: BACKDROP.enemies, turrets: BACKDROP.turrets, minions: [{ x: 120, y: 120 }, { x: 128, y: 126 }],
+    })));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    expect(records.every(r => r.state !== TrackingState.LOCKED)).toBe(true);
+  });
+});
+
+describe('an icon the skin match calls a teammate\'s', () => {
+  const MATE: Point = { x: 150, y: 120 };
+
+  test('is never locked on, even with nothing else to follow', async () => {
+    // Our own icon is nowhere to be seen (how red Gwen's was); the one
+    // teammate's is a clean ring. Before v0.5.21 the ring score alone took the
+    // lock ("cls=0.00 ... ring=0.99").
+    const scenes = renderScenes(Array.from({ length: 40 }, () => ({ ...NO_TEAL, allies: [MATE] })));
+    const classifier = new SkinVerdictScorer(() => null, () => [toFramePoint(MATE)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier });
+    const records = await driveTracker(h, scenes);
+    expect(classifier.runs).toBeGreaterThan(3);
+    expect(records.every(r => r.state !== TrackingState.LOCKED)).toBe(true);
+  });
+
+  test('is let go once the verdicts come in, and we are found', async () => {
+    // Locked on the teammate before skin matching had its say (the model
+    // was silent): two verdicts later the tracker drops it and, rescanning,
+    // finds our own icon — teal art and all.
+    let verdictsOn = false;
+    const selfAt = (i: number): Point => at({ x: 60, y: 220 }, { x: 1, y: 0 }, i);
+    const specs: SceneSpec[] = Array.from({ length: 120 }, (_, i) => ({
+      ...NO_TEAL,
+      allies: [MATE],
+      self: i < 20 ? null : selfAt(i),
+      selfTealArt: true,
+    }));
+    const scenes = renderScenes(specs);
+    let frame = 0;
+    const classifier = new SkinVerdictScorer(
+      () => (verdictsOn && frame >= 20 ? toFramePoint(selfAt(frame)) : null),
+      () => (verdictsOn ? [toFramePoint(MATE)] : []),
+    );
+    const h = newTracker(scenes.map(s => s.frame), { classifier });
+    const early = await driveTracker(h, scenes.slice(0, 20));
+    expect(early[early.length - 1].state).toBe(TrackingState.LOCKED);
+    expect(distance(early[early.length - 1].px!, MATE)).toBeLessThanOrEqual(3);
+    verdictsOn = true;
+    const late = [];
+    for (let i = 20; i < scenes.length; i++) {
+      frame = i;
+      late.push(...await driveTracker(h, [scenes[i]]));
+    }
+    // Let go within two classifier runs and a frame or two — not after a 5s
+    // hold that keeps reporting the teammate's position as ours.
+    const onMate = (r: { px: Point | null }) => !!r.px && distance(r.px, MATE) <= 3;
+    const released = late.findIndex(r => !onMate(r) || r.state !== TrackingState.LOCKED);
+    expect(released).toBeGreaterThanOrEqual(0);
+    expect(released * FRAME_MS).toBeLessThanOrEqual(1500);
+    const last = late[late.length - 1];
+    expect(last.state).toBe(TrackingState.LOCKED);
+    expect(distance(last.px!, selfAt(scenes.length - 1))).toBeLessThanOrEqual(3);
+  });
+
+  test('is let go at once even when nothing yet says which icon is ours', async () => {
+    // As above, but the skin match is unsure of our icon (half covered, say):
+    // nothing re-acquires us, so only dropping the teammate's icon outright
+    // stops its position going out as ours for a 5s hold.
+    const selfAt = (i: number): Point => at({ x: 60, y: 220 }, { x: 1, y: 0 }, i);
+    const specs: SceneSpec[] = Array.from({ length: 40 }, (_, i) => ({
+      ...NO_TEAL, allies: [MATE], self: i < 20 ? null : selfAt(i),
+    }));
+    const scenes = renderScenes(specs);
+    let verdictsOn = false;
+    const classifier = new SkinVerdictScorer(() => null, () => (verdictsOn ? [toFramePoint(MATE)] : []));
+    const h = newTracker(scenes.map(s => s.frame), { classifier });
+    const early = await driveTracker(h, scenes.slice(0, 20));
+    expect(distance(early[early.length - 1].px!, MATE)).toBeLessThanOrEqual(3);
+    verdictsOn = true;
+    const late = await driveTracker(h, scenes.slice(20));
+    const reportsMate = late.map(r => r.state === TrackingState.LOCKED && !!r.px && distance(r.px, MATE) <= 3);
+    const lastOnMate = reportsMate.lastIndexOf(true);
+    expect((lastOnMate + 1) * FRAME_MS).toBeLessThanOrEqual(1500);
+    expect(logs.some(l => l.includes('is a teammate\'s (skin match)'))).toBe(true);
   });
 });

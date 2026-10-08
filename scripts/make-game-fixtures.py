@@ -149,7 +149,40 @@ def match(img, cx, cy, diam, sets):
 
 
 # --- own-team icons, as tracking.ts finds them (teal ring, dilated, sized),
-# centred where it centres them: the rounded mean of the blob's pixels ---
+# centred where it centres them: the rounded mean of the blob's pixels, or for
+# an icon whose art is teal (filledIconRing in tracking-helpers.ts) the centre
+# of its ring ---
+def filled_icon_ring(d, xs, ys):
+    import math
+    H, W = d.shape
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    r = (x1 - x0 + 1 + y1 - y0 + 1) / 4
+    radii = []
+    for k in range(48):
+        t = 2 * math.pi * k / 48
+        last = -1
+        rr = 0.0
+        while rr <= r + 3:
+            x, y = round(cx + rr * math.cos(t)), round(cy + rr * math.sin(t))
+            if 0 <= x < W and 0 <= y < H and d[y, x]:
+                last = rr
+            rr += 0.5
+        radii.append(last)
+    med = sorted(radii)[24]
+    if sum(abs(v - med) <= 1.5 for v in radii) / 48 < 0.75:
+        return None
+    n = hits = 0
+    for y in range(math.ceil(cy - r * 0.6), int(cy + r * 0.6) + 1):
+        for x in range(math.ceil(cx - r * 0.6), int(cx + r * 0.6) + 1):
+            if 0 <= x < W and 0 <= y < H and math.hypot(x - cx, y - cy) <= r * 0.6:
+                n += 1
+                hits += bool(d[y, x])
+    if n and hits / n > 0.6:
+        return None
+    return round(cx), round(cy)
+
+
 def teal_icons(img, diam):
     a = np.asarray(img, dtype=np.int32)
     r, g, b = a[..., 0], a[..., 1], a[..., 2]
@@ -172,8 +205,15 @@ def teal_icons(img, diam):
             ys = [p[0] for p in pts]; xs = [p[1] for p in pts]
             bw, bh = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
             fill = len(pts) / (bw * bh)
-            if 0.6 * diam <= bw <= 1.6 * diam and 0.6 * diam <= bh <= 1.6 * diam and fill <= 0.4:
+            if not (0.6 * diam <= bw <= 1.6 * diam and 0.6 * diam <= bh <= 1.6 * diam
+                    and 0.6 <= bw / bh <= 1.7 and len(pts) >= 15 and fill >= 0.08):
+                continue
+            if fill <= 0.4:
                 out.append((round(sum(xs) / len(xs)), round(sum(ys) / len(ys))))
+            else:
+                ring = filled_icon_ring(d, xs, ys)
+                if ring:
+                    out.append(ring)
     return out
 
 

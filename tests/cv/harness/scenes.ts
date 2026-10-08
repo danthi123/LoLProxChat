@@ -16,6 +16,7 @@ import {
   minionCluster,
   movementPath,
   ring,
+  tealArt,
   BACKGROUND,
   RED,
   TEAL,
@@ -59,6 +60,8 @@ export interface SceneSpec {
    * `enemies`, these can cover part or all of the self icon.
    */
   enemiesOnTop?: Point[];
+  /** Teal art inside the self icon (Gwen's hair): see tealArt. */
+  selfTealArt?: boolean;
 }
 
 export interface RenderedScene {
@@ -86,6 +89,7 @@ export function renderScene(spec: SceneSpec): RenderedScene {
     if (spec.selfTrail) {
       movementPath(f, ox + spec.self.x, oy + spec.self.y, ICON_DIAM, spec.selfTrail.x, spec.selfTrail.y);
     }
+    if (spec.selfTealArt) tealArt(f, ox + spec.self.x, oy + spec.self.y, ICON_DIAM, TEAL);
     ring(f, ox + spec.self.x, oy + spec.self.y, ICON_DIAM, TEAL);
   }
   for (const p of spec.enemiesOnTop ?? []) {

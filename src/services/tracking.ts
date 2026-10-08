@@ -15,7 +15,10 @@ import { FrameSource, TauriFrameSource } from './frame-source';
 import {
   computeMaxJumpPx,
   computeReacquireThreshold,
+  filledIconRing,
   iconCropBox,
+  TeammateVerdicts,
+  TEAMMATE_VERDICT_RUNS,
   pickBestBlobInRange,
   pickClassifierReacquisition,
   reacquireThresholdAt,
@@ -198,6 +201,11 @@ export class TrackingService {
   private bystanders: Array<{ x: number; y: number; vouched: number; lastRunMs: number }> = [];
   // The same icons, unfiltered, for this frame's classifier run.
   private bystanderBlobs: Blob[] = [];
+  // Own-team icons the skin match keeps calling a teammate's: set aside like
+  // bystanders (never locked on), but still scored and counted for camera
+  // dwell. See TeammateVerdicts.
+  private teammateVerdicts = new TeammateVerdicts();
+  private teammateBlobs: Blob[] = [];
   // When the current stacked episode began; latched (left set) when one ends
   // by the cap rather than by us reappearing, so it cannot simply restart.
   private stackedSinceMs = 0;
@@ -414,6 +422,8 @@ export class TrackingService {
     this.lostAt = null;
     this.bystanders = [];
     this.bystanderBlobs = [];
+    this.teammateVerdicts.clear();
+    this.teammateBlobs = [];
     this.lastCleanReg = null;
     this.lastPixelPos = null;
     this.lockedTickCount = 0;
@@ -459,6 +469,8 @@ export class TrackingService {
     this.lostAt = null;
     this.bystanders = [];
     this.bystanderBlobs = [];
+    this.teammateVerdicts.clear();
+    this.teammateBlobs = [];
     this.lastCleanReg = null;
     this.lastPixelPos = null;
     this.lockedTickCount = 0;
@@ -552,6 +564,12 @@ export class TrackingService {
       this.smoothedClassifierScores.clear();
       for (const [key, val] of this.classifierScores) {
         this.smoothedClassifierScores.set(key, val);
+      }
+
+      const verdicts = this.classifier.lastVerdicts?.();
+      if (verdicts && verdicts.length === tealBlobs.length) {
+        this.teammateVerdicts.update(tealBlobs.map(b => ({ x: b.cx, y: b.cy })), verdicts,
+          performance.now(), this.expectedIconDiam);
       }
 
       this.weighWrongLock(tealBlobs, normalizedScores, maxRaw >= MIN_RAW_THRESHOLD);
@@ -868,32 +886,44 @@ export class TrackingService {
   }
 
   /** Filter blobs to those matching champion icon rings (not towers or minion clusters) */
-  private filterIconBlobs(blobs: Blob[]): Blob[] {
+  private filterIconBlobs(blobs: Blob[], mask: Uint8Array, w: number, h: number): Blob[] {
     const diam = this.expectedIconDiam;
     if (diam < 5) return blobs;
 
     const minSize = diam * 0.6;
     const maxSize = diam * 1.6;
 
-    return blobs.filter(b => {
-      const bw = b.maxX - b.minX + 1;
-      const bh = b.maxY - b.minY + 1;
-      // Bounding box should be close to icon-sized (tighter range)
-      if (bw < minSize || bw > maxSize || bh < minSize || bh > maxSize) return false;
-      // Aspect ratio close to square (champion icons are circles)
-      const aspect = bw / bh;
-      if (aspect < 0.6 || aspect > 1.7) return false;
-      // Minimum pixel count (at least a partial arc)
-      if (b.pixels < 15) return false;
-      // Champion icon borders are RINGS (hollow center) → low fill ratio
-      // Towers and minion clusters are FILLED shapes → high fill ratio
-      // Ring of diameter D, border ~3px: fillRatio ≈ 0.25-0.35
-      // Minion groups: fillRatio > 0.40 (many pixels clumped together)
-      if (b.fillRatio > 0.40) return false;
-      // Too sparse means noise, not a real border
-      if (b.fillRatio < 0.08) return false;
-      return true;
-    });
+    const out: Blob[] = [];
+    for (const b of blobs) {
+      if (!this.isIconSized(b, minSize, maxSize)) continue;
+      if (b.fillRatio <= 0.40) { out.push(b); continue; }
+      // Too filled for a bare ring — unless a ring runs round it: an icon
+      // whose own art is teal (filledIconRing).
+      const ring = filledIconRing(b, mask, w, h);
+      if (ring) out.push({ ...b, cx: ring.cx, cy: ring.cy });
+    }
+    return out;
+  }
+
+  /** Every icon test but the fill ratio's upper bound. */
+  private isIconSized(b: Blob, minSize: number, maxSize: number): boolean {
+    const bw = b.maxX - b.minX + 1;
+    const bh = b.maxY - b.minY + 1;
+    // Bounding box should be close to icon-sized (tighter range)
+    if (bw < minSize || bw > maxSize || bh < minSize || bh > maxSize) return false;
+    // Aspect ratio close to square (champion icons are circles)
+    const aspect = bw / bh;
+    if (aspect < 0.6 || aspect > 1.7) return false;
+    // Minimum pixel count (at least a partial arc)
+    if (b.pixels < 15) return false;
+    // Champion icon borders are RINGS (hollow center) → low fill ratio
+    // Towers and minion clusters are FILLED shapes → high fill ratio
+    // Ring of diameter D, border ~3px: fillRatio ≈ 0.25-0.35
+    // Minion groups: fillRatio > 0.40 (many pixels clumped together) —
+    // the caller applies that bound, with its one exception.
+    // Too sparse means noise, not a real border
+    if (b.fillRatio < 0.08) return false;
+    return true;
   }
 
   // --- Movement path line detection (white pixels near teal blobs) ---
@@ -1233,7 +1263,8 @@ export class TrackingService {
     let mask = this.createMask(frame, region);
     mask = this.dilate(mask, region.width, region.height);
     const allBlobs = this.findBlobs(mask, region.width, region.height);
-    const iconBlobs = this.excludeBystanders(this.filterIconBlobs(allBlobs));
+    const iconBlobs = this.excludeTeammates(
+      this.excludeBystanders(this.filterIconBlobs(allBlobs, mask, region.width, region.height)));
     this.occluderBlobs = allBlobs.filter(b => isPossibleOccluder(b, this.expectedIconDiam));
     this.stackBlobs = allBlobs.filter(b => isPossibleStack(b, this.expectedIconDiam));
     this.frameTealIcons = iconBlobs.filter(b => b.color === 'teal');
@@ -1266,7 +1297,7 @@ export class TrackingService {
     // independent of lock state, so it keeps working while the tracker
     // is SCANNING.
     this.updateCameraPosition(viewportMask, region);
-    const ownIcons = [...iconBlobs, ...this.bystanderBlobs].filter(b => b.color === 'teal');
+    const ownIcons = [...iconBlobs, ...this.bystanderBlobs, ...this.teammateBlobs].filter(b => b.color === 'teal');
     this.cameraDwell.update(ownIcons.map(b => ({ x: b.cx, y: b.cy })), this.cameraBox,
       nowMs, this.lastDtSec * 1000, this.expectedIconDiam);
     this.logCameraDwell(nowMs);
@@ -1274,7 +1305,7 @@ export class TrackingService {
     // Run classifier at most every 500ms (scan-rate independent). Excluded
     // bystander icons are scored too: the classifier vouching for one is what
     // releases it (excludeBystanders).
-    const tealBlobs = [...iconBlobs, ...this.bystanderBlobs].filter(b => b.color === 'teal');
+    const tealBlobs = [...iconBlobs, ...this.bystanderBlobs, ...this.teammateBlobs].filter(b => b.color === 'teal');
     if (
       this.classifier &&
       tealBlobs.length > 0 &&
@@ -1574,6 +1605,29 @@ export class TrackingService {
     const tealBlobs = iconBlobs.filter(b => b.color === 'teal');
     const redBlobs = this.occluderBlobs;
     const hasClassifier = !!(this.classifier && this.classifier.isLoaded());
+
+    // The icon we follow is a teammate's, the skin match says (excludeTeammates
+    // took it out of iconBlobs). Let it go now rather than through a 5s hold,
+    // which would keep reporting the teammate's position as ours.
+    {
+      const at = { x: this.lastPixelPos.x - this.minimapRegion.x, y: this.lastPixelPos.y - this.minimapRegion.y };
+      const near = computeNearFieldPx(this.expectedIconDiam);
+      const mate = this.nearestBlob(this.teammateBlobs, at, near);
+      const ours = this.nearestBlob(tealBlobs, at, near);
+      if (mate && (!ours || Math.hypot(mate.cx - at.x, mate.cy - at.y) < Math.hypot(ours.cx - at.x, ours.cy - at.y))) {
+        this.debugSink?.markEvent('teammate');
+        console.warn('[Tracking] The icon we were following is a teammate\'s (skin match) — rescanning');
+        this.lostAt = at;
+        this.lostAtMs = performance.now();
+        this.state = TrackingState.SCANNING;
+        this.holdStartMs = 0;
+        this.holdReason = null;
+        this.resetOcclusion();
+        this.scanFrameCount = 0;
+        this.scanStartMs = performance.now();
+        return;
+      }
+    }
 
     // The classifier has been saying for several seconds that the blob we are
     // on is not us and another one is (weighWrongLock). Move to it.
@@ -2165,6 +2219,20 @@ export class TrackingService {
    * RESET and on respawn; there is no timer, because a timer is what let the
    * rescan lock the teammate as soon as it ran out.
    */
+  /**
+   * Set aside the own-team icons the skin match calls a teammate's
+   * (TeammateVerdicts): never a candidate to lock on — while scanning, one
+   * verdict is enough — and one we are locked on is let go (handleLocked).
+   */
+  private excludeTeammates(blobs: Blob[]): Blob[] {
+    const now = performance.now();
+    const minRuns = this.state === TrackingState.SCANNING ? 1 : TEAMMATE_VERDICT_RUNS;
+    this.teammateBlobs = blobs.filter(b =>
+      b.color === 'teal' && this.teammateVerdicts.isTeammate(b.cx, b.cy, now, this.expectedIconDiam, minRuns));
+    if (this.teammateBlobs.length === 0) return blobs;
+    return blobs.filter(b => !this.teammateBlobs.includes(b));
+  }
+
   private excludeBystanders(blobs: Blob[]): Blob[] {
     this.bystanderBlobs = [];
     if (this.bystanders.length === 0) return blobs;

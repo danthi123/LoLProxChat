@@ -99,3 +99,26 @@ export class IndiscriminateScorer implements BlobScorer {
     return blobs.map(() => 1);
   }
 }
+
+/**
+ * The skin match in front of a silent model (SkinAwareScorer): sure which icon
+ * is ours and which are teammates', and says so through lastVerdicts as well as
+ * the scores. An icon it does not cover is undecided.
+ */
+export class SkinVerdictScorer implements BlobScorer {
+  runs = 0;
+  private verdicts: Array<'self' | 'teammate' | null> = [];
+  constructor(
+    private readonly self: () => Point | null,
+    private readonly mates: () => Point[],
+  ) {}
+  isLoaded(): boolean { return true; }
+  lastVerdicts(): Array<'self' | 'teammate' | null> { return this.verdicts; }
+  async scoreBlobsForLocalChampion(_frame: CaptureFrame, blobs: BlobCropBox[]): Promise<number[]> {
+    this.runs++;
+    const s = this.self();
+    const mates = this.mates();
+    this.verdicts = blobs.map(b => (s && cropContains(b, s) ? 'self' : mates.some(m => cropContains(b, m)) ? 'teammate' : null));
+    return this.verdicts.map(v => (v === 'self' ? 0.95 : 0));
+  }
+}

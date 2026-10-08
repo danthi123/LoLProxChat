@@ -135,6 +135,9 @@ export interface BlobScorer {
   scoreBlobsForLocalChampion(frame: CaptureFrame, blobs: BlobCropBox[]): Promise<number[]>;
   /** The model-input crops of the latest run, for the Debug game bundle. */
   lastCrops?(): ImageData[];
+  /** For each icon of the latest run, whose the skin match says it is: the
+   *  local player's, a teammate's, or undecided (SkinAwareScorer). */
+  lastVerdicts?(): Array<'self' | 'teammate' | null>;
 }
 
 export class ChampionClassifier implements BlobScorer {

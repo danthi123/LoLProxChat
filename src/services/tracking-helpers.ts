@@ -1009,3 +1009,150 @@ export function iconCropBox(x: number, y: number, iconDiam: number): BlobCropBox
   const side = Math.max(4, iconDiam);
   return { cropX: Math.round(x - side / 2), cropY: Math.round(y - side / 2), cropW: side, cropH: side };
 }
+
+// ---------- Icons whose art is teal ----------
+
+/** A filled blob passes as an own-team icon when its teal ends at one radius
+ *  at least this share of the way round — a ring round it. On the eleven
+ *  2026-10-08 recordings every blob at 0.75 or above was an icon; a turret
+ *  ringed by its minions, clear in the middle like an icon, reached 0.69... */
+export const FILLED_RING_MIN_ROUNDNESS = 0.75;
+/** ...and it is not teal right through: within FILLED_RING_CENTRE of the
+ *  ring's radius, no more than this share teal (dilated mask). A face is not
+ *  teal: no icon on those recordings went above 0.6, while every turret and
+ *  minion cluster but that one was at 0.63 or more. */
+export const FILLED_RING_MAX_CENTRE_TEAL = 0.6;
+const FILLED_RING_CENTRE = 0.6;
+const RING_SAMPLES = 48;
+
+/**
+ * How round the outline of the `value` pixels around (cx, cy) is: along rays
+ * at RING_SAMPLES angles, the share whose outermost such pixel (out to maxR)
+ * lies within 1.5 px of the median ray's.
+ */
+export function outlineRoundness(
+  mask: Uint8Array, w: number, h: number, cx: number, cy: number, maxR: number, value: number,
+): number {
+  const radii: number[] = [];
+  for (let k = 0; k < RING_SAMPLES; k++) {
+    const t = (2 * Math.PI * k) / RING_SAMPLES;
+    let last = -1;
+    for (let r = 0; r <= maxR; r += 0.5) {
+      const x = Math.round(cx + r * Math.cos(t));
+      const y = Math.round(cy + r * Math.sin(t));
+      if (x >= 0 && y >= 0 && x < w && y < h && mask[y * w + x] === value) last = r;
+    }
+    radii.push(last);
+  }
+  const median = [...radii].sort((a, b) => a - b)[RING_SAMPLES >> 1];
+  return radii.filter(r => Math.abs(r - median) <= 1.5).length / RING_SAMPLES;
+}
+
+/** Share of the pixels within `r` of (cx, cy) that equal `value`. */
+export function discShare(
+  mask: Uint8Array, w: number, h: number, cx: number, cy: number, r: number, value: number,
+): number {
+  let n = 0;
+  let hits = 0;
+  for (let y = Math.ceil(cy - r); y <= cy + r; y++) {
+    for (let x = Math.ceil(cx - r); x <= cx + r; x++) {
+      if (x < 0 || y < 0 || x >= w || y >= h || Math.hypot(x - cx, y - cy) > r) continue;
+      n++;
+      if (mask[y * w + x] === value) hits++;
+    }
+  }
+  return n > 0 ? hits / n : 0;
+}
+
+/**
+ * An icon-sized blob too filled to be a bare ring that is an own-team icon all
+ * the same: one whose art is itself teal, which merges with the ring. Gwen's
+ * cyan hair does — at fill 0.41-0.63 her icon failed the 0.40 ring test on
+ * every frame of the 2026-10-08 evening game, so her own tracker never saw
+ * her (and followed teammates), nor did her teammates'. What tells such an
+ * icon from a turret or a minion cluster is the ring round it — the teal ends
+ * at one radius nearly all the way round — and a centre that is not all teal.
+ * Both are measured from the blob's own box: the expected icon diameter runs a
+ * few pixels small, which would put them on the hair instead.
+ *
+ * Returns the ring's centre, the better estimate here: the pixel centroid is
+ * pulled towards the hair. Null when the blob is not such an icon.
+ */
+export function filledIconRing(b: Blob, mask: Uint8Array, w: number, h: number): { cx: number; cy: number } | null {
+  const bw = b.maxX - b.minX + 1;
+  const bh = b.maxY - b.minY + 1;
+  const cx = (b.minX + b.maxX) / 2;
+  const cy = (b.minY + b.maxY) / 2;
+  const radius = (bw + bh) / 4;
+  const value = b.color === 'teal' ? 1 : 2;
+  if (outlineRoundness(mask, w, h, cx, cy, radius + 3, value) < FILLED_RING_MIN_ROUNDNESS) return null;
+  if (discShare(mask, w, h, cx, cy, radius * FILLED_RING_CENTRE, value) > FILLED_RING_MAX_CENTRE_TEAL) return null;
+  return { cx: Math.round(cx), cy: Math.round(cy) };
+}
+
+// ---------- Icons the skin match says are a teammate's ----------
+
+/** A teammate verdict must come this many classifier runs in a row to take
+ *  us off an icon we are locked on (one bad crop must not)... */
+export const TEAMMATE_VERDICT_RUNS = 2;
+/** ...and the latest within this, for the icon to be set aside. */
+export const TEAMMATE_VERDICT_TTL_MS = 2000;
+
+interface TeammateMark { x: number; y: number; runs: number; lastMs: number }
+
+/**
+ * Which own-team icons the skin match keeps calling a teammate's. The tracker
+ * sets those aside — never locks on them, and loses one it was following, so
+ * it rescans — as it does bystanders: before v0.5.21 a teammate verdict only
+ * zeroed the classifier's share of the score, and the path line and ring
+ * quality still carried a lock onto a teammate (red Gwen, 2026-10-08:
+ * "cls=0.00 white=1.00").
+ *
+ * Picking an icon to lock on, one verdict is enough to pass it over; leaving
+ * one we are locked on takes two in a row, so one bad crop cannot. Any
+ * verdict of "you" for the icon clears it at once.
+ */
+export class TeammateVerdicts {
+  private marks: TeammateMark[] = [];
+
+  /** One classifier run: each scored icon's position and the skin verdict. */
+  update(
+    icons: Array<{ x: number; y: number }>,
+    verdicts: Array<'self' | 'teammate' | null>,
+    now: number,
+    iconDiam: number,
+  ): void {
+    const reach = Math.max(5, iconDiam * 0.6);
+    const next: TeammateMark[] = [];
+    icons.forEach((p, i) => {
+      const prev = this.nearest(p.x, p.y, reach, this.marks);
+      const v = verdicts[i];
+      if (v === 'teammate') {
+        next.push({ x: p.x, y: p.y, runs: (prev?.runs ?? 0) + 1, lastMs: now });
+      } else if (v === null && prev && now - prev.lastMs <= TEAMMATE_VERDICT_TTL_MS) {
+        // Unsure this run: keep what was known, without adding to it.
+        next.push({ ...prev, x: p.x, y: p.y });
+      }
+    });
+    this.marks = next;
+  }
+
+  /** Whether the icon at (x, y) has been called a teammate's `minRuns` runs
+   *  in a row, the latest recently. */
+  isTeammate(x: number, y: number, now: number, iconDiam: number, minRuns = TEAMMATE_VERDICT_RUNS): boolean {
+    const m = this.nearest(x, y, Math.max(5, iconDiam * 0.6), this.marks);
+    return !!m && m.runs >= minRuns && now - m.lastMs <= TEAMMATE_VERDICT_TTL_MS;
+  }
+
+  clear(): void { this.marks = []; }
+
+  private nearest(x: number, y: number, reach: number, marks: TeammateMark[]): TeammateMark | null {
+    let best: TeammateMark | null = null;
+    let bestD = reach;
+    for (const m of marks) {
+      const d = Math.hypot(m.x - x, m.y - y);
+      if (d <= bestD) { best = m; bestD = d; }
+    }
+    return best;
+  }
+}
