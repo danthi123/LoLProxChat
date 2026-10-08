@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.5.21] — 2026-10-08
+
 ### Added
 - **Shared RESET (Settings, off by default).** When on, pressing RESET or POS also makes everyone else in the game who has it on re-find their champion on the minimap, and their RESETs do the same for you; the panel says who pressed it. Only players who turned it on are affected: the server sends it to nobody else, and the app ignores it with the setting off. Either team can use it, at most once every 15 seconds per game, and someone else's RESET never moves you onto an icon far from where you were. It is ignored while the app is already re-finding you (after a recall, or with you merged with a teammate) or you are dead. Needs the matching server build.
 
