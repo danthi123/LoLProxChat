@@ -30,7 +30,7 @@ describe('VolumeClient.computeVolumes', () => {
     });
   });
 
-  test('passes allyProximity=false through (global/full ally volume — the default)', async () => {
+  test('passes allyProximity=false through (global/full ally volume)', async () => {
     const client = new VolumeClient();
     await client.computeVolumes({ x: 0, y: 0 }, 'room-2', 'Me', false);
 

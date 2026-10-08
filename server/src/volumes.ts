@@ -310,8 +310,9 @@ export function closestApproach(
 /**
  * v0.3 tiered proximity. Server-authoritative team filter.
  *
- * Allies (same team as requester) always come back at 1.0 regardless of
- * distance. Cross-team peers (enemies) come back at their distance-based
+ * Allies (same team as requester) come back at 1.0 regardless of distance,
+ * unless the requester has ally proximity on; then they fade like enemies,
+ * except an ally with no fresh position, who stays at 1.0. Cross-team peers (enemies) come back at their distance-based
  * volume out to MAX_HEARING_RANGE (≈ a champion's vision range): they fade
  * in very faintly as they enter that radius and grow louder as they close.
  * Out-of-range peers are absent from the response entirely (the server
@@ -360,19 +361,29 @@ export function computeTieredVolumes(
   for (const peer of clients) {
     if (peer.name === me.name) continue;
 
-    if (!legacy && peer.team === me.team && !body.allyProximity) {
-      // Global ally voice (default): always full volume, no proximity. We even
-      // skip the staleness check — an ally in SCANNING / long-hold hasn't
-      // reported coords recently but is still actively transmitting audio. What
-      // makes that safe is that a truly-gone peer is removed from room state:
-      // RoomManager.leave on a clean close, and the WebSocket heartbeat
-      // (server/src/heartbeat.ts) for a half-open socket that never fires one.
-      // Without the heartbeat this branch holds a vanished ally at 1.0 for as
-      // long as the OS takes to time the TCP connection out.
-      // (When the requester opts into allyProximity, allies fall through to the
-      // distance falloff below, exactly like cross-team peers.)
+    const ally = !legacy && peer.team === me.team;
+    const allyUnplaced = ally && (!peer.position || peer.position.updatedMs < cutoff);
+    if (ally && (!body.allyProximity || allyUnplaced)) {
+      // Global ally voice (ally proximity off): always full volume, no
+      // proximity. We even skip the staleness check — an ally in SCANNING /
+      // long-hold hasn't reported coords recently but is still actively
+      // transmitting audio. What makes that safe is that a truly-gone peer is
+      // removed from room state: RoomManager.leave on a clean close, and the
+      // WebSocket heartbeat (server/src/heartbeat.ts) for a half-open socket
+      // that never fires one. Without the heartbeat this branch holds a
+      // vanished ally at 1.0 for as long as the OS takes to time the TCP
+      // connection out.
+      //
+      // With ally proximity on (the client default since v0.5.18), allies fall
+      // through to the distance falloff below like cross-team peers — except
+      // one we cannot place. A teammate with no fresh position (game start,
+      // after a recall the tracker lost, after RESET) is heard by their team at
+      // full volume until they are found again, the same team-only fallback
+      // the requester's own client applies while it cannot place itself.
+      // Silencing them instead cut players out of their own team's voice for
+      // as long as their tracking was lost.
       peerVolumes[peer.name] = 1.0;
-      if (DEBUG_VOLUMES) trace.push(peer.name + '[ally team=' + peer.team + ']=1.0');
+      if (DEBUG_VOLUMES) trace.push(peer.name + '[ally team=' + peer.team + (allyUnplaced ? ' UNPLACED' : '') + ']=1.0');
       continue;
     }
 

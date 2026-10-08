@@ -218,6 +218,23 @@ describe('computeTieredVolumes (v0.3 path)', () => {
     expect(result.peerVolumes.AllyBeyond).toBeUndefined();
   });
 
+  it('with allyProximity set, keeps an ally it cannot place at 1.0, but not an enemy', () => {
+    // A teammate whose tracker has not found them (game start, a lost recall,
+    // RESET) falls back to team voice rather than going silent to their team.
+    const old = Date.now() - 60_000;
+    const result = computeTieredVolumes(
+      { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me', allyProximity: true },
+      makeGetter([
+        { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: Date.now() } },
+        { name: 'AllyNoPos', team: 'ORDER' },
+        { name: 'AllyStale', team: 'ORDER', position: { x: 0, y: 0, updatedMs: old } },
+        { name: 'EnemyNoPos', team: 'CHAOS' },
+        { name: 'EnemyStale', team: 'CHAOS', position: { x: 0, y: 0, updatedMs: old } },
+      ]),
+    );
+    expect(result.peerVolumes).toEqual({ AllyNoPos: 1.0, AllyStale: 1.0 });
+  });
+
   it('makes cross-team enemies audible out to vision range, omitting those beyond', () => {
     const result = computeTieredVolumes(
       { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me' },

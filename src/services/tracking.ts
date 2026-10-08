@@ -265,8 +265,8 @@ export class TrackingService {
 
   /**
    * Enable/disable camera-viewport detection. Off costs nothing — the scan is
-   * two extra passes over the mask per frame, so it only runs when someone is
-   * actually listening from their camera. Driven by the orchestrator so the
+   * two extra passes over the mask per frame, so it only runs while Voice on
+   * camera is on (the default since v0.5.18). Driven by the orchestrator so the
    * tracker doesn't need to know about user preferences.
    */
   setCameraTracking(enabled: boolean): void {
