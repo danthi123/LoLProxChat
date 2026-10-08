@@ -279,12 +279,13 @@ export class SignalingService {
   /**
    * Ask everyone in the game with shared RESET on to re-find their icon.
    * Sent only while we are opted in; the server enforces the same and
-   * rate-limits it per room and per sender.
+   * rate-limits it per room and per sender. Returns whether it was sent.
    */
-  requestResetAll(): void {
-    if (!this.sharedReset) return;
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
+  requestResetAll(): boolean {
+    if (!this.sharedReset) return false;
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;
     this.ws.send(JSON.stringify({ type: 'reset_all' }));
+    return true;
   }
 
   /** Current room ID + local player name, for HTTP requests that need them

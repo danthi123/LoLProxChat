@@ -224,9 +224,9 @@ export function handleConnection(
           }
           if (info.sharedReset !== true) return;
           const now = Date.now();
-          if (info.lastResetAllMs !== undefined && now - info.lastResetAllMs < SHARED_RESET_SENDER_MS) return;
+          if (!rooms.senderResetAllowed(info.roomId, info.name, now, SHARED_RESET_SENDER_MS)) return;
           if (!rooms.tryStampRoomReset(info.roomId, now, SHARED_RESET_ROOM_MS)) return;
-          info.lastResetAllMs = now;
+          rooms.stampSenderReset(info.roomId, info.name, now);
           for (const peer of rooms.getOthersInRoom(ws)) {
             if (peer.sharedReset === true) send(peer.ws, { type: 'reset', from: info.name });
           }

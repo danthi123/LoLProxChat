@@ -77,7 +77,7 @@ interface OverlayState {
   localTeam?: 'ORDER' | 'CHAOS' | null;
   lifecycleStatus?: string;
   /** Shared RESET from another player, while the panel should say so. */
-  remoteReset?: { from: string | null; seq: number } | null;
+  remoteReset?: { from: string | null } | null;
 }
 
 const playerList = document.getElementById('player-list')!;
@@ -145,8 +145,8 @@ btnResetHeader.addEventListener('click', resetPosition);
 // gets here — see Orchestrator.handleRemoteReset) and light the POS button,
 // which is all a collapsed panel shows.
 const resetNotice = document.getElementById('reset-notice')!;
-let shownRemoteReset: { from: string | null; seq: number } | null = null;
-function renderRemoteReset(remote: { from: string | null; seq: number } | null): void {
+let shownRemoteReset: { from: string | null } | null = null;
+function renderRemoteReset(remote: { from: string | null } | null): void {
   shownRemoteReset = remote;
   if (!remote) {
     resetNotice.classList.add('hidden');

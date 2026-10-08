@@ -71,6 +71,4 @@ export interface ClientInfo {
   // Shared RESET opt-in, as this connection last declared it. Never carried
   // over from an evicted connection: each connection opts in for itself.
   sharedReset?: boolean;
-  // When this client last had a 'reset_all' relayed (SHARED_RESET_SENDER_MS).
-  lastResetAllMs?: number;
 }

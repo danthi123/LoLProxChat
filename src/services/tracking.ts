@@ -774,32 +774,30 @@ export class TrackingService {
    * we): scan the minimap again. Unlike resetPosition nothing is avoided —
    * nobody has said OUR lock is wrong, only that one in the game was. And the
    * scan starts as if the icon had just been lost where the lock was: an icon
-   * nothing identifies is taken only within walking reach of there, as after
-   * a hold runs out. A clean scan with nothing to go on takes whichever icon
-   * has the cleanest ring, so without this a lock that was right could be
-   * traded for a teammate across the map. Returns false while dead, as
-   * resetPosition does.
+   * nothing identifies is taken only within walking reach of there. A clean
+   * scan with nothing to go on takes whichever icon has the cleanest ring, so
+   * without this a lock that was right could be traded for a teammate across
+   * the map.
+   *
+   * Only from a clean lock. Holding (a recall, our icon covered), merged
+   * with a teammate or already scanning, the tracker is re-finding us
+   * already, with what it knows about the teammates beside us and any RESET
+   * of the user's own; starting over would throw that away and hand the lock
+   * to whichever teammate is nearest. Returns whether it rescanned.
    */
   rescan(): boolean {
-    if (this.state === TrackingState.DEAD) return false;
-    const was = this.state === TrackingState.LOCKED && this.lastPixelPos && this.minimapRegion
-      ? { x: this.lastPixelPos.x - this.minimapRegion.x, y: this.lastPixelPos.y - this.minimapRegion.y }
-      : null;
-    const wasLost = this.lostAt;
+    if (this.state !== TrackingState.LOCKED || this.holdStartMs !== 0 || this.occluded || this.stacked) return false;
+    if (!this.lastPixelPos || !this.minimapRegion) return false;
+    const was = { x: this.lastPixelPos.x - this.minimapRegion.x, y: this.lastPixelPos.y - this.minimapRegion.y };
     this.restartScan();
     this.avoidPoint = null;
     this.avoidOrigin = null;
     this.avoidUntilMs = 0;
-    // Already scanning after a loss: keep that loss's spot and clock.
-    if (was) {
-      this.lostAt = was;
-      this.lostAtMs = performance.now();
-    } else {
-      this.lostAt = wasLost;
-    }
+    this.lostAt = was;
+    this.lostAtMs = performance.now();
     this.debugSink?.markEvent('shared-reset');
-    console.log('[Tracking] Rescanning — shared RESET from another player' +
-      (this.lostAt ? ' (within reach of (' + Math.round(this.lostAt.x) + ',' + Math.round(this.lostAt.y) + '))' : ''));
+    console.log('[Tracking] Rescanning — shared RESET from another player (within reach of (' +
+      Math.round(was.x) + ',' + Math.round(was.y) + '))');
     return true;
   }
 

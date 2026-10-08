@@ -442,6 +442,27 @@ describe('handleConnection', () => {
       expect(p.Bob.received('reset')).toHaveLength(3);
     });
 
+    it('keeps the per-sender limit across a reconnect under the same name', () => {
+      const p = lobby({ Alice: true, Bob: true });
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(1);
+      vi.advanceTimersByTime(SHARED_RESET_ROOM_MS);
+      const alice2 = connect();
+      alice2.deliver({ type: 'join', room: 'r1', name: 'Alice', sharedReset: true });
+      alice2.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(1);
+      vi.advanceTimersByTime(SHARED_RESET_SENDER_MS - SHARED_RESET_ROOM_MS);
+      alice2.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(2);
+    });
+
+    it('takes the opt-in from a repeated join on the same connection', () => {
+      const p = lobby({ Alice: true, Bob: true });
+      p.Bob.deliver({ type: 'join', room: 'r1', name: 'Bob', sharedReset: false });
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(0);
+    });
+
     it('keeps rooms apart', () => {
       const p = lobby({ Alice: true });
       const other = connect();

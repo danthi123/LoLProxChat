@@ -105,7 +105,7 @@ function makeHarness(
     sendSignal: jest.fn(),
     setSharedReset: jest.fn(),
     setOnRemoteReset: jest.fn(),
-    requestResetAll: jest.fn(),
+    requestResetAll: jest.fn(() => true),
   };
   const harness: Harness = {
     gameState,
@@ -516,6 +516,19 @@ describe('the game-state poll', () => {
       expect(h.tracker.rescans).toBe(2);
     });
 
+    it('a reset while the tracker is not on a clean lock is ignored, and does not use up the window', async () => {
+      setSharedReset(true);
+      const h = await startInGame();
+      h.tracker.moveTo(7000, 7000);
+      await jest.advanceTimersByTimeAsync(300);
+      h.tracker.state = TrackingState.SCANNING;
+      remoteReset(h)('Bob');
+      expect(h.tracker.rescans).toBe(0);
+      h.tracker.state = TrackingState.LOCKED;
+      remoteReset(h)('Bob');
+      expect(h.tracker.rescans).toBe(1);
+    });
+
     it('a reset that arrives with the setting off does nothing', async () => {
       const h = await startInGame();
       h.tracker.moveTo(7000, 7000);
@@ -547,7 +560,7 @@ describe('the game-state poll', () => {
       const h = await startInGame();
       const seen = overlayStates();
       remoteReset(h)('Not In This Game');
-      expect(seen[seen.length - 1].remoteReset).toEqual({ from: null, seq: 1 });
+      expect(seen[seen.length - 1].remoteReset).toEqual({ from: null });
 
       const onPeerPosition = h.signaling.joinRoom.mock.calls[0][3];
       onPeerPosition({ summonerName: ROSTER[1].summonerName, championName: ROSTER[1].championName,
@@ -555,7 +568,14 @@ describe('the game-state poll', () => {
       h.tracker.state = TrackingState.LOCKED;
       await jest.advanceTimersByTimeAsync(SHARED_RESET_RECEIVE_MS);
       remoteReset(h)(ROSTER[1].summonerName);
-      expect(seen[seen.length - 1].remoteReset).toEqual({ from: ROSTER[1].summonerName, seq: 2 });
+      expect(seen[seen.length - 1].remoteReset).toEqual({ from: ROSTER[1].summonerName });
+
+      // Present in the room but not on this game's roster: not named.
+      onPeerPosition({ summonerName: 'Stranger#XYZ', championName: 'Teemo', team: 'CHAOS', isMuted: false, isDead: false });
+      h.tracker.state = TrackingState.LOCKED;
+      await jest.advanceTimersByTimeAsync(SHARED_RESET_RECEIVE_MS);
+      remoteReset(h)('Stranger#XYZ');
+      expect(seen[seen.length - 1].remoteReset).toEqual({ from: null });
 
       await jest.advanceTimersByTimeAsync(5000);
       expect(seen[seen.length - 1].remoteReset).toBeNull();

@@ -1257,6 +1257,65 @@ describe('the wrong-lock check at real walking speed', () => {
   });
 });
 
+describe('a shared RESET from another player, when our lock is not clean', () => {
+  // TrackingService.rescan acts only from a clean lock. Holding, merged or
+  // already scanning, the tracker is re-finding us with what it knows about
+  // the teammates beside us; starting over threw that away and handed the
+  // lock to the nearest teammate (v0.5.21 review).
+  const meet = at(START, STEP, 16);
+  const withMate = (self: Point | null, mate: Point): SceneSpec =>
+    ({ ...BACKDROP, self, selfTrail: null, allies: [...BACKDROP.allies!, mate] });
+
+  async function runWith(specs: SceneSpec[], actAt: Record<number, (h: ReturnType<typeof newTracker>) => void>) {
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(sc => sc.frame), { classifier: new ZeroScorer() });
+    const records: Awaited<ReturnType<typeof driveTracker>> = [];
+    for (let i = 0; i < scenes.length; i++) {
+      actAt[i]?.(h);
+      records.push(...await driveTracker(h, [scenes[i]]));
+    }
+    return records;
+  }
+  const lockedOn = (records: Awaited<ReturnType<typeof driveTracker>>, p: Point) =>
+    records.filter(r => r.state === TrackingState.LOCKED && r.holdSec === 0 && distance(r.px!, p) <= 12).length;
+
+  test('during a recall\'s hold, or after it ran out, it never puts us on the teammate beside us', async () => {
+    const mate = { x: meet.x + 40, y: meet.y };
+    const specs = [
+      ...walk(17).map(sc => ({ ...sc, allies: [...BACKDROP.allies!, mate] })),
+      ...Array.from({ length: 120 }, () => withMate(null, mate)),
+    ];
+    let during: boolean | null = null;
+    let after: boolean | null = null;
+    const a = await runWith(specs, { 25: h => { during = h.svc.rescan(); } });
+    const b = await runWith(specs, { 70: h => { after = h.svc.rescan(); } });
+    expect(during).toBe(false);
+    expect(after).toBe(false);
+    expect(lockedOn(a.slice(17), mate)).toBe(0);
+    expect(lockedOn(b.slice(17), mate)).toBe(0);
+  });
+
+  test('merged with a duo partner, it leaves the pair alone', async () => {
+    const mate = { x: meet.x + 18, y: meet.y };
+    const specs = [...walk(17), ...Array.from({ length: 40 }, () => withMate(meet, mate))];
+    let acted: boolean | null = null;
+    const records = await runWith(specs, { 40: h => { acted = h.svc.rescan(); } });
+    expect(acted).toBe(false);
+    for (const r of records.slice(40)) expect(r.state).toBe(TrackingState.LOCKED);
+  });
+
+  test('after our own RESET, it does not undo the avoidance', async () => {
+    const lockSpecs = walk(16);
+    const from = lockSpecs[15].self!;
+    const specs = [...lockSpecs, ...Array.from({ length: 48 }, () => ({ ...BACKDROP, self: from, selfTrail: null }))];
+    let acted: boolean | null = null;
+    const own = await runWith(specs, { 16: h => h.svc.resetPosition() });
+    const both = await runWith(specs, { 16: h => h.svc.resetPosition(), 18: h => { acted = h.svc.rescan(); } });
+    expect(acted).toBe(false);
+    expect(both.map(r => r.state)).toEqual(own.map(r => r.state));
+  });
+});
+
 describe('RESET pressed when the lock was right', () => {
   const NEAR_ALLY: Point = { x: 120, y: 120 };
 
