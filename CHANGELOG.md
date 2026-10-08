@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.5.16] — 2026-10-07
+
 ### Fixed
 - **A player with League's streamer mode on was alone in their own voice room.** The room everyone meets in is worked out from the players' names, and streamer mode replaces every name on the streamer's own client with the champion name — so in a 7-player test one player computed a different room from the other six and never met anyone. The room now uses each player's Riot ID wherever streamer mode has hidden the name, which is what everyone else's client sees; players without streamer mode get the same room as before, so this works alongside older versions.
 - **A blocked microphone no longer silently cancels voice chat.** The app now grants its own windows microphone access, so a "Block" clicked once on the microphone permission prompt can no longer lock it out. If the microphone still can't be opened (Windows Settings › Privacy › Microphone › "Let desktop apps access your microphone" turned off, or no device), you still hear everyone, the panel says "Microphone blocked — listening only", and the app retries every 10 seconds, so fixing the setting or plugging in a headset picks up without restarting. Before, the session was dropped and the panel looked normal.
