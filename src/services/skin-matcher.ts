@@ -424,6 +424,7 @@ export class SkinAwareScorer implements BlobScorer {
   private sets: TemplateSet[] = [];
   private tally = { self: 0, other: 0, unsure: 0 };
   private lastTallyLogMs = 0;
+  private verdicts: Array<'self' | 'teammate' | null> = [];
 
   /** `teamIds`: every player on the local player's team, `selfId` among them. */
   constructor(
@@ -456,21 +457,29 @@ export class SkinAwareScorer implements BlobScorer {
     return this.sets.length > 0;
   }
 
+  lastVerdicts(): Array<'self' | 'teammate' | null> {
+    return this.verdicts;
+  }
+
   lastCrops(): ImageData[] {
     return this.inner?.lastCrops?.() ?? [];
   }
 
   async scoreBlobsForLocalChampion(frame: CaptureFrame, blobs: BlobCropBox[]): Promise<number[]> {
+    this.verdicts = blobs.map(() => null);
     if (!this.inner?.isLoaded()) return blobs.map(() => 0);
     const model = await this.inner.scoreBlobsForLocalChampion(frame, blobs);
     if (this.sets.length === 0) return model;
+    const verdicts: Array<'self' | 'teammate' | null> = [];
     const scores = blobs.map((b, i) => {
       const who = whoseIcon(frame, b, this.sets);
-      if (who === this.selfId) { this.tally.self++; return Math.max(model[i], SKIN_SELF_RAW); }
-      if (who !== null) { this.tally.other++; return 0; }
+      if (who === this.selfId) { this.tally.self++; verdicts.push('self'); return Math.max(model[i], SKIN_SELF_RAW); }
+      if (who !== null) { this.tally.other++; verdicts.push('teammate'); return 0; }
       this.tally.unsure++;
+      verdicts.push(null);
       return model[i];
     });
+    this.verdicts = verdicts;
     const now = Date.now();
     if (now - this.lastTallyLogMs >= 60_000) {
       if (this.lastTallyLogMs > 0) {

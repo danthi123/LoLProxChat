@@ -16,7 +16,9 @@ import {
   probeMicPermission,
 } from '../services/devices';
 import { getForceTurnRelay, setForceTurnRelay } from '../services/privacy';
-import { getAllyProximity, setAllyProximity, getCameraListen, setCameraListen } from '../services/audio-prefs';
+import {
+  getAllyProximity, setAllyProximity, getCameraListen, setCameraListen, getSharedReset, setSharedReset,
+} from '../services/audio-prefs';
 import { computeDesiredHeight, shouldSendSize } from './resize-helpers';
 import { browserKeyToWin32Vk, humanizeVk } from '../core/keymap';
 import {
@@ -74,6 +76,8 @@ interface OverlayState {
   detectedMinimapBounds?: { screenX: number; screenY: number; screenWidth: number; screenHeight: number } | null;
   localTeam?: 'ORDER' | 'CHAOS' | null;
   lifecycleStatus?: string;
+  /** Shared RESET from another player, while the panel should say so. */
+  remoteReset?: { from: string | null } | null;
 }
 
 const playerList = document.getElementById('player-list')!;
@@ -130,12 +134,31 @@ function resetPosition(): void {
   if (resetFeedbackId !== null) clearTimeout(resetFeedbackId);
   resetFeedbackId = setTimeout(() => {
     btnResetPosition.textContent = t('settings.reset');
-    btnResetHeader.classList.remove('searching');
+    if (!shownRemoteReset) btnResetHeader.classList.remove('searching');
     resetFeedbackId = null;
   }, 2000);
 }
 btnResetPosition.addEventListener('click', resetPosition);
 btnResetHeader.addEventListener('click', resetPosition);
+
+// Shared RESET from another player: say who (only a name in this room ever
+// gets here — see Orchestrator.handleRemoteReset) and light the POS button,
+// which is all a collapsed panel shows.
+const resetNotice = document.getElementById('reset-notice')!;
+let shownRemoteReset: { from: string | null } | null = null;
+function renderRemoteReset(remote: { from: string | null } | null): void {
+  shownRemoteReset = remote;
+  if (!remote) {
+    resetNotice.classList.add('hidden');
+    if (resetFeedbackId === null) btnResetHeader.classList.remove('searching');
+    return;
+  }
+  resetNotice.textContent = remote.from
+    ? t('notice.sharedReset', { name: remote.from })
+    : t('notice.sharedResetAnon');
+  resetNotice.classList.remove('hidden');
+  btnResetHeader.classList.add('searching');
+}
 
 btnSettings.addEventListener('click', () => {
   settingsPanel.classList.toggle('hidden');
@@ -318,6 +341,20 @@ queueMicrotask(syncCameraListenButton);
 btnCameraListen.addEventListener('click', () => {
   setCameraListen(!getCameraListen());
   syncCameraListenButton();
+});
+
+// Shared RESET (opt-in, off by default): see audio-prefs.ts.
+const btnSharedReset = document.getElementById('btn-shared-reset') as HTMLButtonElement;
+function syncSharedResetButton(): void {
+  const on = getSharedReset();
+  btnSharedReset.textContent = onOff(on);
+  btnSharedReset.classList.toggle('active', on);
+}
+queueMicrotask(syncSharedResetButton);
+btnSharedReset.addEventListener('click', () => {
+  // Reaches the server on the next position tick (Orchestrator).
+  setSharedReset(!getSharedReset());
+  syncSharedResetButton();
 });
 
 // v0.3 (#1): PTT + toggle-mute key rebind. The Rust WH_KEYBOARD_LL hook
@@ -704,6 +741,8 @@ function renderState(state: OverlayState): void {
     }
   }
 
+  renderRemoteReset(state.remoteReset ?? null);
+
   // Show/hide empty state with lifecycle-aware text
   const emptyText = state.lifecycleStatus ? translateStatus(state.lifecycleStatus) : t('players.waiting');
   const emptyState = playerList.querySelector('.empty-state');
@@ -762,6 +801,7 @@ function applyLanguage(): void {
   syncForceTurnButton();
   syncAllyProximityButton();
   syncCameraListenButton();
+  syncSharedResetButton();
   btnDebug.textContent = onOff(debugEnabled);
   for (const relabel of bindRelabelers) relabel();
   if (updateStatusMsg) updateStatus.textContent = t(updateStatusMsg.key, updateStatusMsg.params);

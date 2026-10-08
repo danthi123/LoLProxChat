@@ -31,7 +31,10 @@ jest.mock('@tauri-apps/api/core', () => ({
 jest.mock('@tauri-apps/api/event', () => ({ emit: jest.fn(async () => undefined) }));
 
 import { invoke } from '@tauri-apps/api/core';
-import { Orchestrator, OrchestratorDeps, defaultDeps, STATUS_MIC_BLOCKED } from '../../src/services/orchestrator';
+import {
+  Orchestrator, OrchestratorDeps, defaultDeps, STATUS_MIC_BLOCKED, SHARED_RESET_RECEIVE_MS,
+} from '../../src/services/orchestrator';
+import { setSharedReset } from '../../src/services/audio-prefs';
 import { AudioService } from '../../src/services/audio';
 import { GameStateService } from '../../src/services/game-state';
 import { SignalingService } from '../../src/services/signaling';
@@ -39,7 +42,7 @@ import { TrackingService, TrackingState } from '../../src/services/tracking';
 import { VolumeClient } from '../../src/services/volume-client';
 import { PeerConnection } from '../../src/services/peer-connection';
 import { Player } from '../../src/core/types';
-import { installDomShims } from '../e2e/setup/dom';
+import { installDomShims, clearStoredPrefs } from '../e2e/setup/dom';
 import { setLoggingEnabled } from '../../src/core/logging';
 import { installWebAudioFakes } from '../e2e/fakes/webaudio';
 import { FakePeerConnection } from '../e2e/fakes/peer';
@@ -100,6 +103,9 @@ function makeHarness(
     broadcastPosition: jest.fn(),
     sendCoords: jest.fn(),
     sendSignal: jest.fn(),
+    setSharedReset: jest.fn(),
+    setOnRemoteReset: jest.fn(),
+    requestResetAll: jest.fn(() => true),
   };
   const harness: Harness = {
     gameState,
@@ -451,6 +457,129 @@ describe('the game-state poll', () => {
     expect(h.tracker.getState()).toBe(TrackingState.DEAD);
     expect(sendCoords.mock.calls.length).toBeGreaterThan(0);
     for (const c of sendCoords.mock.calls) expect(c[2]).toBe(false);
+  });
+
+  describe('shared RESET', () => {
+    afterEach(() => clearStoredPrefs());
+
+    /** What the signaling layer hands on when another player's reset arrives. */
+    const remoteReset = (h: Harness) =>
+      (h.signaling as any).setOnRemoteReset.mock.calls[0][0] as (from: string) => void;
+    const overlayStates = (): any[] => {
+      const seen: any[] = [];
+      window.addEventListener('overlayUpdate', ((e: CustomEvent) => { seen.push(e.detail); }) as EventListener);
+      return seen;
+    };
+
+    it('declares the setting before joining, and passes on each change', async () => {
+      setSharedReset(true);
+      const h = await startInGame();
+      const set = (h.signaling as any).setSharedReset as jest.Mock;
+      expect(set.mock.invocationCallOrder[0]).toBeLessThan(h.signaling.joinRoom.mock.invocationCallOrder[0]);
+      expect(set).toHaveBeenLastCalledWith(true);
+
+      setSharedReset(false);
+      await jest.advanceTimersByTimeAsync(300);
+      expect(set).toHaveBeenLastCalledWith(false);
+    });
+
+    it('RESET asks the others to rescan only with the setting on', async () => {
+      const h = await startInGame();
+      const requestResetAll = (h.signaling as any).requestResetAll as jest.Mock;
+      h.orchestrator.resetPosition();
+      expect(requestResetAll).not.toHaveBeenCalled();
+
+      setSharedReset(true);
+      h.orchestrator.resetPosition();
+      expect(requestResetAll).toHaveBeenCalledTimes(1);
+      expect(h.tracker.resets).toBe(2);
+    });
+
+    it('another player\'s reset rescans without avoiding anything, at most once per window', async () => {
+      setSharedReset(true);
+      const h = await startInGame();
+      h.tracker.moveTo(7000, 7000);
+      await jest.advanceTimersByTimeAsync(300);
+
+      remoteReset(h)('Bob');
+      expect(h.tracker.rescans).toBe(1);
+      expect(h.tracker.resets).toBe(0);
+      expect(h.tracker.getState()).toBe(TrackingState.SCANNING);
+
+      h.tracker.state = TrackingState.LOCKED;
+      await jest.advanceTimersByTimeAsync(SHARED_RESET_RECEIVE_MS - 1000);
+      remoteReset(h)('Bob');
+      expect(h.tracker.rescans).toBe(1);
+
+      await jest.advanceTimersByTimeAsync(1000);
+      remoteReset(h)('Bob');
+      expect(h.tracker.rescans).toBe(2);
+    });
+
+    it('a reset while the tracker is not on a clean lock is ignored, and does not use up the window', async () => {
+      setSharedReset(true);
+      const h = await startInGame();
+      h.tracker.moveTo(7000, 7000);
+      await jest.advanceTimersByTimeAsync(300);
+      h.tracker.state = TrackingState.SCANNING;
+      remoteReset(h)('Bob');
+      expect(h.tracker.rescans).toBe(0);
+      h.tracker.state = TrackingState.LOCKED;
+      remoteReset(h)('Bob');
+      expect(h.tracker.rescans).toBe(1);
+    });
+
+    it('a reset that arrives with the setting off does nothing', async () => {
+      const h = await startInGame();
+      h.tracker.moveTo(7000, 7000);
+      await jest.advanceTimersByTimeAsync(300);
+      remoteReset(h)('Bob');
+      expect(h.tracker.rescans).toBe(0);
+      expect(h.tracker.getState()).toBe(TrackingState.LOCKED);
+    });
+
+    it('a reset while dead leaves the body where it is, and does not use up the window', async () => {
+      setSharedReset(true);
+      const h = await startInGame();
+      h.tracker.moveTo(7000, 7000);
+      await jest.advanceTimersByTimeAsync(300);
+      h.gameState.setDead(true, 5);
+      await jest.advanceTimersByTimeAsync(1000);
+      await settle();
+      remoteReset(h)('Bob');
+      expect(h.tracker.getState()).toBe(TrackingState.DEAD);
+
+      h.tracker.onRespawn();
+      h.tracker.state = TrackingState.LOCKED;
+      remoteReset(h)('Bob');
+      expect(h.tracker.rescans).toBe(1);
+    });
+
+    it('the panel names the sender only when they are a player in this room', async () => {
+      setSharedReset(true);
+      const h = await startInGame();
+      const seen = overlayStates();
+      remoteReset(h)('Not In This Game');
+      expect(seen[seen.length - 1].remoteReset).toEqual({ from: null });
+
+      const onPeerPosition = h.signaling.joinRoom.mock.calls[0][3];
+      onPeerPosition({ summonerName: ROSTER[1].summonerName, championName: ROSTER[1].championName,
+        team: ROSTER[1].team, isMuted: false, isDead: false });
+      h.tracker.state = TrackingState.LOCKED;
+      await jest.advanceTimersByTimeAsync(SHARED_RESET_RECEIVE_MS);
+      remoteReset(h)(ROSTER[1].summonerName);
+      expect(seen[seen.length - 1].remoteReset).toEqual({ from: ROSTER[1].summonerName });
+
+      // Present in the room but not on this game's roster: not named.
+      onPeerPosition({ summonerName: 'Stranger#XYZ', championName: 'Teemo', team: 'CHAOS', isMuted: false, isDead: false });
+      h.tracker.state = TrackingState.LOCKED;
+      await jest.advanceTimersByTimeAsync(SHARED_RESET_RECEIVE_MS);
+      remoteReset(h)('Stranger#XYZ');
+      expect(seen[seen.length - 1].remoteReset).toEqual({ from: null });
+
+      await jest.advanceTimersByTimeAsync(5000);
+      expect(seen[seen.length - 1].remoteReset).toBeNull();
+    });
   });
 
   it('ignores the top-level isDead, which League never actually sends', async () => {

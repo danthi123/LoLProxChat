@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import type { WebSocket } from 'ws';
 import { RoomManager } from '../src/rooms.js';
-import { handleConnection, TAKEOVER_CLOSE_CODE } from '../src/ws-handler.js';
+import { handleConnection, TAKEOVER_CLOSE_CODE, SHARED_RESET_ROOM_MS, SHARED_RESET_SENDER_MS } from '../src/ws-handler.js';
 import { Heartbeat, type LivenessTracker, type PingableSocket } from '../src/heartbeat.js';
 import type { ServerMessage } from '../src/types.js';
 
@@ -369,6 +369,113 @@ describe('handleConnection', () => {
       });
 
       expect(() => sock.deliver({ type: 'coords', x: 1, y: 2 })).not.toThrow();
+    });
+  });
+
+  describe('shared RESET (opt-in)', () => {
+    function lobby(optIns: Record<string, boolean | undefined>): Record<string, FakeSocket> {
+      const out: Record<string, FakeSocket> = {};
+      for (const [name, sharedReset] of Object.entries(optIns)) {
+        out[name] = connect();
+        out[name].deliver({ type: 'join', room: 'r1', name, ...(sharedReset === undefined ? {} : { sharedReset }) });
+      }
+      return out;
+    }
+
+    it('relays a reset only to the others who opted in, with the sender\'s name and nothing else', () => {
+      const p = lobby({ Alice: true, Bob: true, Carol: false, Dave: undefined, Erin: true });
+      p.Alice.deliver({ type: 'reset_all', payload: { evil: 1 }, x: 5 });
+      expect(p.Bob.received('reset')).toEqual([{ type: 'reset', from: 'Alice' }]);
+      expect(p.Erin.received('reset')).toEqual([{ type: 'reset', from: 'Alice' }]);
+      // Not opted in (off, or a client too old to know the setting): nothing.
+      expect(p.Carol.received('reset')).toHaveLength(0);
+      expect(p.Dave.received('reset')).toHaveLength(0);
+      // Never echoed back.
+      expect(p.Alice.received('reset')).toHaveLength(0);
+    });
+
+    it('ignores a reset from a client that has not opted in itself', () => {
+      const p = lobby({ Alice: false, Bob: true });
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(0);
+    });
+
+    it('follows the setting when it is flipped mid-game, either way', () => {
+      const p = lobby({ Alice: true, Bob: false });
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(0);
+      p.Bob.deliver({ type: 'shared_reset', on: true });
+      vi.advanceTimersByTime(SHARED_RESET_SENDER_MS);
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(1);
+      p.Bob.deliver({ type: 'shared_reset', on: 'yes' }); // not literally true: off
+      vi.advanceTimersByTime(SHARED_RESET_SENDER_MS);
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(1);
+    });
+
+    it('does not carry an opt-in over to a connection that takes over the name', () => {
+      const p = lobby({ Alice: true, Bob: true });
+      const bob2 = connect();
+      bob2.deliver({ type: 'join', room: 'r1', name: 'Bob' });
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(bob2.received('reset')).toHaveLength(0);
+    });
+
+    it('is rate limited per room and per sender', () => {
+      const p = lobby({ Alice: true, Bob: true, Carol: true });
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(1);
+      // Anyone else in the same room, too soon: dropped.
+      vi.advanceTimersByTime(SHARED_RESET_ROOM_MS - 1);
+      p.Carol.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(1);
+      // Past the room's cooldown, Carol may; Alice, within her own, may not.
+      vi.advanceTimersByTime(1);
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(1);
+      p.Carol.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toEqual([{ type: 'reset', from: 'Alice' }, { type: 'reset', from: 'Carol' }]);
+      // Sender cooldown longer than the room's: Alice again only after hers.
+      vi.advanceTimersByTime(SHARED_RESET_SENDER_MS - SHARED_RESET_ROOM_MS);
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(3);
+    });
+
+    it('keeps the per-sender limit across a reconnect under the same name', () => {
+      const p = lobby({ Alice: true, Bob: true });
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(1);
+      vi.advanceTimersByTime(SHARED_RESET_ROOM_MS);
+      const alice2 = connect();
+      alice2.deliver({ type: 'join', room: 'r1', name: 'Alice', sharedReset: true });
+      alice2.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(1);
+      vi.advanceTimersByTime(SHARED_RESET_SENDER_MS - SHARED_RESET_ROOM_MS);
+      alice2.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(2);
+    });
+
+    it('takes the opt-in from a repeated join on the same connection', () => {
+      const p = lobby({ Alice: true, Bob: true });
+      p.Bob.deliver({ type: 'join', room: 'r1', name: 'Bob', sharedReset: false });
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(p.Bob.received('reset')).toHaveLength(0);
+    });
+
+    it('keeps rooms apart', () => {
+      const p = lobby({ Alice: true });
+      const other = connect();
+      other.deliver({ type: 'join', room: 'r2', name: 'Zed', sharedReset: true });
+      p.Alice.deliver({ type: 'reset_all' });
+      expect(other.received('reset')).toHaveLength(0);
+    });
+
+    it('needs a room', () => {
+      const sock = connect();
+      sock.deliver({ type: 'reset_all' });
+      sock.deliver({ type: 'shared_reset', on: true });
+      expect(sock.received('error')).toHaveLength(2);
     });
   });
 });

@@ -32,6 +32,10 @@ import {
   CAMERA_DWELL_MIN_READABLE_MS,
   CAMERA_DWELL_LOW,
   CAMERA_DWELL_MIN_READABLE_SHARE,
+  TeammateVerdicts,
+  discShare,
+  filledIconRing,
+  outlineRoundness,
 } from '../../src/services/tracking-helpers';
 import type { Blob } from '../../src/services/blob-types';
 
@@ -717,5 +721,157 @@ describe('cameraFavourite and cameraSwitchTarget', () => {
     const list = [r(0.1, 20_000, 0), r(0.7, 20_000, 50)];
     expect(readingNear(list, { x: 48, y: 0 }, 10)).toBe(list[1]);
     expect(readingNear(list, { x: 25, y: 0 }, 10)).toBeNull();
+  });
+});
+
+// ---------- Icons whose art is teal ----------
+
+/** A W x W mask and a Blob over everything set in it, as findBlobs makes them. */
+function maskOf(W: number, paint: (x: number, y: number) => boolean): { mask: Uint8Array; blob: Blob } {
+  const mask = new Uint8Array(W * W);
+  let minX = W, maxX = -1, minY = W, maxY = -1, n = 0, sx = 0, sy = 0;
+  for (let y = 0; y < W; y++) {
+    for (let x = 0; x < W; x++) {
+      if (!paint(x, y)) continue;
+      mask[y * W + x] = 1;
+      n++; sx += x; sy += y;
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+    }
+  }
+  return {
+    mask,
+    blob: {
+      color: 'teal', pixels: n, cx: Math.round(sx / n), cy: Math.round(sy / n), minX, maxX, minY, maxY,
+      fillRatio: n / ((maxX - minX + 1) * (maxY - minY + 1)),
+    },
+  };
+}
+
+describe('filledIconRing — an icon whose own art is teal', () => {
+  const W = 60;
+  const C = 30;
+  const R = 13.5; // a 28px icon, the expected diameter 26
+  const ringAt = (x: number, y: number) => { const d = Math.hypot(x - C, y - C); return d <= R && d > R - 2.5; };
+  // Hair framing the face: the upper part, clear of the centre.
+  const hair = (x: number, y: number) => { const d = Math.hypot(x - C, y - C); return d <= R && d > R * 0.5 && y - C <= R * 0.5; };
+
+  test('Gwen: ring and hair in one blob, too filled for a bare ring, is an icon — centred on its ring', () => {
+    const { mask, blob } = maskOf(W, (x, y) => ringAt(x, y) || hair(x, y));
+    expect(blob.fillRatio).toBeGreaterThan(0.4);
+    // The pixel centroid is pulled up into the hair; the ring's centre is not.
+    expect(blob.cy).toBeLessThan(C);
+    expect(filledIconRing(blob, mask, W, W)).toEqual({ cx: C, cy: C });
+  });
+
+  test('Gwen with a minion against her ring is still an icon, centred on the ring (v0.5.21 review)', () => {
+    // The dot widens the box by a few pixels, which put the box centre — and
+    // every measure taken from it — off the ring.
+    const dot = (x: number, y: number) => Math.hypot(x - (C + R + 2), y - (C + 3)) <= 2.5;
+    const { mask, blob } = maskOf(W, (x, y) => ringAt(x, y) || hair(x, y) || dot(x, y));
+    expect(blob.maxX - blob.minX + 1).toBeGreaterThan(2 * R + 3);
+    const at = filledIconRing(blob, mask, W, W)!;
+    expect(at).not.toBeNull();
+    expect(Math.hypot(at.cx - C, at.cy - C)).toBeLessThanOrEqual(1);
+  });
+
+  test('...and with a minion wave against it, the wave is left out of the fit', async () => {
+    const wave = [[C + R + 2, C + 3], [C + R + 3, C - 3], [C + R + 1, C + 8], [C + R + 4, C + 1]];
+    const { mask, blob } = maskOf(W, (x, y) =>
+      ringAt(x, y) || hair(x, y) || wave.some(([dx, dy]) => Math.hypot(x - dx, y - dy) <= 2.5));
+    const at = filledIconRing(blob, mask, W, W)!;
+    expect(at).not.toBeNull();
+    expect(Math.hypot(at.cx - C, at.cy - C)).toBeLessThanOrEqual(1);
+  });
+
+  test('a shallow arc, whose circle is centred far off it: not an icon', () => {
+    const { mask, blob } = maskOf(W, (x, y) => {
+      const d = Math.hypot(x - C, y - (C + 40));
+      return d <= 52 && d > 46 && Math.abs(x - C) <= 13;
+    });
+    expect(filledIconRing(blob, mask, W, W)).toBeNull();
+  });
+
+  test('a solid disc is round and ringed too, but teal right through: not an icon', () => {
+    const { mask, blob } = maskOf(W, (x, y) => Math.hypot(x - C, y - C) <= R);
+    expect(discShare(mask, W, W, C, C, R * 0.6, 1)).toBe(1);
+    expect(filledIconRing(blob, mask, W, W)).toBeNull();
+  });
+
+  test('a turret and the minions round it: not round, not an icon', () => {
+    // A shield-shaped marker with dots scattered round it, some touching.
+    const dots = [[C - 12, C - 2], [C + 11, C + 3], [C - 5, C + 11], [C + 4, C - 12], [C + 9, C - 8]];
+    const { mask, blob } = maskOf(W, (x, y) =>
+      (Math.abs(x - C) <= 8 && y >= C - 9 && y <= C + 7 - Math.abs(x - C) / 2) ||
+      dots.some(([dx, dy]) => Math.hypot(x - dx, y - dy) <= 2.5) ||
+      (Math.abs(y - C) <= 1 && Math.abs(x - C) <= 12));
+    expect(blob.fillRatio).toBeGreaterThan(0.4);
+    expect(filledIconRing(blob, mask, W, W)).toBeNull();
+  });
+
+  test('an oval band, hollow in the middle, is not round: not an icon', () => {
+    // The shape of the 2026-10-08 turret ringed by its minions: filled past
+    // 0.4 and clear in the centre, like an icon — only its outline is not a
+    // circle.
+    const { mask, blob } = maskOf(W, (x, y) => {
+      const e = Math.hypot((x - C) / 13, (y - C) / 8);
+      return e <= 1 && e > 0.55;
+    });
+    expect(blob.fillRatio).toBeGreaterThan(0.4);
+    expect(discShare(mask, W, W, C, C, ((blob.maxX - blob.minX + blob.maxY - blob.minY + 2) / 4) * 0.6, 1)).toBeLessThanOrEqual(0.6);
+    expect(filledIconRing(blob, mask, W, W)).toBeNull();
+  });
+
+  test('two icons merged into one blob stay rejected, as before', () => {
+    const { mask, blob } = maskOf(W, (x, y) =>
+      (ringAt(x + 8, y) || hair(x + 8, y)) || (ringAt(x - 8, y) || hair(x - 8, y)));
+    expect(filledIconRing(blob, mask, W, W)).toBeNull();
+  });
+
+  test('the measures themselves', () => {
+    const { mask } = maskOf(W, ringAt);
+    expect(outlineRoundness(mask, W, W, C, C, R + 3, 1)).toBe(1);
+    expect(discShare(mask, W, W, C, C, R * 0.6, 1)).toBe(0);
+    // Half a ring: round only where it is.
+    const half = maskOf(W, (x, y) => ringAt(x, y) && x >= C).mask;
+    expect(outlineRoundness(half, W, W, C, C, R + 3, 1)).toBeCloseTo(0.5, 1);
+  });
+});
+
+describe('TeammateVerdicts', () => {
+  const D = 24;
+  const MATE = { x: 100, y: 100 };
+
+  test('two teammate verdicts in a row set an icon aside; one is enough only when asked', () => {
+    const v = new TeammateVerdicts();
+    v.update([MATE], ['teammate'], 0, D);
+    expect(v.isTeammate(MATE.x, MATE.y, 0, D)).toBe(false);
+    expect(v.isTeammate(MATE.x, MATE.y, 0, D, 1)).toBe(true);
+    v.update([{ x: 102, y: 101 }], ['teammate'], 500, D); // it moved a little
+    expect(v.isTeammate(103, 101, 500, D)).toBe(true);
+    // Somewhere else entirely is not it.
+    expect(v.isTeammate(160, 100, 500, D)).toBe(false);
+  });
+
+  test('a verdict of "you" clears it at once; an unsure run keeps it, without adding', () => {
+    const v = new TeammateVerdicts();
+    v.update([MATE], ['teammate'], 0, D);
+    v.update([MATE], [null], 500, D);
+    expect(v.isTeammate(MATE.x, MATE.y, 500, D)).toBe(false);
+    v.update([MATE], ['teammate'], 1000, D);
+    expect(v.isTeammate(MATE.x, MATE.y, 1000, D)).toBe(true);
+    v.update([MATE], [null], 1500, D);
+    expect(v.isTeammate(MATE.x, MATE.y, 1500, D)).toBe(true);
+    v.update([MATE], ['self'], 2000, D);
+    expect(v.isTeammate(MATE.x, MATE.y, 2000, D, 1)).toBe(false);
+  });
+
+  test('goes stale without fresh verdicts, and forgets icons no longer scored', () => {
+    const v = new TeammateVerdicts();
+    v.update([MATE], ['teammate'], 0, D);
+    v.update([MATE], ['teammate'], 500, D);
+    expect(v.isTeammate(MATE.x, MATE.y, 2500, D)).toBe(true);
+    expect(v.isTeammate(MATE.x, MATE.y, 2501, D)).toBe(false);
+    v.update([{ x: 20, y: 20 }], [null], 600, D);
+    expect(v.isTeammate(MATE.x, MATE.y, 600, D, 1)).toBe(false);
   });
 });

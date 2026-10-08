@@ -17,6 +17,7 @@ import {
   encodeFrame,
   ovalRing,
   portraitArt,
+  tealArt,
   ring,
   setPixel,
   SynthFrame,
@@ -81,7 +82,7 @@ function inspectEncoded(encoded: ArrayBuffer): Inspection {
     createMask(f: unknown, r: unknown): Uint8Array;
     dilate(m: Uint8Array, w: number, h: number): Uint8Array;
     findBlobs(m: Uint8Array, w: number, h: number): Blob[];
-    filterIconBlobs(b: Blob[]): Blob[];
+    filterIconBlobs(b: Blob[], m: Uint8Array, w: number, h: number): Blob[];
     buildWhiteMasks(f: unknown, r: unknown): { whiteMask: Uint8Array; viewportMask: Uint8Array };
     whitePixelScore(b: Blob, w: Uint8Array, v: Uint8Array, rw: number, rh: number): number;
   };
@@ -93,7 +94,7 @@ function inspectEncoded(encoded: ArrayBuffer): Inspection {
 
   return {
     allBlobs,
-    iconBlobs: inner.filterIconBlobs(allBlobs),
+    iconBlobs: inner.filterIconBlobs(allBlobs, mask, REGION.width, REGION.height),
     whiteMask,
     viewportMask,
     whiteScore: (b) => inner.whitePixelScore(b, whiteMask, viewportMask, REGION.width, REGION.height),
@@ -244,7 +245,7 @@ describe('icon ring thickness is load-bearing', () => {
       createMask(f: unknown, r: unknown): Uint8Array;
       dilate(m: Uint8Array, w: number, h: number): Uint8Array;
       findBlobs(m: Uint8Array, w: number, h: number): Blob[];
-      filterIconBlobs(b: Blob[]): Blob[];
+      filterIconBlobs(b: Blob[], m: Uint8Array, w: number, h: number): Blob[];
     };
     const f = blankFrame(CAPTURE_SIZE, CAPTURE_SIZE);
     ring(f, REGION.x + SELF.x, REGION.y + SELF.y, ICON_DIAM, TEAL, thickness);
@@ -252,13 +253,15 @@ describe('icon ring thickness is load-bearing', () => {
     const mask = inner.dilate(inner.createMask(frame, REGION), REGION.width, REGION.height);
     const blobs = inner.findBlobs(mask, REGION.width, REGION.height);
     expect(blobs).toHaveLength(1);
-    return { fill: blobs[0].fillRatio, accepted: inner.filterIconBlobs(blobs).length === 1 };
+    return { fill: blobs[0].fillRatio, accepted: inner.filterIconBlobs(blobs, mask, REGION.width, REGION.height).length === 1 };
   }
 
-  test('the default thickness clears the 0.40 fill cap, and thickness 3 does not', () => {
+  test('the default thickness clears the 0.40 fill cap, and thickness 3 passes only as a round ring', () => {
     // dilate() fattens every border by a pixel on each side before detection,
-    // so a ring drawn one pixel thicker than it looks is a ring that vanishes.
-    // At ICON_DIAM=24: 1 -> 0.263, 2 -> 0.340, 3 -> 0.417 (rejected).
+    // so a ring drawn one pixel thicker than it looks goes past the bare-ring
+    // fill cap. At ICON_DIAM=24: 1 -> 0.263, 2 -> 0.340, 3 -> 0.417. Until
+    // v0.5.21 that made it vanish; now a blob past the cap that is round and
+    // hollow in the middle is still an icon (filledIconRing).
     const t1 = fillRatioFor(1);
     const t2 = fillRatioFor(2);
     const t3 = fillRatioFor(3);
@@ -268,7 +271,7 @@ describe('icon ring thickness is load-bearing', () => {
     expect(t2.fill).toBeLessThan(0.40);
     expect(t2.accepted).toBe(true);
     expect(t3.fill).toBeGreaterThan(0.40);
-    expect(t3.accepted).toBe(false);
+    expect(t3.accepted).toBe(true);
   });
 });
 
@@ -374,7 +377,7 @@ describe('the frames are not easier than a real minimap', () => {
     expect(near(thick.iconBlobs[0], AT, 1)).toBe(true);
   });
 
-  test('champion art inside the border is tolerated only up to about a tenth cyan', () => {
+  test('cyan champion art is tolerated up to about a sixth of the portrait, or anywhere off its centre', () => {
     // Scenes here draw hollow rings on flat fog. A real icon is a portrait, and
     // every portrait pixel classifyPixel calls teal joins the border's blob —
     // then dilate() spreads each one into a five-pixel cross — so the interior
@@ -390,13 +393,30 @@ describe('the frames are not easier than a real minimap', () => {
     expect(near(typical.iconBlobs[0], AT, 2)).toBe(true);
     expect(typical.iconBlobs[0].fillRatio).toBeLessThan(0.40);
 
-    // HONEST LIMIT: past roughly a tenth, the icon stops existing as far as the
-    // tracker is concerned — detected as a blob, rejected as too dense, never
-    // offered to the scorer. Nothing in this repo measures how many of the 172
-    // champion icons land on the wrong side of that line; only a real capture
-    // can, and this suite's green run is not evidence about it either way.
+    // Until v0.5.21 this was the HONEST LIMIT: past roughly a tenth the icon
+    // stopped existing as far as the tracker was concerned — and in the
+    // 2026-10-08 evening game that was Gwen, invisible on every frame. A blob
+    // past the cap that is round and not teal in the middle now passes
+    // (filledIconRing): at 0.15 scattered evenly it does...
+    const sixth = withArt(0.15);
+    expect(sixth.allBlobs[0].fillRatio).toBeGreaterThan(0.40);
+    expect(sixth.iconBlobs).toHaveLength(1);
+    expect(near(sixth.iconBlobs[0], AT, 1)).toBe(true);
+
+    // ...at 0.20 scattered evenly the middle is too teal, and it still does not.
     const cyanHeavy = withArt(0.20);
     expect(cyanHeavy.iconBlobs).toHaveLength(0);
     expect(cyanHeavy.allBlobs[0].fillRatio).toBeGreaterThan(0.40);
+
+    // Real teal art keeps off the face — Gwen's hair frames it — and passes
+    // whatever its amount (fill 0.41-0.63 in real games).
+    const hair = bare(f => {
+      const c = frameAt(AT);
+      tealArt(f, c.x, c.y, ICON_DIAM, TEAL);
+      ring(f, c.x, c.y, ICON_DIAM, TEAL, 1);
+    });
+    expect(hair.allBlobs[0].fillRatio).toBeGreaterThan(0.40);
+    expect(hair.iconBlobs).toHaveLength(1);
+    expect(near(hair.iconBlobs[0], AT, 1)).toBe(true);
   });
 });

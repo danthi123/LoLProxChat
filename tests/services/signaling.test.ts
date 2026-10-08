@@ -102,7 +102,7 @@ describe('SignalingService', () => {
 
     sockets()[0].emitOpen();
     expect(JSON.parse(sockets()[0].sent[0])).toEqual({
-      type: 'join', room: 'room-7', name: 'Alice', team: 'ORDER',
+      type: 'join', room: 'room-7', name: 'Alice', team: 'ORDER', sharedReset: false,
     });
   });
 
@@ -223,5 +223,73 @@ describe('SignalingService', () => {
     sockets()[0].emitOpen();
     service.sendCoords(1, 2);
     expect(JSON.parse(sockets()[0].sent[1])).toEqual({ type: 'coords', x: 1, y: 2 });
+  });
+
+  describe('shared RESET', () => {
+    const sent = (i = 0) => sockets()[i].sent.map(m => JSON.parse(m));
+
+    it('declares the opt-in on join, and again on every reconnect', () => {
+      const service = new SignalingService();
+      service.setSharedReset(true);
+      join(service);
+      sockets()[0].emitOpen();
+      expect(sent()[0]).toMatchObject({ type: 'join', sharedReset: true });
+
+      sockets()[0].emitClose();
+      jest.advanceTimersByTime(500);
+      sockets()[1].emitOpen();
+      expect(sent(1)[0]).toMatchObject({ type: 'join', sharedReset: true });
+    });
+
+    it('tells the server when the setting changes, and only then', () => {
+      const service = new SignalingService();
+      join(service);
+      sockets()[0].emitOpen();
+      service.setSharedReset(false);
+      service.setSharedReset(true);
+      service.setSharedReset(true);
+      service.setSharedReset(false);
+      expect(sent().slice(1)).toEqual([
+        { type: 'shared_reset', on: true },
+        { type: 'shared_reset', on: false },
+      ]);
+    });
+
+    it('asks for a reset_all only while opted in', () => {
+      const service = new SignalingService();
+      join(service);
+      sockets()[0].emitOpen();
+      service.requestResetAll();
+      expect(sent().map(m => m.type)).toEqual(['join']);
+
+      service.setSharedReset(true);
+      service.requestResetAll();
+      expect(sent()[2]).toEqual({ type: 'reset_all' });
+    });
+
+    it('drops a reset that arrives with the setting off', () => {
+      const from: string[] = [];
+      const service = new SignalingService();
+      service.setOnRemoteReset((f) => from.push(f));
+      join(service);
+      sockets()[0].emitOpen();
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      sockets()[0].emitMessage({ type: 'reset', from: 'Bob' });
+      expect(from).toEqual([]);
+      expect(warn).toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('passes on only the sender name, and nothing that is not a string', () => {
+      const from: string[] = [];
+      const service = new SignalingService();
+      service.setOnRemoteReset((f) => from.push(f));
+      service.setSharedReset(true);
+      join(service);
+      sockets()[0].emitOpen();
+      sockets()[0].emitMessage({ type: 'reset', from: 'Bob', payload: { evil: true } });
+      sockets()[0].emitMessage({ type: 'reset', from: { toString: 'x' } });
+      expect(from).toEqual(['Bob', '']);
+    });
   });
 });

@@ -244,6 +244,20 @@ Collisions between two *honest* players are not a practical concern: the name is
 
 **What this doesn't cover:** an attacker who repeatedly re-claims a name can keep a player out of voice chat for as long as they keep doing it. The client makes this diagnosable rather than mysterious — close code 4000 is terminal, so it stops reconnecting and logs why instead of trading the name back and forth — but there is no authentication in the signaling protocol to prevent it, and adding one would mean an account system the project deliberately does not have.
 
+## Shared RESET: one player triggering another's rescan
+
+**Risk:** With Shared RESET (v0.5.21), one client's message makes other clients do something — re-find their own icon — which no other server message did before. A malicious player, or a compromised or modified server, could try to use it to keep a game's trackers scanning (and so team-only while they scan), or to push something more into the clients that receive it.
+
+**Status:** Bounded by an opt-in that both ends enforce, and by the message carrying nothing to act on.
+
+- **Off by default, and enforced on both sides.** The server relays a `reset` only to connections that declared the opt-in on join or since, and acts on a `reset_all` only from one that did. The client does not rely on that: with its own setting off it drops a `reset` unread (`SignalingService`), and the orchestrator checks the setting again before acting. So even a modified server that sent `reset` to everyone could not make a player who left the setting off rescan.
+- **Nothing in it is used but a name.** The relayed message is `{type:'reset', from}`. The client reads `from` only as a string and shows it only when it names a player already in the room; every other field is ignored. Receiving it means "rescan", and there is nothing else it can say.
+- **Rate-limited at both ends.** At most one relayed per 15 s per room and one per 30 s per player name on the server (so reconnecting does not reset it), and at most one acted on per 15 s by each client — so even a server that floods it cannot keep a client scanning.
+- **A rescan cannot be steered.** The receiving tracker acts only from a clean lock — not while holding (a recall, its icon covered), merged with a teammate, already scanning or dead, when it is re-finding the player already — then avoids nothing and takes an unidentified icon only within walking reach of where that lock was. So another player's RESET cannot move anyone's position across the map; at worst it costs them a few seconds of being team-only while they are found again, and, with a teammate standing within reach and nothing to tell the two apart, the same chance of picking the teammate as any rescan.
+- **It reveals no opt-ins.** The sender is told nothing about who received it.
+
+**What this doesn't cover:** an enemy who has opted in can trigger a rescan for every opted-in player once per 15 s — the per-room limit is shared, so they cannot do it more often than that, and players who find that annoying can turn the setting off mid-game, which the server applies at once.
+
 ## Voice content in transit
 
 **Risk:** Voice flows P2P over WebRTC, but the media layer encryption is the standard DTLS-SRTP — anyone observing the network path can tell *that* there's voice traffic between two endpoints, just not what's being said.
@@ -265,3 +279,4 @@ Collisions between two *honest* players are not a practical concern: the name is
 | WebView2 process trust | Accepted | Auto-updated by Microsoft Edge; small attack surface |
 | Signaling presence enumeration | Accepted | No mitigation without breaking peer-discovery |
 | Voice in transit | Standard DTLS-SRTP | Inherent to WebRTC |
+| Shared RESET abuse | **Mitigated (opt-in)** | Off by default; enforced by server and client; name-only payload; rate-limited both ends |

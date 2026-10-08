@@ -15,6 +15,11 @@ export class RoomManager {
   private rooms = new Map<string, ClientInfo[]>();
   /** ws → ClientInfo (for fast lookup on disconnect) */
   private clients = new Map<WebSocket, ClientInfo>();
+  /** roomId → when a shared RESET was last relayed there. */
+  private roomResetMs = new Map<string, number>();
+  /** roomId → name → when that player last had one relayed. Kept per name,
+   *  not per connection, so reconnecting does not reset it. */
+  private senderResetMs = new Map<string, Map<string, number>>();
 
   /**
    * Add a client to a room. Returns the existing peer names (before this join)
@@ -80,6 +85,8 @@ export class RoomManager {
       if (idx !== -1) room.splice(idx, 1);
       if (room.length === 0) {
         this.rooms.delete(info.roomId);
+        this.roomResetMs.delete(info.roomId);
+        this.senderResetMs.delete(info.roomId);
       } else {
         remaining = room.slice();
       }
@@ -146,6 +153,43 @@ export class RoomManager {
     const info = this.clients.get(ws);
     if (!info) return;
     info.camera = { x, y, updatedMs: Date.now() };
+  }
+
+  /** Record whether a client has opted in to shared RESET. No-op if the ws
+   *  isn't in a room. */
+  setSharedReset(ws: WebSocket, on: boolean): void {
+    const info = this.clients.get(ws);
+    if (!info) return;
+    info.sharedReset = on;
+  }
+
+  /**
+   * When a 'reset_all' was last relayed in a room, and stamp it now if one may
+   * be: false while the room is within `cooldownMs` of the last one.
+   */
+  tryStampRoomReset(roomId: string, now: number, cooldownMs: number): boolean {
+    const last = this.roomResetMs.get(roomId);
+    if (last !== undefined && now - last < cooldownMs) return false;
+    this.roomResetMs.set(roomId, now);
+    return true;
+  }
+
+  /**
+   * Whether `name` in `roomId` may have a shared RESET relayed (none within
+   * `cooldownMs`). Only checks: stamp with stampSenderReset once it is.
+   */
+  senderResetAllowed(roomId: string, name: string, now: number, cooldownMs: number): boolean {
+    const last = this.senderResetMs.get(roomId)?.get(name);
+    return last === undefined || now - last >= cooldownMs;
+  }
+
+  stampSenderReset(roomId: string, name: string, now: number): void {
+    let byName = this.senderResetMs.get(roomId);
+    if (!byName) {
+      byName = new Map();
+      this.senderResetMs.set(roomId, byName);
+    }
+    byName.set(name, now);
   }
 
   /**

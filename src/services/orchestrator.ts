@@ -14,7 +14,7 @@ import { disownAfterSec } from './tracking-helpers';
 import { BlobScorer, ChampionClassifier } from './champion-classifier';
 import { SkinAwareScorer, TeammateSkin, TemplateSet, loadTeamTemplates } from './skin-matcher';
 import { VolumeClient } from './volume-client';
-import { getAllyProximity, getCameraListen } from './audio-prefs';
+import { getAllyProximity, getCameraListen, getSharedReset } from './audio-prefs';
 import { getForceTurnRelay } from './privacy';
 import { DebugBundle } from './debug-bundle';
 import { flushLogBuffer, isLoggingEnabled } from '../core/logging';
@@ -103,6 +103,15 @@ export function defaultDeps(): OrchestratorDeps {
 export const STATUS_MIC_BLOCKED =
   'Microphone blocked — listening only. Check Windows microphone privacy settings';
 
+/**
+ * A shared RESET is acted on at most once per this long. The server already
+ * holds each room to one per 15s; this holds a server that does not.
+ */
+export const SHARED_RESET_RECEIVE_MS = 15_000;
+
+/** How long the panel says who asked us to rescan. */
+const SHARED_RESET_NOTICE_MS = 4_000;
+
 export class Orchestrator {
   private readonly deps: OrchestratorDeps;
   private gameState: GameStateService;
@@ -157,10 +166,16 @@ export class Orchestrator {
   private selfMutedPref = false;
   private muteAllPref = false;
 
+  // Shared RESET: when one from another player was last acted on, and what
+  // the panel says about it until when.
+  private lastRemoteResetMs = -Infinity;
+  private remoteReset: { from: string | null; untilMs: number } | null = null;
+
   constructor(deps: Partial<OrchestratorDeps> = {}) {
     this.deps = { ...defaultDeps(), ...deps };
     this.gameState = this.deps.createGameState();
     this.signaling = this.deps.createSignaling();
+    this.signaling.setOnRemoteReset((from) => this.handleRemoteReset(from));
   }
 
   start(): void {
@@ -418,7 +433,7 @@ export class Orchestrator {
   }
 
   private async startSession(session: GameSession): Promise<void> {
-    console.log('[LoLProxChat] Starting session: room=' + session.roomId);
+    console.log('[LoLProxChat] Starting session: room=' + session.roomId + ' team=' + session.localPlayer.team);
     // None of these toggles reach the log any other way (the panel writes them
     // straight to storage), and the 2026-10-07 test could only infer that
     // everyone had both opt-ins on from how the volumes behaved.
@@ -426,6 +441,7 @@ export class Orchestrator {
     try {
       console.log('[LoLProxChat] Settings: allyProximity=' + getAllyProximity() +
         ' voiceOnCamera=' + getCameraListen() +
+        ' sharedReset=' + getSharedReset() +
         ' hideIp=' + getForceTurnRelay() +
         ' inputDevice=' + (getStoredInputDeviceId() ? 'chosen' : 'default') +
         ' outputDevice=' + (getStoredOutputDeviceId() ? 'chosen' : 'default'));
@@ -464,6 +480,8 @@ export class Orchestrator {
     // Join signaling room. v0.3: team is sent so the server can do team-aware
     // proximity (allies always full volume; enemies fade out at vision range).
     // Older servers ignore the team field and fall back to team-blind behavior.
+    // The shared RESET opt-in rides on the join, so it is set first.
+    this.signaling.setSharedReset(getSharedReset());
     this.signaling.joinRoom(
       session.roomId,
       this.localSummonerName,
@@ -636,6 +654,9 @@ export class Orchestrator {
     // early returns below so the 30 FPS tracking loop is already producing
     // camera positions by the time we need one, rather than a tick behind.
     this.tracking?.setCameraTracking(getCameraListen());
+    // And the shared RESET opt-in with its toggle: told to the server only
+    // when it changes.
+    this.signaling.setSharedReset(getSharedReset());
 
     // Broadcast presence over signaling so peers can discover us.
     // Coordinates go separately via sendCoords() — kept off this message so
@@ -939,6 +960,9 @@ export class Orchestrator {
       detectedMinimapBounds: this.tracking?.getDetectedMinimapScreenBounds() ?? null,
       localTeam: this.session?.localPlayer.team ?? null,
       lifecycleStatus: this.computeLifecycleStatus(),
+      remoteReset: this.remoteReset && performance.now() < this.remoteReset.untilMs
+        ? { from: this.remoteReset.from }
+        : null,
     };
 
     // Auto-position the SCANNER window over the minimap whenever bounds
@@ -1003,6 +1027,45 @@ export class Orchestrator {
     if (!this.tracking.resetPosition()) {
       console.log('[LoLProxChat] Position reset ignored — dead; we stay at the body until respawn');
     }
+    // Shared RESET on: ask everyone else in the game who has it on to re-find
+    // their icon too. A no-op with it off (see SignalingService).
+    if (getSharedReset() && this.signaling.requestResetAll()) {
+      console.log('[LoLProxChat] Shared RESET: asked the others in the game to rescan too');
+    }
+  }
+
+  /**
+   * Another player pressed RESET with shared RESET on. Rescan — without
+   * avoiding anything, since nobody has said our lock is wrong — but only if
+   * our own toggle is on now, at most once per SHARED_RESET_RECEIVE_MS, and
+   * only from a clean lock (TrackingService.rescan). `from` is shown in the
+   * panel only when it names a player in this room who is also on this
+   * game's roster; it is never used for anything else.
+   */
+  private handleRemoteReset(from: string): void {
+    if (!getSharedReset()) {
+      console.warn('[LoLProxChat] Shared RESET received with the setting off — ignored');
+      return;
+    }
+    if (!this.tracking) return;
+    const now = performance.now();
+    if (now - this.lastRemoteResetMs < SHARED_RESET_RECEIVE_MS) {
+      console.log('[LoLProxChat] Shared RESET ignored — one was acted on under ' +
+        SHARED_RESET_RECEIVE_MS / 1000 + 's ago');
+      return;
+    }
+    const fromIdentity = this.peerStates.has(from) ? readIdentity({ summonerName: from }) : null;
+    const known = fromIdentity && this.rosterIdentities.some((r) => identityEquals(r.identity, fromIdentity)) ? from : null;
+    if (!this.tracking.rescan()) {
+      // Dead, holding, merged with a teammate or already scanning: either
+      // there is nothing to re-find, or the tracker is re-finding us already.
+      console.log('[LoLProxChat] Shared RESET ignored — not on a clean lock (' + this.tracking.getState() + ')');
+      return;
+    }
+    this.lastRemoteResetMs = now;
+    console.log('[LoLProxChat] Shared RESET from ' + (known ?? 'another player') + ' — rescanning');
+    this.remoteReset = { from: known, untilMs: now + SHARED_RESET_NOTICE_MS };
+    this.broadcastOverlayState();
   }
   toggleMutePlayer(name: string): boolean { return this.audio?.toggleMutePlayer(name) ?? false; }
   setPlayerVolume(name: string, volume: number): void { this.audio?.setPlayerVolume(name, volume); }
@@ -1270,6 +1333,8 @@ export class Orchestrator {
     this.gameState.clearSession();
     this.session = null;
     this.peerStates.clear();
+    this.remoteReset = null;
+    this.lastRemoteResetMs = -Infinity;
     this.localSummonerName = '';
     this.rosterIdentities = [];
     this.clearSessionAttemptState();

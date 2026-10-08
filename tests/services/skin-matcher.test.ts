@@ -188,6 +188,22 @@ describe('SkinAwareScorer', () => {
     expect(await scorer.scoreBlobsForLocalChampion(frameWith(null, 60, 60, 29), [box(60, 60)])).toEqual([0.02]);
   });
 
+  test('says which icons it vouched for and ruled out, for the tracker to act on', async () => {
+    const scorer = new SkinAwareScorer('me', ['me', 'mate'], model(0.02));
+    expect(scorer.lastVerdicts()).toEqual([]);
+    scorer.setTemplates(sets('me', 'mate'));
+    await scorer.scoreBlobsForLocalChampion(frameWith('me', 60, 60, 29), [box(60, 60)]);
+    expect(scorer.lastVerdicts()).toEqual(['self']);
+    await scorer.scoreBlobsForLocalChampion(frameWith('mate', 60, 60, 29), [box(60, 60)]);
+    expect(scorer.lastVerdicts()).toEqual(['teammate']);
+    await scorer.scoreBlobsForLocalChampion(frameWith(null, 60, 60, 29), [box(60, 60)]);
+    expect(scorer.lastVerdicts()).toEqual([null]);
+    // Not matching (icons missing): nothing to say about anyone.
+    scorer.setTemplates(sets('me'));
+    await scorer.scoreBlobsForLocalChampion(frameWith('mate', 60, 60, 29), [box(60, 60)]);
+    expect(scorer.lastVerdicts()).toEqual([null]);
+  });
+
   test('is not loaded, and scores nothing, without the model', async () => {
     const scorer = new SkinAwareScorer('me', ['me', 'mate']);
     scorer.setTemplates(sets('me', 'mate'));

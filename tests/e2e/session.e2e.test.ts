@@ -13,7 +13,8 @@ import { invokedCommands, resetTauriFake } from './fakes/tauri-core';
 import { resetEventFake } from './fakes/tauri-event';
 import { clearStoredPrefs } from './setup/dom';
 import { player } from './fakes/game-state';
-import { setAllyProximity, setCameraListen } from '../../src/services/audio-prefs';
+import { setAllyProximity, setCameraListen, setSharedReset } from '../../src/services/audio-prefs';
+import { SignalingService } from '../../src/services/signaling';
 import { Player } from '../../src/core/types';
 
 const A = 'PlayerOne';
@@ -459,5 +460,45 @@ describe('E8 session teardown', () => {
     const perHalfSecond = volumesFor(a).length - atStart;
     expect(perHalfSecond).toBeGreaterThanOrEqual(4);
     expect(perHalfSecond).toBeLessThanOrEqual(16);
+  });
+});
+
+describe('E9 shared RESET reaches only the players who opted in', () => {
+  it('relays a RESET to an opted-in player and never sends it to one who is not', async () => {
+    // Three in one game. The setting is process-global here (one localStorage
+    // for every client), so the third client is held opted out at its own
+    // signaling layer: whatever the panel says, it tells the server "off".
+    class OptedOut extends SignalingService {
+      setSharedReset(): void { super.setSharedReset(false); }
+    }
+    setSharedReset(true);
+    const tag = 'E2E' + (++tagSeq);
+    const players = [
+      player(A, tag, 'Ahri', 'ORDER'),
+      player(B, tag, 'Zed', 'CHAOS'),
+      player('PlayerThree', tag, 'Lux', 'ORDER'),
+    ];
+    const [a, b, c] = players.map(p => p.summonerName);
+    const [one, two, three] = track(
+      makeClient(a, players),
+      makeClient(b, players),
+      makeClient(c, players, { createSignaling: () => new OptedOut() }),
+    );
+    await startAll([one, two, three]);
+    await waitForMesh(one, two);
+    await waitForMesh(one, three);
+
+    expect(socketFor(c)!.outbound.find((m) => m.type === 'join').sharedReset).toBe(false);
+    one.orchestrator.resetPosition();
+    await waitFor(() => two.tracker.rescans === 1, 'the opted-in player rescanning');
+    // The relay names the sender and carries nothing else.
+    expect(inboundFor(b).filter((m) => m.type === 'reset')).toEqual([{ type: 'reset', from: a }]);
+
+    // Give the server every chance to have sent the other one too.
+    await new Promise((r) => setTimeout(r, 300));
+    expect(inboundFor(c).some((m) => m.type === 'reset')).toBe(false);
+    expect(inboundFor(a).some((m) => m.type === 'reset')).toBe(false);
+    expect(three.tracker.rescans).toBe(0);
+    expect(one.tracker.resets).toBe(1);
   });
 });

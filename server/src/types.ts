@@ -2,7 +2,7 @@ import type { WebSocket } from 'ws';
 
 // Client → Server messages
 export interface ClientMessage {
-  type: 'join' | 'signal' | 'position' | 'coords';
+  type: 'join' | 'signal' | 'position' | 'coords' | 'shared_reset' | 'reset_all';
   room?: string;    // required for 'join'
   name?: string;    // required for 'join'
   to?: string;      // required for 'signal' (target player name)
@@ -35,13 +35,19 @@ export interface ClientMessage {
   // v0.3: team identifier on 'join' (ORDER / CHAOS). Optional for back-compat
   // — a v0.2 client omits it and the server falls back to team-blind behavior.
   team?: 'ORDER' | 'CHAOS';
+  // Shared RESET (v0.5.21, opt-in). On 'join', and on 'shared_reset' whenever
+  // the user flips the setting: true opts this client in, anything else opts
+  // it out. Only an opted-in client's 'reset_all' is acted on, and only
+  // opted-in clients are sent the resulting 'reset' — see ws-handler.ts.
+  sharedReset?: boolean;
+  on?: boolean;
 }
 
 // Server → Client messages
 export interface ServerMessage {
-  type: 'peer_joined' | 'peer_left' | 'signal' | 'position' | 'room_state' | 'error';
+  type: 'peer_joined' | 'peer_left' | 'signal' | 'position' | 'room_state' | 'error' | 'reset';
   name?: string;    // for peer_joined/peer_left
-  from?: string;    // for signal/position (who sent it)
+  from?: string;    // for signal/position/reset (who sent it)
   peers?: string[]; // for room_state (list of existing peers)
   payload?: any;    // for signal relay
   blob?: string;    // for position relay (peer metadata, NOT coordinates)
@@ -62,4 +68,7 @@ export interface ClientInfo {
   // v0.3: team for cross-team filtering. Undefined means a legacy v0.2 client —
   // server falls back to team-blind volume math (every peer audible if in range).
   team?: 'ORDER' | 'CHAOS';
+  // Shared RESET opt-in, as this connection last declared it. Never carried
+  // over from an evicted connection: each connection opts in for itself.
+  sharedReset?: boolean;
 }

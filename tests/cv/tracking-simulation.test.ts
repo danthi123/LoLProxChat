@@ -28,6 +28,7 @@ import { driveTracker, FRAME_MS, metrics, newTracker } from './harness/drive';
 import {
   IndiscriminateScorer,
   OracleScorer,
+  SkinVerdictScorer,
   SpikingScorer,
   UnloadedScorer,
   ZeroScorer,
@@ -1256,10 +1257,69 @@ describe('the wrong-lock check at real walking speed', () => {
   });
 });
 
+describe('a shared RESET from another player, when our lock is not clean', () => {
+  // TrackingService.rescan acts only from a clean lock. Holding, merged or
+  // already scanning, the tracker is re-finding us with what it knows about
+  // the teammates beside us; starting over threw that away and handed the
+  // lock to the nearest teammate (v0.5.21 review).
+  const meet = at(START, STEP, 16);
+  const withMate = (self: Point | null, mate: Point): SceneSpec =>
+    ({ ...BACKDROP, self, selfTrail: null, allies: [...BACKDROP.allies!, mate] });
+
+  async function runWith(specs: SceneSpec[], actAt: Record<number, (h: ReturnType<typeof newTracker>) => void>) {
+    const scenes = renderScenes(specs);
+    const h = newTracker(scenes.map(sc => sc.frame), { classifier: new ZeroScorer() });
+    const records: Awaited<ReturnType<typeof driveTracker>> = [];
+    for (let i = 0; i < scenes.length; i++) {
+      actAt[i]?.(h);
+      records.push(...await driveTracker(h, [scenes[i]]));
+    }
+    return records;
+  }
+  const lockedOn = (records: Awaited<ReturnType<typeof driveTracker>>, p: Point) =>
+    records.filter(r => r.state === TrackingState.LOCKED && r.holdSec === 0 && distance(r.px!, p) <= 12).length;
+
+  test('during a recall\'s hold, or after it ran out, it never puts us on the teammate beside us', async () => {
+    const mate = { x: meet.x + 40, y: meet.y };
+    const specs = [
+      ...walk(17).map(sc => ({ ...sc, allies: [...BACKDROP.allies!, mate] })),
+      ...Array.from({ length: 120 }, () => withMate(null, mate)),
+    ];
+    let during: boolean | null = null;
+    let after: boolean | null = null;
+    const a = await runWith(specs, { 25: h => { during = h.svc.rescan(); } });
+    const b = await runWith(specs, { 70: h => { after = h.svc.rescan(); } });
+    expect(during).toBe(false);
+    expect(after).toBe(false);
+    expect(lockedOn(a.slice(17), mate)).toBe(0);
+    expect(lockedOn(b.slice(17), mate)).toBe(0);
+  });
+
+  test('merged with a duo partner, it leaves the pair alone', async () => {
+    const mate = { x: meet.x + 18, y: meet.y };
+    const specs = [...walk(17), ...Array.from({ length: 40 }, () => withMate(meet, mate))];
+    let acted: boolean | null = null;
+    const records = await runWith(specs, { 40: h => { acted = h.svc.rescan(); } });
+    expect(acted).toBe(false);
+    for (const r of records.slice(40)) expect(r.state).toBe(TrackingState.LOCKED);
+  });
+
+  test('after our own RESET, it does not undo the avoidance', async () => {
+    const lockSpecs = walk(16);
+    const from = lockSpecs[15].self!;
+    const specs = [...lockSpecs, ...Array.from({ length: 48 }, () => ({ ...BACKDROP, self: from, selfTrail: null }))];
+    let acted: boolean | null = null;
+    const own = await runWith(specs, { 16: h => h.svc.resetPosition() });
+    const both = await runWith(specs, { 16: h => h.svc.resetPosition(), 18: h => { acted = h.svc.rescan(); } });
+    expect(acted).toBe(false);
+    expect(both.map(r => r.state)).toEqual(own.map(r => r.state));
+  });
+});
+
 describe('RESET pressed when the lock was right', () => {
   const NEAR_ALLY: Point = { x: 120, y: 120 };
 
-  async function resetWhile(motion: (i: number) => Point, scorer: 'zero' | 'oracle', allies: Point[]) {
+  async function resetWhile(motion: (i: number) => Point, scorer: 'zero' | 'oracle', allies: Point[], how: 'reset' | 'rescan' = 'reset') {
     const lockSpecs = walk(16);
     const from = lockSpecs[15].self!;
     const over: SceneSpec = { ...BACKDROP, allies };
@@ -1276,11 +1336,29 @@ describe('RESET pressed when the lock was right', () => {
     const records: Awaited<ReturnType<typeof driveTracker>> = [];
     for (let i = 0; i < scenes.length; i++) {
       target = specs[i].self ?? null;
-      if (i === 16) expect(h.svc.resetPosition()).toBe(true);
+      if (i === 16) expect(how === 'reset' ? h.svc.resetPosition() : h.svc.rescan()).toBe(true);
       records.push(...await driveTracker(h, [scenes[i]]));
     }
     return records;
   }
+
+  // Shared RESET: another player pressed RESET, so ours rescans — but nobody
+  // said our lock was wrong, so it must not be steered off the icon it had.
+  test('a shared RESET finds a standing champion straight away; a RESET of our own steers off it', async () => {
+    const still = () => ({ x: 0, y: 0 });
+    const soft = await resetWhile(still, 'zero', [...BACKDROP.allies!, NEAR_ALLY], 'rescan');
+    const relocked = soft.findIndex((r, i) => i > 16 && r.state === TrackingState.LOCKED);
+    expect(relocked).toBeGreaterThan(16);
+    expect((relocked - 16) * FRAME_MS).toBeLessThanOrEqual(1_500);
+    for (const r of soft.slice(relocked)) expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    expect(logs.some(l => l.includes('shared RESET from another player'))).toBe(true);
+    expect(logs.some(l => l.includes('avoiding ('))).toBe(false);
+
+    logs.length = 0;
+    const own = await resetWhile(still, 'zero', [...BACKDROP.allies!, NEAR_ALLY], 'reset');
+    const ownRelocked = own.findIndex((r, i) => i > 16 && r.state === TrackingState.LOCKED && distance(r.px!, r.truth!) <= 3);
+    expect(ownRelocked === -1 || (ownRelocked - 16) * FRAME_MS > 1_500).toBe(true);
+  });
 
   test('a champion walking at ordinary speed is found again, not an ally', async () => {
     const records = await resetWhile(i => ({ x: Math.round(i * 0.75), y: 0 }), 'zero', [...BACKDROP.allies!, NEAR_ALLY]);
@@ -1367,6 +1445,23 @@ describe('walking alongside a teammate (v0.5.12 Shen + Vex log)', () => {
       // On our side of the pair: nearer our icon than the teammate's.
       const mate = { x: r.truth!.x + OFFSET.x, y: r.truth!.y + OFFSET.y };
       expect(distance(r.px!, r.truth!)).toBeLessThan(distance(r.px!, mate));
+      expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(8);
+    }
+  });
+
+  test('the same for a champion whose art is teal (Gwen beside her support)', async () => {
+    // Her hair fills the merged pair past the plain-ring fill cap; before
+    // v0.5.21's review it was not taken for a stack at all, held, and was
+    // rescanned at 5s like the v0.5.12 log.
+    const { specs } = lockThenJoin();
+    const pairStart = at(at(START, STEP, 16), PAIR_STEP, 8);
+    const pair = together(pairStart, 64);
+    const art = (s: SceneSpec): SceneSpec => ({ ...s, selfTealArt: true });
+    const records = await run([...specs, ...pair].map(art));
+    expect(logs.some(l => l.includes('merged with a teammate'))).toBe(true);
+    expect(logs.some(l => l.includes('Hold exceeded'))).toBe(false);
+    for (const r of records.slice(specs.length)) {
+      expect(r.state).toBe(TrackingState.LOCKED);
       expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(8);
     }
   });
@@ -1902,5 +1997,138 @@ describe('the camera says which teammate icon is us (2026-10-08 1hoxklt log)', (
     expect(DECOY_FROM.y).toBeGreaterThan(70);
     expect(logs.some(l => l.includes('moving to the one it keeps on screen'))).toBe(false);
     expect(distance(records[records.length - 1].px!, at(DECOY_FROM, { x: 0, y: 0.05 }, records.length - 1))).toBeLessThan(6);
+  });
+});
+
+describe('a champion whose art is teal (2026-10-08 evening log, two Gwens)', () => {
+  // Gwen's cyan hair passes the teal test and merges with her ring into a blob
+  // too filled for a bare ring: until v0.5.21 the tracker threw her icon away
+  // on every frame, so a Gwen was tracked on nobody's screen — her own
+  // tracker followed teammates instead.
+  test('is found and followed', async () => {
+    const scenes = renderScenes(walk(30).map(s => ({ ...s, selfTealArt: true })));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const m = metrics(await driveTracker(h, scenes));
+    expect(m.lockFrame).toBeGreaterThanOrEqual(0);
+    expect(m.lockFrame).toBeLessThanOrEqual(12);
+    expect(m.maxErrorPx).toBeLessThanOrEqual(3);
+  });
+
+  test('a turret and a minion wave still are not icons', async () => {
+    // Nothing but the backdrop's turret and minions on our side: no lock.
+    const scenes = renderScenes(Array.from({ length: 30 }, () => ({
+      enemies: BACKDROP.enemies, turrets: BACKDROP.turrets, minions: [{ x: 120, y: 120 }, { x: 128, y: 126 }],
+    })));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    expect(records.every(r => r.state !== TrackingState.LOCKED)).toBe(true);
+  });
+});
+
+describe('an icon the skin match calls a teammate\'s', () => {
+  const MATE: Point = { x: 150, y: 120 };
+
+  test('is never locked on, even with nothing else to follow', async () => {
+    // Our own icon is nowhere to be seen (how red Gwen's was); the one
+    // teammate's is a clean ring. Before v0.5.21 the ring score alone took the
+    // lock ("cls=0.00 ... ring=0.99").
+    const scenes = renderScenes(Array.from({ length: 40 }, () => ({ ...NO_TEAL, allies: [MATE] })));
+    const classifier = new SkinVerdictScorer(() => null, () => [toFramePoint(MATE)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier });
+    const records = await driveTracker(h, scenes);
+    expect(classifier.runs).toBeGreaterThan(3);
+    expect(records.every(r => r.state !== TrackingState.LOCKED)).toBe(true);
+  });
+
+  test('is let go once the verdicts come in, and we are found', async () => {
+    // Locked on the teammate before skin matching had its say (the model
+    // was silent): two verdicts later the tracker drops it and, rescanning,
+    // finds our own icon — teal art and all.
+    let verdictsOn = false;
+    const selfAt = (i: number): Point => at({ x: 60, y: 220 }, { x: 1, y: 0 }, i);
+    const specs: SceneSpec[] = Array.from({ length: 120 }, (_, i) => ({
+      ...NO_TEAL,
+      allies: [MATE],
+      self: i < 20 ? null : selfAt(i),
+      selfTealArt: true,
+    }));
+    const scenes = renderScenes(specs);
+    let frame = 0;
+    const classifier = new SkinVerdictScorer(
+      () => (verdictsOn && frame >= 20 ? toFramePoint(selfAt(frame)) : null),
+      () => (verdictsOn ? [toFramePoint(MATE)] : []),
+    );
+    const h = newTracker(scenes.map(s => s.frame), { classifier });
+    const early = await driveTracker(h, scenes.slice(0, 20));
+    expect(early[early.length - 1].state).toBe(TrackingState.LOCKED);
+    expect(distance(early[early.length - 1].px!, MATE)).toBeLessThanOrEqual(3);
+    verdictsOn = true;
+    const late = [];
+    for (let i = 20; i < scenes.length; i++) {
+      frame = i;
+      late.push(...await driveTracker(h, [scenes[i]]));
+    }
+    // Let go within two classifier runs and a frame or two — not after a 5s
+    // hold that keeps reporting the teammate's position as ours.
+    const onMate = (r: { px: Point | null }) => !!r.px && distance(r.px, MATE) <= 3;
+    const released = late.findIndex(r => !onMate(r) || r.state !== TrackingState.LOCKED);
+    expect(released).toBeGreaterThanOrEqual(0);
+    expect(released * FRAME_MS).toBeLessThanOrEqual(1500);
+    const last = late[late.length - 1];
+    expect(last.state).toBe(TrackingState.LOCKED);
+    expect(distance(last.px!, selfAt(scenes.length - 1))).toBeLessThanOrEqual(3);
+  });
+
+  test('is let go at once even when nothing yet says which icon is ours', async () => {
+    // As above, but the skin match is unsure of our icon (half covered, say):
+    // nothing re-acquires us, so only dropping the teammate's icon outright
+    // stops its position going out as ours for a 5s hold.
+    const selfAt = (i: number): Point => at({ x: 60, y: 220 }, { x: 1, y: 0 }, i);
+    const specs: SceneSpec[] = Array.from({ length: 40 }, (_, i) => ({
+      ...NO_TEAL, allies: [MATE], self: i < 20 ? null : selfAt(i),
+    }));
+    const scenes = renderScenes(specs);
+    let verdictsOn = false;
+    const classifier = new SkinVerdictScorer(() => null, () => (verdictsOn ? [toFramePoint(MATE)] : []));
+    const h = newTracker(scenes.map(s => s.frame), { classifier });
+    const early = await driveTracker(h, scenes.slice(0, 20));
+    expect(distance(early[early.length - 1].px!, MATE)).toBeLessThanOrEqual(3);
+    verdictsOn = true;
+    const late = await driveTracker(h, scenes.slice(20));
+    const reportsMate = late.map(r => r.state === TrackingState.LOCKED && !!r.px && distance(r.px, MATE) <= 3);
+    const lastOnMate = reportsMate.lastIndexOf(true);
+    expect((lastOnMate + 1) * FRAME_MS).toBeLessThanOrEqual(1500);
+    expect(logs.some(l => l.includes('is a teammate\'s (skin match)'))).toBe(true);
+  });
+
+  test('walking past where an enemy covers us does not end the cover hold', async () => {
+    // We walk under an enemy's icon (the hold that keeps us where we went out
+    // of sight), then a teammate the skin match knows settles beside it. The
+    // teammate is not the icon we follow — ours is under the enemy — so the
+    // lock must not be dropped (v0.5.21 review: it was, for team-only audio
+    // in the middle of a fight).
+    const E: Point = { x: 150, y: 140 };
+    const specs: SceneSpec[] = [];
+    for (let d = 60; d > 0; d--) specs.push({ ...BACKDROP, self: { x: E.x - d, y: E.y }, selfTrail: { x: -1, y: 0 }, enemiesOnTop: [E] });
+    const covered = specs.length;
+    const mateAt = (i: number): Point => ({ x: Math.max(E.x + 20, E.x + 40 - 2 * i), y: E.y });
+    for (let i = 0; i < 30; i++) specs.push({ ...BACKDROP, self: E, enemiesOnTop: [E], allies: [...BACKDROP.allies!, mateAt(i)] });
+    const scenes = renderScenes(specs);
+    let frame = 0;
+    const classifier = new SkinVerdictScorer(
+      () => (frame < covered ? toFramePoint(specs[frame].self!) : null),
+      () => (frame >= covered ? [toFramePoint(mateAt(frame - covered))] : []),
+    );
+    const h = newTracker(scenes.map(s => s.frame), { classifier });
+    const records = [];
+    for (let i = 0; i < scenes.length; i++) {
+      frame = i;
+      records.push(...await driveTracker(h, [scenes[i]]));
+    }
+    for (const r of records.slice(covered)) {
+      expect(r.state).toBe(TrackingState.LOCKED);
+      expect(distance(r.px!, E)).toBeLessThanOrEqual(4);
+    }
+    expect(logs.some(l => l.includes('is a teammate\'s (skin match)'))).toBe(false);
   });
 });
