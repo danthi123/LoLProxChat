@@ -47,6 +47,14 @@ import {
   RESET_AVOID_MS,
   RESET_OBSERVE_MS,
   WRONG_LOCK_STILL_FRACTION,
+  CameraDwell,
+  ViewportBox,
+  cameraFavourite,
+  cameraSwitchTarget,
+  readingNear,
+  CAMERA_SWITCH_COOLDOWN_MS,
+  CAMERA_REJECT_MS,
+  isInBaseZone,
 } from './tracking-helpers';
 
 export enum TrackingState {
@@ -264,10 +272,12 @@ export class TrackingService {
   }
 
   /**
-   * Enable/disable camera-viewport detection. Off costs nothing — the scan is
-   * two extra passes over the mask per frame, so it only runs while Voice on
-   * camera is on (the default since v0.5.18). Driven by the orchestrator so the
-   * tracker doesn't need to know about user preferences.
+   * Enable/disable publishing the camera centre for voice on camera. The
+   * rectangle itself is read every frame regardless (two counting passes over
+   * a mask processFrame builds anyway), because the tracker uses it to tell
+   * our icon from a teammate's; this only controls getCameraPosition(). Driven
+   * by the orchestrator so the tracker doesn't need to know about user
+   * preferences.
    */
   setCameraTracking(enabled: boolean): void {
     if (this.cameraTrackingEnabled === enabled) return;
@@ -279,8 +289,9 @@ export class TrackingService {
     viewportMask: Uint8Array,
     region: { x: number; y: number; width: number; height: number },
   ): void {
-    if (!this.cameraTrackingEnabled) return;
     const result = describeViewportCenter(viewportMask, region.width, region.height);
+    this.cameraBox = result.box ?? null;
+    if (!this.cameraTrackingEnabled) return;
     this.cameraMiss = result.miss ?? null;
     this.cameraMarkedPixels = result.markedPixels;
     const centre = result.centre;
@@ -696,6 +707,7 @@ export class TrackingService {
   onRespawn(): void {
     if (this.state !== TrackingState.DEAD) return;
     this.state = TrackingState.SCANNING;
+    this.cameraDwell.reset();
     this.lostAt = null;
     this.bystanders = [];
     this.bystanderBlobs = [];
@@ -732,6 +744,9 @@ export class TrackingService {
     this.avoidPoint = was;
     this.avoidOrigin = was;
     this.avoidUntilMs = performance.now() + RESET_AVOID_MS;
+    // The scan's avoidance ends at its lock; this keeps the camera from moving
+    // us straight back onto the icon the user just rejected once it may.
+    if (was) this.cameraDwell.reject(was, computeNearFieldPx(this.expectedIconDiam), performance.now() + CAMERA_REJECT_MS);
     this.lastPixelPos = null;
     this.lockedTickCount = 0;
     this.scanFrameCount = 0;
@@ -893,6 +908,15 @@ export class TrackingService {
   // shape-plausibility one, and those need opposite fixes.
   private cameraMiss: ViewportMiss | null = null;
   private cameraMarkedPixels = 0;
+  // The rectangle itself (region px) this frame, read whether or not voice on
+  // camera is on: which teammate icon the player keeps on screen is how a
+  // wrong lock is found (see CameraDwell). Nothing about it leaves the tracker.
+  private cameraBox: ViewportBox | null = null;
+  private cameraDwell = new CameraDwell();
+  // When the last lock or camera-driven switch happened; the camera may not
+  // move us again for CAMERA_SWITCH_COOLDOWN_MS after either.
+  private lastLockChangeMs = 0;
+  private lastDwellLogMs = 0;
 
   /**
    * Build a mask of white pixels, marking those that belong to the camera viewport
@@ -1240,6 +1264,10 @@ export class TrackingService {
     // independent of lock state, so it keeps working while the tracker
     // is SCANNING.
     this.updateCameraPosition(viewportMask, region);
+    const ownIcons = [...iconBlobs, ...this.bystanderBlobs].filter(b => b.color === 'teal');
+    this.cameraDwell.update(ownIcons.map(b => ({ x: b.cx, y: b.cy })), this.cameraBox,
+      nowMs, this.lastDtSec * 1000, this.expectedIconDiam);
+    this.logCameraDwell(nowMs);
 
     // Run classifier at most every 500ms (scan-rate independent). Excluded
     // bystander icons are scored too: the classifier vouching for one is what
@@ -1349,6 +1377,31 @@ export class TrackingService {
       return;
     }
 
+    // The icon the player has kept on screen while the others were not is us,
+    // whatever the classifier makes of it. Not one the user just reset away
+    // from: they have told us that one is wrong.
+    //
+    // Within walking reach of where a hold ran out, like any icon nothing
+    // else identifies: after a recall the player's camera is often still on
+    // the lane, on whichever teammate is there, while their own icon sits in
+    // the fountain where the camera is not.
+    const favourite = cameraFavourite(this.cameraDwell.readings(performance.now()));
+    if (favourite) {
+      const near = computeNearFieldPx(this.expectedIconDiam);
+      const resetRadius = Math.max(5, this.expectedIconDiam * 0.6);
+      const avoided = this.avoidPoint && performance.now() < this.avoidUntilMs &&
+        Math.hypot(favourite.x - this.avoidPoint.x, favourite.y - this.avoidPoint.y) <= resetRadius;
+      const outOfReach = this.lostAt &&
+        Math.hypot(favourite.x - this.lostAt.x, favourite.y - this.lostAt.y) >
+          rescanReachPx(this.expectedIconDiam, performance.now() - this.lostAtMs);
+      const pick = avoided || outOfReach ? null : this.nearestBlob(tealBlobs, favourite, near);
+      if (pick) {
+        this.lockOnBlob(pick, 'camera(on screen ' + Math.round(favourite.dwell * 100) + '% of the last ' +
+          Math.round(favourite.readableMs / 1000) + 's)');
+        return;
+      }
+    }
+
     let bestBlob = tealBlobs[0];
     let bestScore = -Infinity;
     // Per-term breakdown of the winner, for the lock-on log. Issue #13 is
@@ -1445,6 +1498,7 @@ export class TrackingService {
     this.lastPixelPos = { x: cx, y: cy };
     this.setLastPosition(this.pixelToGamePosition(cx, cy, this.minimapRegion), 'lockOnBlob');
     this.state = TrackingState.LOCKED;
+    this.lastLockChangeMs = performance.now();
     this.wrongLock = emptyWrongLockEvidence();
     this.wrongLockTarget = null;
     this.avoidPoint = null;
@@ -1536,6 +1590,8 @@ export class TrackingService {
         return;
       }
     }
+
+    if (this.cameraSwitch(tealBlobs)) return;
 
     const lastRegion = {
       x: this.lastPixelPos.x - this.minimapRegion.x,
@@ -1633,6 +1689,72 @@ export class TrackingService {
     this.finalizeLockedFrame(phase1.blob, lastReg, holdSec, redBlobs);
   }
 
+  private nearestBlob(blobs: Blob[], at: { x: number; y: number }, radius: number): Blob | null {
+    let pick: Blob | null = null;
+    let pickDist = radius;
+    for (const b of blobs) {
+      const d = Math.hypot(b.cx - at.x, b.cy - at.y);
+      if (d <= pickDist) { pick = b; pickDist = d; }
+    }
+    return pick;
+  }
+
+  /**
+   * Move the lock to the icon the camera says is us (cameraSwitchTarget): the
+   * one the player has kept on screen for most of the last 30s while the one
+   * we follow was hardly ever in view. This is what corrects a lock on a
+   * teammate the classifier cannot tell apart from us — in the 2026-10-08
+   * test, a lock taken in the fountain followed the wrong teammate for four
+   * minutes.
+   *
+   * Only while we are following something cleanly (no hold, nothing covering
+   * or merged with our icon), not within CAMERA_SWITCH_COOLDOWN_MS of the last
+   * lock change, and never away from an icon in a base: a player shopping or
+   * waiting to respawn is looking at the rest of the map, not at themselves.
+   */
+  private cameraSwitch(tealBlobs: Blob[]): boolean {
+    if (!this.lastPixelPos || !this.minimapRegion) return false;
+    const now = performance.now();
+    if (now - this.lastLockChangeMs < CAMERA_SWITCH_COOLDOWN_MS) return false;
+    if (this.holdStartMs > 0 || this.occluded || this.stacked) return false;
+    const region = this.minimapRegion;
+    const at = { x: this.lastPixelPos.x - region.x, y: this.lastPixelPos.y - region.y };
+    const here = this.pixelToGamePosition(this.lastPixelPos.x, this.lastPixelPos.y, region);
+    if (isInBaseZone(here, MAP_DIMENSIONS[this.mapType])) return false;
+    const near = computeNearFieldPx(this.expectedIconDiam);
+    // The model recognising the icon we follow outranks where the camera has
+    // been: then the player has simply been watching someone else.
+    const followedBlob = this.nearestBlob(tealBlobs, at, near);
+    if (followedBlob && this.getClassifierScore(followedBlob, this.rawClassifierScores) >= FAR_REACQUIRE_MIN_RAW) return false;
+    const readings = this.cameraDwell.readings(now);
+    const followed = readingNear(readings, at, near);
+    const target = cameraSwitchTarget(readings, followed);
+    if (!target || Math.hypot(target.x - at.x, target.y - at.y) <= near) return false;
+    const pick = this.nearestBlob(tealBlobs, target, near);
+    if (!pick) return false;
+    console.warn('[Tracking] Following a teal icon the camera has hardly shown (' +
+      Math.round((followed?.dwell ?? 0) * 100) + '% of the last ' + Math.round((followed?.readableMs ?? 0) / 1000) +
+      's) — moving to the one it keeps on screen (' + Math.round(target.dwell * 100) + '%)');
+    this.acquireViaClassifier(pick, 0, 'camera');
+    return true;
+  }
+
+  /** Every 30s with two or more own-team icons in view: each one's dwell. */
+  private logCameraDwell(now: number): void {
+    if (now - this.lastDwellLogMs < 30_000) return;
+    const readings = this.cameraDwell.readings(now);
+    if (readings.length < 2 || !this.minimapRegion) return;
+    this.lastDwellLogMs = now;
+    const at = this.lastPixelPos && this.state === TrackingState.LOCKED
+      ? { x: this.lastPixelPos.x - this.minimapRegion.x, y: this.lastPixelPos.y - this.minimapRegion.y }
+      : null;
+    const followed = at ? readingNear(readings, at, computeNearFieldPx(this.expectedIconDiam)) : null;
+    console.log('[Tracking] Camera dwell (on screen / readable of seen): ' + readings.map(r =>
+      '(' + Math.round(r.x) + ',' + Math.round(r.y) + ')' + (r === followed ? '*' : '') + '=' +
+      Math.round(r.dwell * 100) + '%/' + Math.round(r.readableMs / 1000) + 's of ' + Math.round(r.seenMs / 1000) + 's' +
+      (r.rejected ? ' (reset away)' : '')).join(' '));
+  }
+
   /**
    * Per-blob Phase-2 threshold: an icon further than we could have travelled
    * since we were last seen needs the classifier to be all but certain (see
@@ -1657,9 +1779,11 @@ export class TrackingService {
       // also needs the model itself to say something.
       if (threshold > ordinary && raw < FAR_REACQUIRE_MIN_RAW) threshold = Infinity;
       if (threshold > ordinary && score >= ordinary &&
-          this.farRefusalLoggedHold !== this.holdStartMs) {
+          this.farRefusalLoggedHold !== this.holdStartMs &&
+          performance.now() - this.farRefusalLoggedMs >= 5000) {
         if (score < threshold) {
           this.farRefusalLoggedHold = this.holdStartMs;
+          this.farRefusalLoggedMs = performance.now();
           this.debugSink?.markEvent('far-refused');
           console.log('[Tracking] Not re-acquiring at game(' + Math.round(at.x) + ',' + Math.round(at.y) +
             '): ' + Math.round(Math.hypot(at.x - lastSeen.x, at.y - lastSeen.y)) +
@@ -1673,10 +1797,14 @@ export class TrackingService {
   }
 
   private farRefusalLoggedHold = -1;
+  // Short holds come one after another while a far icon is refused; one line
+  // per hold logged twenty in five seconds (the 2026-10-08 Ekko log).
+  private farRefusalLoggedMs = -Infinity;
 
   /** Phase 2 success path: snap position, reset velocity, log, fire callback. */
-  private acquireViaClassifier(blob: Blob, clsScore: number): void {
+  private acquireViaClassifier(blob: Blob, clsScore: number, via?: string): void {
     if (!this.minimapRegion) return;
+    this.lastLockChangeMs = performance.now();
     const cx = this.minimapRegion.x + blob.cx;
     const cy = this.minimapRegion.y + blob.cy;
     this.lastPixelPos = { x: cx, y: cy };
@@ -1691,9 +1819,9 @@ export class TrackingService {
     this.velocityX = 0;
     this.velocityY = 0;
     this.lockedTickCount++;
-    this.debugSink?.markEvent('reacquired');
-    console.log('[Tracking] Re-acquired via classifier (cls=' + clsScore.toFixed(2) +
-      '): pixel(' + cx + ',' + cy + ')' +
+    this.debugSink?.markEvent(via ? 'camera-switch' : 'reacquired');
+    console.log('[Tracking] Re-acquired via ' + (via ?? 'classifier (cls=' + clsScore.toFixed(2) + ')') +
+      ': pixel(' + cx + ',' + cy + ')' +
       ' game(' + Math.round(newPos.x) + ',' + Math.round(newPos.y) + ')');
     if (this.onPositionUpdate && this.lastPosition) {
       this.onPositionUpdate(this.lastPosition);
