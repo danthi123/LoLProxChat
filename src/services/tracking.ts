@@ -491,11 +491,18 @@ export class TrackingService {
   ): Promise<void> {
     if (!this.classifier || !this.classifier.isLoaded()) return;
 
+    // One icon's square, centred on the blob. The blob's bounding box was used
+    // before, which takes in whatever the dilated ring merged with — a turret
+    // marker, a neighbour's ring — and was then stretched square: on the
+    // 2026-10-08 crops, cutting them this way instead made the model rank the
+    // right teammate first for Briar, Ekko and Kayn every time, at 3-10x the
+    // confidence of a crop just 20% looser.
+    const side = Math.max(4, this.expectedIconDiam);
     const crops = tealBlobs.map(b => ({
-      cropX: region.x + b.minX - 1,
-      cropY: region.y + b.minY - 1,
-      cropW: b.maxX - b.minX + 3,
-      cropH: b.maxY - b.minY + 3,
+      cropX: Math.round(region.x + b.cx - side / 2),
+      cropY: Math.round(region.y + b.cy - side / 2),
+      cropW: side,
+      cropH: side,
     }));
 
     try {

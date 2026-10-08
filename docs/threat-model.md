@@ -129,11 +129,13 @@ The only data that ever leaves the user's machine is:
 - **Summoner name** — sent to the signaling server so peers in the same match can find each other in a room. Same name visible to anyone on the match scoreboard.
 - **XY position coordinates** — sent in plaintext over the WebSocket (`coords` message) so the server can compute proximity volumes against the room's other players. Held only in process memory, never logged or persisted, replaced on every ~100 ms tick, dropped on disconnect. Only the server ever sees them (see "Server operator can read all positions" below).
 - **WebRTC signaling messages** (SDP offers/answers, ICE candidates) — exchanged peer-to-peer via the signaling server as a relay. Standard WebRTC handshake; contains your public IP unless `Hide IP (Force TURN)` is enabled (see below).
+- **Icon file requests to Community Dragon** (`raw.communitydragon.org`, behind Cloudflare) — at the start of a game the app downloads the minimap icons of the skins you and your teammates have on, to tell your icon from theirs (`src/services/skin-matcher.ts`). The request is a file path like `characters/kayn/hud/kayn_circle_15.png` and nothing else: no game ID, summoner name or room. Each icon is cached on disk and fetched again only after a month (a champion's file listing after a week), so most games make no request at all. Like any web request it shows your IP address to Community Dragon and Cloudflare.
 - **Voice audio** — flows peer-to-peer over DTLS-SRTP, never touches the signaling server. Goes through the TURN relay (Cloudflare) only if direct P2P fails or `Hide IP (Force TURN)` is on, and even then the relay can't decrypt it.
 
 The only data persisted locally is:
 
 - **Settings** — input mode, mic/speaker device IDs, volume preferences, auto-update opt-in, Hide-IP toggle, per-player mute prefs. Stored in WebView2 localStorage at `%LOCALAPPDATA%\com.proxchat.app\`. Never sent anywhere.
+- **Icon cache** — the downloaded minimap icons, in WebView2's cache storage under the same folder. Never sent anywhere.
 - **Debug log** (only when `Debug` is toggled on) — written to `%LOCALAPPDATA%\com.proxchat.app\lolproxchat.log`. Only leaves your machine if you manually attach it to a GitHub issue. Rotates after 3 sessions.
 
 There is no opt-in/opt-out switch for analytics because there is no analytics. The same applies to any future release — if telemetry is ever introduced, it will be opt-in, explicitly documented here, and clearly visible in Settings.

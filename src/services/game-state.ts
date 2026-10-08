@@ -145,6 +145,8 @@ export class GameStateService {
       if (typeof p.riotIdTagLine === 'string' && p.riotIdTagLine.trim() !== '') {
         player.riotIdTagLine = p.riotIdTagLine;
       }
+      if (typeof p.skinID === 'number' && Number.isInteger(p.skinID) && p.skinID >= 0) player.skinId = p.skinID;
+      if (typeof p.rawChampionName === 'string') player.rawChampionName = p.rawChampionName;
       return player;
     });
   }

@@ -12,6 +12,7 @@ import { AudioService } from './audio';
 import { TrackingService, TrackingState } from './tracking';
 import { disownAfterSec } from './tracking-helpers';
 import { BlobScorer, ChampionClassifier } from './champion-classifier';
+import { SkinAwareScorer, TeammateSkin, TemplateSet, loadTeamTemplates } from './skin-matcher';
 import { VolumeClient } from './volume-client';
 import { getAllyProximity, getCameraListen } from './audio-prefs';
 import { getForceTurnRelay } from './privacy';
@@ -68,6 +69,9 @@ export interface OrchestratorDeps {
   createTracking(gameRect: ScreenRect, mapType: MapType): TrackingService;
   /** Resolves null when no scorer is available; tracking runs without one. */
   createClassifier(championName: string): Promise<BlobScorer | null>;
+  /** Teammates' minimap icons for this game (skin-matcher.ts). Optional: with
+   *  none, identification is the classifier's alone. */
+  loadSkinTemplates?(team: TeammateSkin[]): Promise<TemplateSet[]>;
   createVolumeClient(): VolumeClient;
   timings: OrchestratorTimings;
 }
@@ -88,6 +92,7 @@ export function defaultDeps(): OrchestratorDeps {
       return classifier;
     },
     createVolumeClient: () => new VolumeClient(),
+    loadSkinTemplates: loadTeamTemplates,
     // The volume tick is 10 Hz because GainNode smoothing turns those steps
     // into a ramp; the other two are housekeeping.
     timings: { gameStatePollMs: 3000, volumeTickMs: 100, configPollMs: 5000 },
@@ -520,14 +525,37 @@ export class Orchestrator {
       await this.tracking.initCaptureBounds();
 
       // Load champion classifier (async, non-blocking — tracking works without it)
+      // and, alongside it, the minimap icons of the skins this team has on.
+      // Either one alone is enough to start scoring; see SkinAwareScorer.
+      const scorer = new SkinAwareScorer(session.localPlayer.summonerName);
+      const team: TeammateSkin[] = session.allPlayers
+        .filter(p => p.team === session.localPlayer.team && typeof p.skinId === 'number')
+        .map(p => ({ id: p.summonerName, championName: p.championName, rawChampionName: p.rawChampionName, skinId: p.skinId! }));
+      const tracking = this.tracking;
+      let scorerSet = false;
+      const useScorer = (): void => {
+        if (scorerSet || this.tracking !== tracking) return;
+        scorerSet = true;
+        tracking.setClassifier(scorer);
+      };
       this.deps.createClassifier(session.localPlayer.championName).then((classifier) => {
-        if (classifier && this.tracking) {
-          this.tracking.setClassifier(classifier);
+        if (classifier && this.tracking === tracking) {
+          scorer.setInner(classifier);
+          useScorer();
           console.log('[LoLProxChat] Champion classifier loaded');
         }
       }).catch(err => {
         console.warn('[LoLProxChat] Champion classifier failed to load (tracking continues without it):', err);
       });
+      if (this.deps.loadSkinTemplates && team.length >= 2) {
+        this.deps.loadSkinTemplates(team).then((sets) => {
+          if (this.tracking !== tracking) return;
+          scorer.setTemplates(sets);
+          if (scorer.isLoaded()) useScorer();
+        }).catch(err => {
+          console.warn('[LoLProxChat] Teammate icons failed to load (the classifier carries on alone):', err);
+        });
+      }
 
       // Read minimap scale from League config and apply before starting tracking
       this.readMinimapScale((scale) => {

@@ -10,6 +10,11 @@ export interface Player {
   // heuristic both need to know whether a tag line exists.
   riotIdGameName?: string;
   riotIdTagLine?: string;
+  /** Which skin they have on (Live Client Data `skinID`), and the internal
+   *  champion name (`rawChampionName`): together they name the minimap icon
+   *  the game draws for them. See src/services/skin-matcher.ts. */
+  skinId?: number;
+  rawChampionName?: string;
 }
 
 export interface Position {
