@@ -9,9 +9,13 @@
 // clusters the detector takes for icons. Icons that labelling could not call
 // (mostly ones half under an enemy's) were labelled by eye where a person can
 // tell whose they are: they are what the app's thresholds are there for.
-// Lowering the 0.6 score floor makes this suite fail; the 0.2 margin is not
-// exercised (no wrong teammate here scores within 0.2 of a right one above
-// 0.6) and stays for teammates whose icons look alike. Riot's art is not committed, so
+// How much they guard is limited by the data: the score floor could drop to
+// about 0.45 before a wrong name appears here (at 0.4, one turret is named),
+// and the 0.2 margin is not exercised at all. Both stay set for icons and
+// teammates this one game does not have.
+//
+// It also checks that the app's coarse-to-fine crop search decides exactly as
+// an exhaustive search would: the shortcut must cost time, not answers. Riot's art is not committed, so
 // tests/cv/fixtures-games/ is gitignored and this suite skips itself when it
 // has not been built.
 //
@@ -25,7 +29,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { TemplateSet, iconTemplates, whoseIcon } from '../../src/services/skin-matcher';
+import {
+  MatchScore, TemplateSet, decideMatch, iconTemplates, matchIcon, normalizedInner, sampleSquare, whoseIcon,
+} from '../../src/services/skin-matcher';
 import { iconCropBox } from '../../src/services/tracking-helpers';
 
 const DIR = path.join(__dirname, 'fixtures-games');
@@ -55,24 +61,66 @@ if (!games) {
   console.log('real-games: tests/cv/fixtures-games/ not built — run scripts/make-game-fixtures.py on Debug zips');
 }
 
+function templateSets(game: Game): TemplateSet[] {
+  return game.roster.map(r => ({
+    id: r.alias,
+    vecs: r.icons.flatMap((f) => {
+      const [w, h] = game.icons[f];
+      const raw = fs.readFileSync(path.join(DIR, 'icons', f.replace(/\.png$/, '.rgba')));
+      return iconTemplates(new Uint8Array(raw), w, h);
+    }),
+  }));
+}
+
+function patchFrame(p: Patch): { width: number; height: number; data: Uint8ClampedArray<ArrayBuffer> } {
+  const raw = fs.readFileSync(path.join(DIR, 'patches', p.file));
+  return { width: p.side, height: p.side, data: new Uint8ClampedArray(raw) as Uint8ClampedArray<ArrayBuffer> };
+}
+
+/** Every crop size and every offset within 2 px: what matchIcon approximates. */
+function exhaustiveMatch(frame: ReturnType<typeof patchFrame>, cx: number, cy: number, diam: number, sets: TemplateSet[]): MatchScore[] {
+  const best = sets.map(() => -Infinity);
+  for (const k of [0.95, 1.05, 1.15]) {
+    for (let dy = -2; dy <= 2; dy++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        const v = normalizedInner(sampleSquare(frame.data, frame.width, frame.height, cx + dx, cy + dy, diam * k));
+        sets.forEach((set, i) => {
+          for (const t of set.vecs) {
+            let s = 0;
+            for (let j = 0; j < v.length; j++) s += v[j] * t[j];
+            best[i] = Math.max(best[i], s);
+          }
+        });
+      }
+    }
+  }
+  return sets.map((set, i) => ({ id: set.id, score: best[i] })).sort((a, b) => b.score - a.score);
+}
+
 maybe('the skin matcher on real games\' icons', () => {
   for (const game of games ?? []) {
+    test(game.zip + ': the crop search decides as an exhaustive one would', () => {
+      const sets = templateSets(game);
+      const differ: string[] = [];
+      for (const p of game.patches) {
+        const frame = patchFrame(p);
+        const box = iconCropBox(p.cx, p.cy, p.diam);
+        const cx = box.cropX + box.cropW / 2;
+        const cy = box.cropY + box.cropH / 2;
+        const fast = decideMatch(matchIcon(frame, cx, cy, box.cropW, sets));
+        const full = decideMatch(exhaustiveMatch(frame, cx, cy, box.cropW, sets));
+        if (fast !== full) differ.push(p.file + ': ' + fast + ' vs ' + full);
+      }
+      expect(differ).toEqual([]);
+    });
+
     test(game.zip + ': names the right teammate, and never the wrong one', () => {
-      const sets: TemplateSet[] = game.roster.map(r => ({
-        id: r.alias,
-        vecs: r.icons.flatMap((f) => {
-          const [w, h] = game.icons[f];
-          const raw = fs.readFileSync(path.join(DIR, 'icons', f.replace(/\.png$/, '.rgba')));
-          return iconTemplates(new Uint8Array(raw), w, h);
-        }),
-      }));
+      const sets = templateSets(game);
       let right = 0;
       let icons = 0;
       const wrong: string[] = [];
       for (const p of game.patches.filter(q => q.label !== '?')) {
-        const raw = fs.readFileSync(path.join(DIR, 'patches', p.file));
-        const frame = { width: p.side, height: p.side, data: new Uint8ClampedArray(raw) as Uint8ClampedArray<ArrayBuffer> };
-        const who = whoseIcon(frame, iconCropBox(p.cx, p.cy, p.diam), sets);
+        const who = whoseIcon(patchFrame(p), iconCropBox(p.cx, p.cy, p.diam), sets);
         if (p.label !== 'nobody') icons++;
         if (who === null) continue;
         if (who === p.label) right++;

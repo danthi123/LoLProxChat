@@ -714,6 +714,22 @@ describe('teammate skin icons', () => {
     expect(h.tracker.classifierSet).toBe(false);
   });
 
+  it('starts no download for a game that ended while it was starting', async () => {
+    const load = jest.fn(async (team: TeammateSkin[]) => fakeSets(team));
+    const h = makeHarness({}, TEAM, { createClassifier: async () => model, loadSkinTemplates: load });
+    let release: () => void = () => undefined;
+    h.tracker.initCaptureBounds = () => new Promise<void>((resolve) => { release = resolve; });
+    h.orchestrator.start();
+    await settle();
+    h.gameState.gameEnded();
+    await jest.advanceTimersByTimeAsync(3000);
+    await settle();
+    release();
+    await settle();
+    expect(load).not.toHaveBeenCalled();
+    expect(h.tracker.classifierSet).toBe(false);
+  });
+
   it('cancels the download when the game ends', async () => {
     const { h, signals } = await start(TEAM, model);
     expect(signals[0].aborted).toBe(false);

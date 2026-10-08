@@ -525,6 +525,8 @@ export class Orchestrator {
 
       // Set capture bounds in Tauri backend
       await this.tracking.initCaptureBounds();
+      // The game may have ended while that was awaited.
+      if (this.session !== session || !this.tracking) return;
 
       // Load champion classifier (async, non-blocking — tracking works without it)
       // and, alongside it, the minimap icons of the skins this team has on,
@@ -552,6 +554,7 @@ export class Orchestrator {
         : []));
       if (this.deps.loadSkinTemplates && mates.length >= 2 && team.length === mates.length) {
         const iconsAbort = new AbortController();
+        this.skinIconsAbort?.abort();
         this.skinIconsAbort = iconsAbort;
         this.deps.loadSkinTemplates(team, iconsAbort.signal).then((sets) => {
           if (this.tracking !== tracking) return;

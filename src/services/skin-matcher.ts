@@ -36,15 +36,16 @@ const ICON_BACKDROP = 30;
  *  art than the full circle image, by an amount that varies with HUD scale. */
 const TEMPLATE_ZOOMS = [0.8, 0.9, 1.0];
 /** Crop sizes (fraction of the expected icon diameter) and centre offsets
- *  (px) searched around each blob: blob centres are off by a pixel or two.
- *  The search is coarse first (every other pixel), then a pixel either way
- *  around the best spot of each teammate still in contention. */
+ *  (px, at most MAX_SHIFT either way) searched around each blob: blob centres
+ *  are off by a pixel or two. The search is coarse first (every other pixel),
+ *  then a pixel either way around each teammate's best coarse spot. */
 const CROP_SCALES = [0.95, 1.05, 1.15];
 const COARSE_SHIFTS = [-2, 0, 2];
-/** Teammates within this of the best coarse score are refined: everyone the
- *  margin test could turn on. */
-const REFINE_WITHIN = MATCH_MIN_MARGIN + 0.1;
-/** Below this coarse score no refinement can make a match: stop there. */
+const MAX_SHIFT = 2;
+/** Below this best coarse score the icon is left undecided without refining.
+ *  Refining can lift a score by more than the 0.1 between this and
+ *  MATCH_MIN_SCORE (up to 0.28 on the real-game fixtures), so this only ever
+ *  errs towards "unsure" — never towards naming someone. */
 const REFINE_MIN = MATCH_MIN_SCORE - 0.1;
 
 let innerCache: Int32Array | null = null;
@@ -191,8 +192,9 @@ export interface MatchScore { id: string; score: number }
 /**
  * Correlate the icon centred near (cx, cy) in `frame` with every teammate's
  * templates, searching a few crop sizes and centre offsets. Best score per
- * teammate, highest first. Teammates too far behind to matter, and every
- * teammate when nobody comes close to a match, keep their coarse score.
+ * teammate, highest first; when nobody comes close to a match, the coarse
+ * scores. Every teammate is refined, not just the leader: a runner-up left at
+ * its coarse score would understate it and inflate the margin.
  */
 export function matchIcon(
   frame: CaptureFrame,
@@ -217,12 +219,13 @@ export function matchIcon(
     });
   };
   for (const k of CROP_SCALES) for (const dy of COARSE_SHIFTS) for (const dx of COARSE_SHIFTS) tryAt(k, dx, dy);
-  const top = Math.max(-Infinity, ...best);
-  if (top >= REFINE_MIN) {
-    const contenders = sets.map((_, si) => si).filter(si => best[si] >= top - REFINE_WITHIN);
-    for (const si of contenders) {
-      const { k, dx, dy } = where[si];
-      for (let ddy = -1; ddy <= 1; ddy++) for (let ddx = -1; ddx <= 1; ddx++) tryAt(k, dx + ddx, dy + ddy);
+  if (Math.max(-Infinity, ...best) >= REFINE_MIN) {
+    // Seeds fixed before refining: tryAt moves `where` as it goes, and
+    // refining around a moved spot would walk the search outwards.
+    const seeds = where.map(w => ({ ...w }));
+    const clamp = (d: number): number => Math.max(-MAX_SHIFT, Math.min(MAX_SHIFT, d));
+    for (const { k, dx, dy } of seeds) {
+      for (let ddy = -1; ddy <= 1; ddy++) for (let ddx = -1; ddx <= 1; ddx++) tryAt(k, clamp(dx + ddx), clamp(dy + ddy));
     }
   }
   return sets.map((set, si) => ({ id: set.id, score: best[si] })).sort((a, b) => b.score - a.score);
