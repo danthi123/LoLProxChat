@@ -98,6 +98,8 @@ function exhaustiveMatch(frame: ReturnType<typeof patchFrame>, cx: number, cy: n
 }
 
 maybe('the skin matcher on real games\' icons', () => {
+  // Jest fails a suite with no tests, so an unbuilt set still declares one.
+  if (!games || games.length === 0) test.skip('tests/cv/fixtures-games/ not built', () => undefined);
   for (const game of games ?? []) {
     test(game.zip + ': the crop search decides as an exhaustive one would', () => {
       const sets = templateSets(game);
