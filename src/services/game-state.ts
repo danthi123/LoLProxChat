@@ -5,6 +5,7 @@ import { generateRoomId } from '../core/room';
 import {
   Identity,
   matchLocal,
+  normalizeName,
   presentIdentityFields,
   readIdentity,
 } from '../core/identity';
@@ -93,6 +94,38 @@ export type SessionResult =
   | { ok: true; session: GameSession }
   | { ok: false; reason: SessionFailureReason; detail: string };
 
+/**
+ * The names the room id is hashed from — every other client's `summonerName`
+ * for each player, as near as this client can reconstruct it.
+ *
+ * League's streamer mode rewrites `summonerName` on the streamer's own client
+ * to every player's champion name, while the split Riot ID fields stay real.
+ * Hashing `summonerName` as-is put a streamer in a room of their own: in the
+ * 2026-10-07 test XadowAsol's client hashed seven champion names to 103cahv
+ * while the other six hashed the Riot IDs to vrb9uf. So a name that is exactly
+ * the champion name with no tag, where a Riot ID exists, is replaced
+ * by the Riot ID spelled the way the unobscured entries in this roster spell
+ * theirs ("name#tag" unless every one of them is bare). Unobscured names pass
+ * through untouched, so the id still matches clients that predate this.
+ */
+export function roomNames(allPlayers: Player[]): string[] {
+  const isObscured = (p: Player): boolean => {
+    const gameName = p.riotIdGameName?.trim() ?? '';
+    return gameName !== '' &&
+      typeof p.summonerName === 'string' && typeof p.championName === 'string' &&
+      !p.summonerName.includes('#') &&
+      normalizeName(p.summonerName) === normalizeName(p.championName);
+  };
+  const shown = allPlayers.filter((p) => typeof p.summonerName === 'string' && !isObscured(p));
+  const tagged = shown.length === 0 || shown.some((p) => p.summonerName.includes('#'));
+  return allPlayers.map((p) => {
+    if (!isObscured(p)) return p.summonerName;
+    const gameName = p.riotIdGameName!.trim();
+    const tag = p.riotIdTagLine?.trim() ?? '';
+    return tagged && tag ? gameName + '#' + tag : gameName;
+  });
+}
+
 export class GameStateService {
   private session: GameSession | null = null;
 
@@ -171,8 +204,7 @@ export class GameStateService {
         ' (roster tag lines available: ' + hasTagLines + ')');
     }
 
-    const playerNames = allPlayers.map((p) => p.summonerName);
-    const roomId = generateRoomId(playerNames);
+    const roomId = generateRoomId(roomNames(allPlayers));
 
     const gameMode = typeof gameData?.gameMode === 'string' ? gameData.gameMode : 'CLASSIC';
     const detection = detectMap(gameData);

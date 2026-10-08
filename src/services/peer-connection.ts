@@ -209,6 +209,27 @@ export class PeerConnection {
     this.audioElement.volume = Math.max(0, Math.min(1, value));
   }
 
+  /**
+   * Every peer in every log of the 2026-10-07 test hit an AbortError on its
+   * first play(), and the gesture retry below waits for a click on the panel,
+   * which nobody makes mid-game. So whenever this peer should be audible and
+   * the element is not playing, ask again — from the volume ticker, which runs
+   * whether or not the volume is changing (an ally sits at 1.0 all game).
+   */
+  private ensurePlaying(nowMs: number): void {
+    if (this.muted || !this.targetVolume || !this.audioElement.paused) return;
+    if (this.remoteStream.getAudioTracks().length === 0) return;
+    if (nowMs - this.lastPlayRetryAt < PeerConnection.PLAY_RETRY_MS) return;
+    this.lastPlayRetryAt = nowMs;
+    Promise.resolve()
+      .then(() => this.audioElement.play())
+      .then(() => console.log('[WebRTC] Playback started for', this.remoteName))
+      .catch(() => { /* the next tick retries */ });
+  }
+
+  private lastPlayRetryAt = -Infinity;
+  static readonly PLAY_RETRY_MS = 2000;
+
   private tryPlay(): void {
     this.audioElement.play().catch((err) => {
       // Autoplay blocked by browser policy — retry on next user gesture.
@@ -322,6 +343,7 @@ export class PeerConnection {
   /** One smoothing step towards the target. Driven by AudioService's ticker. */
   stepVolume(nowMs: number): void {
     if (this.smoothedVolume === null) return;
+    this.ensurePlaying(nowMs);
     if (this.smoothedVolume === this.targetVolume) {
       this.lastSetVolumeMs = nowMs;
       return;

@@ -4,6 +4,15 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Fixed
+- **A player with League's streamer mode on was alone in their own voice room.** The room everyone meets in is worked out from the players' names, and streamer mode replaces every name on the streamer's own client with the champion name — so in a 7-player test one player computed a different room from the other six and never met anyone. The room now uses each player's Riot ID wherever streamer mode has hidden the name, which is what everyone else's client sees; players without streamer mode get the same room as before, so this works alongside older versions.
+- **A blocked microphone no longer silently cancels voice chat.** The app now grants its own windows microphone access, so a "Block" clicked once on the microphone permission prompt can no longer lock it out. If the microphone still can't be opened (Windows Settings › Privacy › Microphone › "Let desktop apps access your microphone" turned off, or no device), you still hear everyone, the panel says "Microphone blocked — listening only", and the app retries every 10 seconds, so fixing the setting or plugging in a headset picks up without restarting. Before, the session was dropped and the panel looked normal.
+- **Tracking no longer jumps you across the map on a guess.** After losing your icon for a moment, the app used to accept any icon the champion classifier mildly preferred, however far away — in the test, a top laner was put in bot lane (13,000 units in 0.6 s) and heard, and was heard by, the enemy bot laner. An icon further away than you could have travelled now needs the classifier to be genuinely sure — both when re-finding you and when rescanning after 5 seconds lost; otherwise you stay "lost" (team-only) until you are found nearby or within walking reach, instead of being placed next to the wrong enemies. A recall to your fountain is unaffected. The classifier recognised almost no one in that test, so a teleport may take longer to follow than before.
+- **Voices could stay silent until you clicked the panel.** Every voice connection in the test logged a blocked first playback, with a retry that waited for a click on the panel — rare mid-game. Playback is now retried every couple of seconds while that player should be audible.
+
+### Added
+- **The log records the settings each game starts with** — Ally proximity, Voice on camera, Hide IP, chosen devices. The test's logs could only suggest that every player had both opt-ins on.
+
 ## [v0.5.15] — 2026-10-07
 
 ### Changed

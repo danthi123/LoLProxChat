@@ -5,6 +5,7 @@ mod game_window;
 mod global_keys;
 mod key_decision;
 mod lcu;
+mod mic_permission;
 mod updater;
 
 use capture::CaptureState;
@@ -196,6 +197,10 @@ fn main() {
             // startup. setup_hook logs the install result from the hook thread,
             // where the outcome is actually known.
             global_keys::setup_hook(app.handle().clone());
+
+            for webview in app.webview_windows().values() {
+                mic_permission::allow_microphone(webview);
+            }
 
             let Some(window) = app.get_webview_window("overlay") else {
                 return Ok(());

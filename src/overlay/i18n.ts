@@ -111,6 +111,8 @@ export type StringKey = keyof typeof STRINGS;
 // The orchestrator's and the game-window / tracking warnings' exact wording.
 const STATUS_ES: Record<string, string> = {
   'Waiting for League of Legends': 'Esperando a League of Legends',
+  'Microphone blocked — listening only. Check Windows microphone privacy settings':
+    'Micrófono bloqueado — solo escuchas. Revisa la privacidad del micrófono en Windows',
   'Searching for your champion on the minimap': 'Buscando a tu campeón en el minimapa',
   'In client': 'En el cliente',
   'In lobby': 'En la sala',

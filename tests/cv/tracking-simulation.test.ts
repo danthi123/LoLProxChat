@@ -1639,3 +1639,66 @@ describe('the rescan after a hold runs out', () => {
     expect(distance(last.px!, VANISH)).toBeLessThanOrEqual(3);
   });
 });
+
+describe('re-acquiring across the map (2026-10-07 gcg545 log)', () => {
+  // A Darius in top lane lost his icon and Phase 2 re-acquired him on a
+  // teammate's icon in bot lane — 13,000 units in 0.6 s — on a smoothed score
+  // of 0.64 that a near-silent model's normalization had produced. The enemy
+  // bot laner then heard him, and he heard them.
+  const WALK = 16;
+  const VANISH: Point = at(START, STEP, WALK - 1);
+  const FAR_ALLY: Point = BACKDROP.allies![1];
+  const reacquired = () => logs.some(l => l.includes('Re-acquired via classifier'));
+
+  /** Recognises us while we walk, then names `after` once our icon is gone. */
+  function run(specs: SceneSpec[], after: Point, raw: number) {
+    const scenes = renderScenes(specs);
+    let h: ReturnType<typeof newTracker> | null = null;
+    const target = () => {
+      const frame = h ? h.source.captureCount - 1 : 0;
+      return toFramePoint(frame < WALK ? at(START, STEP, frame) : after);
+    };
+    h = newTracker(scenes.map(s => s.frame), { classifier: new OracleScorer(target, raw) });
+    return driveTracker(h, scenes);
+  }
+
+  test('a near-silent model cannot move us further than we could have travelled', async () => {
+    // Past the 5 s forced rescan too: that rescan used to count the same
+    // normalized score as identifying the far icon and lock onto it there.
+    const records = await run([...walk(WALK), ...vanished(140)], FAR_ALLY, 0.02);
+
+    expect(distance(VANISH, FAR_ALLY)).toBeGreaterThan(150);
+    expect(reacquired()).toBe(false);
+    expect(logs.some(l => l.includes('Not re-acquiring at game('))).toBe(true);
+    for (const r of records.slice(WALK)) {
+      if (r.px) expect(distance(r.px, FAR_ALLY)).toBeGreaterThan(50);
+    }
+    expect(logs.some(l => l.includes('Hold exceeded'))).toBe(true);
+    expect(logs.some(l => l.includes('SCANNING -> LOCKED'))).toBe(true); // the walk's own lock only
+    expect(logs.filter(l => l.includes('SCANNING -> LOCKED')).length).toBe(1);
+  });
+
+  test('a model that really recognises us still follows a Teleport', async () => {
+    const records = await run([
+      ...walk(WALK),
+      ...vanished(8),
+      ...Array.from({ length: 16 }, () => ({ ...BACKDROP, allies: [BACKDROP.allies![0]], self: FAR_ALLY })),
+    ], FAR_ALLY, 0.9);
+
+    expect(reacquired()).toBe(true);
+    expect(distance(records[records.length - 1].px!, FAR_ALLY)).toBeLessThan(12);
+  });
+
+  test('a recall into the fountain needs no more than before', async () => {
+    const FOUNTAIN: Point = { x: 20, y: 255 };
+    const records = await run([
+      ...walk(WALK),
+      ...vanished(4),
+      ...Array.from({ length: 16 }, () => ({ ...BACKDROP, turrets: [], self: FOUNTAIN })),
+    ], FOUNTAIN, 0.02);
+
+    expect(distance(VANISH, FOUNTAIN)).toBeGreaterThan(90);
+    expect(reacquired()).toBe(true);
+    expect(distance(records[records.length - 1].px!, FOUNTAIN)).toBeLessThan(12);
+  });
+});

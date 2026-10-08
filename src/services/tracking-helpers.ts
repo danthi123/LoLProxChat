@@ -4,6 +4,7 @@
 // logging, position updates) stay in TrackingService itself.
 
 import type { Blob } from './blob-types';
+import type { Position } from '../core/types';
 
 /**
  * Maximum allowed per-frame jump distance, in minimap pixels. Allows normal
@@ -35,6 +36,70 @@ export function computeReacquireThreshold(
   if (stationarySec > 3) return 0.85;
   if (holdSec > 1.0) return 0.35;
   return 0.5;
+}
+
+// ---------- how far a re-acquisition may move us ----------
+
+/**
+ * Classifier confidence a Phase-2 re-acquisition needs when it would move us
+ * further than a champion can travel. The ordinary thresholds (0.35-0.5 after
+ * a short hold) were set for finding ourselves again nearby; applied across
+ * the map they let a weak score teleport us. In the 2026-10-07 test a Darius in
+ * top lane was re-acquired on a teammate's icon in bot lane at 0.64 and then
+ * 0.85 — 13,000 units in 0.6 s — so the enemy bot laner heard him and he heard
+ * them. Every correct re-acquisition in that log scored 0.99-1.00.
+ */
+export const FAR_REACQUIRE_THRESHOLD = 0.9;
+
+/**
+ * ...and the model's own, un-normalized output for that icon on its latest
+ * run. The smoothed score is relative to the best icon in view, so a model
+ * that recognises nobody (the median best raw score across that test's logs
+ * was 0.002) still drives one icon to 1.0. Across those logs only 10% of runs
+ * scored any icon above 0.14.
+ */
+export const FAR_REACQUIRE_MIN_RAW = 0.3;
+
+/**
+ * Game units we may plausibly have covered since we were last seen: an icon's
+ * width of measurement slack plus Flash and a dash, then a fast champion's
+ * run speed with a margin.
+ */
+export const REACQUIRE_REACH_BASE_UNITS = 2500;
+export const REACQUIRE_REACH_UNITS_PER_SEC = 700;
+
+/** A recall lands in a fountain: within this fraction of the map's width of
+ *  either base corner, a long jump is a recall, not a mis-track. */
+export const BASE_ZONE_FRACTION = 0.2;
+
+export function reacquireReachUnits(elapsedSec: number): number {
+  return REACQUIRE_REACH_BASE_UNITS + REACQUIRE_REACH_UNITS_PER_SEC * Math.max(0, elapsedSec);
+}
+
+export function isInBaseZone(p: Position, map: { width: number; height: number }): boolean {
+  const r = BASE_ZONE_FRACTION * map.width;
+  return Math.hypot(p.x, p.y) <= r || Math.hypot(map.width - p.x, map.height - p.y) <= r;
+}
+
+/**
+ * The threshold for re-acquiring at `candidate`: the ordinary one when it is
+ * within reach of where we were last seen (or in a base), otherwise
+ * FAR_REACQUIRE_THRESHOLD. Turning a far candidate down leaves us holding —
+ * the 2 s disown then fades enemies out rather than putting us beside the
+ * wrong ones.
+ */
+export function reacquireThresholdAt(
+  ordinary: number,
+  candidate: Position,
+  lastSeen: Position | null,
+  elapsedSec: number,
+  map: { width: number; height: number },
+): number {
+  if (!lastSeen) return ordinary;
+  const dist = Math.hypot(candidate.x - lastSeen.x, candidate.y - lastSeen.y);
+  if (dist <= reacquireReachUnits(elapsedSec)) return ordinary;
+  if (isInBaseZone(candidate, map)) return ordinary;
+  return Math.max(ordinary, FAR_REACQUIRE_THRESHOLD);
 }
 
 export interface BlobScoreInputs {
@@ -168,13 +233,13 @@ export function pickBestBlobInRange(
  */
 export function pickClassifierReacquisition(
   tealBlobs: Blob[],
-  threshold: number,
+  threshold: number | ((b: Blob) => number),
   clsScoreFn: (b: Blob) => number,
 ): ScoredBlob | null {
   let best: ScoredBlob | null = null;
   for (const b of tealBlobs) {
     const clsScore = clsScoreFn(b);
-    if (clsScore < threshold) continue;
+    if (clsScore < (typeof threshold === 'number' ? threshold : threshold(b))) continue;
     if (!best || clsScore > best.score) best = { blob: b, score: clsScore };
   }
   return best;

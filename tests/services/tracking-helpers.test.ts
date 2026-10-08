@@ -18,6 +18,12 @@ import {
   WRONG_LOCK_RUNS,
   WRONG_LOCK_MIN_MS,
   WRONG_LOCK_STALE_MS,
+  reacquireThresholdAt,
+  reacquireReachUnits,
+  isInBaseZone,
+  FAR_REACQUIRE_THRESHOLD,
+  REACQUIRE_REACH_BASE_UNITS,
+  REACQUIRE_REACH_UNITS_PER_SEC,
 } from '../../src/services/tracking-helpers';
 import type { Blob } from '../../src/services/blob-types';
 
@@ -537,5 +543,47 @@ describe('nextWrongLockEvidence', () => {
     expect(WRONG_LOCK_STALE_MS).toBeLessThanOrEqual(3000);
     expect(later.switchTo).toBeNull();
     expect(later.evidence.runs).toBe(1);
+  });
+});
+
+describe('reacquireThresholdAt — how far a re-acquisition may move us', () => {
+  const SR = { width: 14870, height: 14980 };
+  const TOP = { x: 1912, y: 11850 };
+
+  test('nearby keeps the ordinary threshold', () => {
+    expect(reacquireThresholdAt(0.35, { x: 3000, y: 12500 }, TOP, 0.6, SR)).toBe(0.35);
+  });
+
+  test('top lane to bot lane in 0.6 s needs the far threshold (the gcg545 log)', () => {
+    expect(reacquireThresholdAt(0.5, { x: 11541, y: 2459 }, TOP, 0.64, SR)).toBe(FAR_REACQUIRE_THRESHOLD);
+  });
+
+  test('reach grows with time since we were last seen', () => {
+    const far = { x: 6000, y: 8000 };
+    const dist = Math.hypot(far.x - TOP.x, far.y - TOP.y);
+    expect(reacquireReachUnits(0)).toBeLessThan(dist);
+    expect(reacquireThresholdAt(0.35, far, TOP, 0, SR)).toBe(FAR_REACQUIRE_THRESHOLD);
+    const sec = (dist - REACQUIRE_REACH_BASE_UNITS) / REACQUIRE_REACH_UNITS_PER_SEC + 0.1;
+    expect(reacquireThresholdAt(0.35, far, TOP, sec, SR)).toBe(0.35);
+  });
+
+  test('a recall to either fountain is exempt', () => {
+    expect(isInBaseZone({ x: 500, y: 500 }, SR)).toBe(true);
+    expect(isInBaseZone({ x: 14300, y: 14400 }, SR)).toBe(true);
+    expect(isInBaseZone({ x: 13600, y: 1500 }, SR)).toBe(false);
+    expect(reacquireThresholdAt(0.5, { x: 14300, y: 14400 }, { x: 1000, y: 2000 }, 0.1, SR)).toBe(0.5);
+  });
+
+  test('never lowers an already higher ordinary threshold, and needs a last sighting', () => {
+    expect(reacquireThresholdAt(0.95, { x: 11541, y: 2459 }, TOP, 0.5, SR)).toBe(0.95);
+    expect(reacquireThresholdAt(0.35, { x: 11541, y: 2459 }, null, 0.5, SR)).toBe(0.35);
+  });
+
+  test('pickClassifierReacquisition takes a per-blob threshold', () => {
+    const near = mkBlob(10, 10);
+    const far = mkBlob(200, 200);
+    const picked = pickClassifierReacquisition([near, far], (b) => (b === far ? 0.9 : 0.5),
+      (b) => (b === far ? 0.85 : 0.6));
+    expect(picked?.blob).toBe(near);
   });
 });

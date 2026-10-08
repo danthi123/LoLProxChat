@@ -16,6 +16,9 @@ import {
   computeReacquireThreshold,
   pickBestBlobInRange,
   pickClassifierReacquisition,
+  reacquireThresholdAt,
+  FAR_REACQUIRE_THRESHOLD,
+  FAR_REACQUIRE_MIN_RAW,
   ScoreFns,
   // v0.3: CV tracking tweaks driven by IXAM's v0.1.33 issue #7 logs
   // (v0.3.1 reverted the classifier-confidence-dependent ones — see below)
@@ -102,6 +105,9 @@ export class TrackingService {
   private classifier: BlobScorer | null = null;
   // Cached classifier scores per blob (refreshed periodically, not every frame)
   private classifierScores: Map<string, number> = new Map();
+  /** The latest run's un-normalized model output per blob — what a far
+   *  re-acquisition is gated on (see FAR_REACQUIRE_MIN_RAW). */
+  private rawClassifierScores: Map<string, number> = new Map();
   // EMA-smoothed classifier scores to dampen single-frame misclassifications
   private smoothedClassifierScores: Map<string, number> = new Map();
   private lastClassifierRunMs = 0;
@@ -496,9 +502,11 @@ export class TrackingService {
       const toleranceSq = tolerance * tolerance;
 
       this.classifierScores.clear();
+      this.rawClassifierScores.clear();
       for (let i = 0; i < tealBlobs.length; i++) {
         const key = tealBlobs[i].cx + ',' + tealBlobs[i].cy;
         const norm = normalizedScores[i];
+        this.rawClassifierScores.set(key, rawScores[i] ?? 0);
 
         // Find closest prior smoothed score (blobs shift slightly between frames)
         let priorSmoothed = -1;
@@ -585,9 +593,9 @@ export class TrackingService {
    * Get cached classifier score for a blob.
    * Uses fuzzy matching: finds the closest cached blob center within icon diameter.
    */
-  private getClassifierScore(blob: Blob): number {
+  private getClassifierScore(blob: Blob, scores: Map<string, number> = this.classifierScores): number {
     // Exact match first
-    const exact = this.classifierScores.get(blob.cx + ',' + blob.cy);
+    const exact = scores.get(blob.cx + ',' + blob.cy);
     if (exact !== undefined) return exact;
 
     // Fuzzy match: find closest cached center within icon diameter tolerance
@@ -595,7 +603,7 @@ export class TrackingService {
     const toleranceSq = tolerance * tolerance;
     let bestScore = 0;
     let bestDistSq = Infinity;
-    for (const [key, score] of this.classifierScores) {
+    for (const [key, score] of scores) {
       const [kx, ky] = key.split(',').map(Number);
       const dx = blob.cx - kx;
       const dy = blob.cy - ky;
@@ -1365,7 +1373,12 @@ export class TrackingService {
       // us or comes within reach. The reach grows at walking speed, so this
       // cannot stall for good.
       if (this.lostAt) {
-        const identified = (classifierUsable && clsScore >= 0.5) || whiteScore > 0;
+        // The smoothed score is normalized to the best icon in view, so a
+        // near-silent model makes one icon "identified" at 1.0; the raw output
+        // has to say something too (the 2026-10-07 log's far re-locks).
+        const identified = (classifierUsable && clsScore >= 0.5 &&
+          this.getClassifierScore(b, this.rawClassifierScores) >= FAR_REACQUIRE_MIN_RAW) ||
+          whiteScore > 0;
         const reach = rescanReachPx(this.expectedIconDiam, performance.now() - this.lostAtMs);
         if (!identified && Math.hypot(b.cx - this.lostAt.x, b.cy - this.lostAt.y) > reach) continue;
       }
@@ -1574,7 +1587,8 @@ export class TrackingService {
       this.holdReason = 'no-match';
       const stationarySec = this.lastMovementMs > 0 ? (now - this.lastMovementMs) / 1000 : 0;
       const reacquireThreshold = computeReacquireThreshold(stationarySec, holdSec);
-      const phase2 = pickClassifierReacquisition(tealBlobs, reacquireThreshold, scoreFns.cls);
+      const phase2 = pickClassifierReacquisition(
+        tealBlobs, this.reacquireThresholdFn(reacquireThreshold, holdSec, scoreFns.cls), scoreFns.cls);
       if (phase2) {
         this.acquireViaClassifier(phase2.blob, phase2.score);
         return;
@@ -1594,6 +1608,46 @@ export class TrackingService {
 
     this.finalizeLockedFrame(phase1.blob, lastReg, holdSec, redBlobs);
   }
+
+  /**
+   * Per-blob Phase-2 threshold: an icon further than we could have travelled
+   * since we were last seen needs the classifier to be all but certain (see
+   * reacquireThresholdAt). Logs the first refusal of each hold.
+   */
+  private reacquireThresholdFn(
+    ordinary: number,
+    holdSec: number,
+    cls: (b: Blob) => number,
+  ): (b: Blob) => number {
+    const region = this.minimapRegion;
+    const lastSeen = this.lastSeenPosition;
+    if (!region || !lastSeen) return () => ordinary;
+    const map = MAP_DIMENSIONS[this.mapType];
+    return (b) => {
+      const at = this.pixelToGamePosition(region.x + b.cx, region.y + b.cy, region);
+      let threshold = reacquireThresholdAt(ordinary, at, lastSeen, holdSec, map);
+      const score = cls(b);
+      const raw = this.getClassifierScore(b, this.rawClassifierScores);
+      // The smoothed score is normalized to the best blob in view, so it climbs
+      // to 1.0 on whichever icon a near-silent model ranks first; a far jump
+      // also needs the model itself to say something.
+      if (threshold > ordinary && raw < FAR_REACQUIRE_MIN_RAW) threshold = Infinity;
+      if (threshold > ordinary && score >= ordinary &&
+          this.farRefusalLoggedHold !== this.holdStartMs) {
+        if (score < threshold) {
+          this.farRefusalLoggedHold = this.holdStartMs;
+          console.log('[Tracking] Not re-acquiring at game(' + Math.round(at.x) + ',' + Math.round(at.y) +
+            '): ' + Math.round(Math.hypot(at.x - lastSeen.x, at.y - lastSeen.y)) +
+            ' units from where we were seen ' + holdSec.toFixed(1) + 's ago needs cls>=' +
+            FAR_REACQUIRE_THRESHOLD.toFixed(2) + ' and raw>=' + FAR_REACQUIRE_MIN_RAW.toFixed(2) +
+            ', got cls=' + score.toFixed(2) + ' raw=' + raw.toFixed(3));
+        }
+      }
+      return threshold;
+    };
+  }
+
+  private farRefusalLoggedHold = -1;
 
   /** Phase 2 success path: snap position, reset velocity, log, fire callback. */
   private acquireViaClassifier(blob: Blob, clsScore: number): void {

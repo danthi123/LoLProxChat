@@ -1,4 +1,5 @@
-import { GameStateService } from '../../src/services/game-state';
+import { GameStateService, roomNames } from '../../src/services/game-state';
+import { generateRoomId } from '../../src/core/room';
 import { readIdentity, Identity } from '../../src/core/identity';
 import { Player } from '../../src/core/types';
 
@@ -177,5 +178,69 @@ describe('GameStateService room id', () => {
       .createSession([roster[1]], local({ summonerName: 'Alice' }), SR);
     if (!withStreamer.ok || !withoutStreamer.ok) throw new Error('unreachable');
     expect(withStreamer.session.roomId).not.toBe(withoutStreamer.session.roomId);
+  });
+});
+
+describe('room names under League streamer mode', () => {
+  // The 2026-10-07 test: on XadowAsol's client (streamer mode) every
+  // summonerName was the champion name while the split Riot ID stayed real.
+  const real: [string, string, string, string][] = [
+    ['NotOtakuu', 'RAWR', 'Yasuo', 'ORDER'],
+    ['Quevedo', 'cpev', 'Yunara', 'ORDER'],
+    ['TTV XadowAsol', 'ASOL', 'Aurelion Sol', 'ORDER'],
+    ['gcg545', 'EUW', 'Darius', 'CHAOS'],
+    ['Ésaïe', 'cruz', 'Orianna', 'CHAOS'],
+    ['Vmezcua VDB', 'Fiora', 'Fiora', 'CHAOS'],
+    ['SlayBells1780', 'EUW', 'Irelia', 'CHAOS'],
+  ];
+  const asSeenBy = (streamer: boolean, roster = real) => roster.map(([name, tag, champ, team]) => makePlayer({
+    summonerName: streamer ? champ : name + '#' + tag,
+    championName: champ,
+    team: team as 'ORDER' | 'CHAOS',
+    riotIdGameName: name,
+    riotIdTagLine: tag,
+  }));
+
+  // gcg545 played Sion in the first two games and Darius in the third.
+  const withSion = real.map((r) => (r[0] === 'gcg545' ? [r[0], r[1], 'Sion', r[3]] : r)) as typeof real;
+
+  it('reproduces every room id from the logs', () => {
+    expect(generateRoomId(asSeenBy(false).map((p) => p.summonerName))).toBe('vrb9uf');
+    expect(generateRoomId(asSeenBy(true, withSion).map((p) => p.summonerName))).toBe('103cahv');
+    expect(generateRoomId(asSeenBy(true).map((p) => p.summonerName))).toBe('1sm85hu');
+  });
+
+  it('puts the streamer in the same room as everyone else', () => {
+    expect(generateRoomId(roomNames(asSeenBy(true)))).toBe('vrb9uf');
+    expect(generateRoomId(roomNames(asSeenBy(true, withSion)))).toBe('vrb9uf');
+    expect(generateRoomId(roomNames(asSeenBy(false)))).toBe('vrb9uf');
+  });
+
+  it("still works when someone's Riot ID is their champion's name", () => {
+    // On the streamer's client this player is a bare "Fiora" like everyone
+    // else; left as it was, it would also make the roster look untagged.
+    const roster = [...real.filter((r) => r[2] !== 'Fiora'), ['Fiora', 'EUW', 'Fiora', 'CHAOS']] as typeof real;
+    const everyone = generateRoomId(asSeenBy(false, roster).map((p) => p.summonerName));
+    expect(generateRoomId(roomNames(asSeenBy(true, roster)))).toBe(everyone);
+  });
+
+  it('leaves a player who picked their champion as a name alone', () => {
+    // Fiora's tag is "Fiora": a tagged name never counts as obscured.
+    const p = makePlayer({ summonerName: 'Fiora#EUW', championName: 'Fiora',
+      riotIdGameName: 'Fiora', riotIdTagLine: 'EUW' });
+    expect(roomNames([p])).toEqual(['Fiora#EUW']);
+  });
+
+  it('spells the Riot ID bare when the roster spells names bare', () => {
+    const roster = [
+      makePlayer({ summonerName: 'Lux', championName: 'Lux', riotIdGameName: 'Bob', riotIdTagLine: 'NA1' }),
+      makePlayer({ summonerName: 'Alice', championName: 'Ahri', riotIdGameName: 'Alice', riotIdTagLine: 'NA1' }),
+    ];
+    expect(roomNames(roster)).toEqual(['Bob', 'Alice']);
+  });
+
+  it('keeps a champion name with no Riot ID behind it', () => {
+    const p = makePlayer({ summonerName: 'Ahri', championName: 'Ahri' });
+    expect(roomNames([p])).toEqual(['Ahri']);
   });
 });
