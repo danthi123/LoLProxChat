@@ -756,17 +756,60 @@ export class TrackingService {
     const was = this.state === TrackingState.LOCKED && this.lastPixelPos && this.minimapRegion
       ? { x: this.lastPixelPos.x - this.minimapRegion.x, y: this.lastPixelPos.y - this.minimapRegion.y }
       : null;
-    this.state = TrackingState.SCANNING;
-    this.lostAt = null;
-    this.bystanders = [];
-    this.bystanderBlobs = [];
-    this.lastCleanReg = null;
+    this.restartScan();
     this.avoidPoint = was;
     this.avoidOrigin = was;
     this.avoidUntilMs = performance.now() + RESET_AVOID_MS;
     // The scan's avoidance ends at its lock; this keeps the camera from moving
     // us straight back onto the icon the user just rejected once it may.
     if (was) this.cameraDwell.reject(was, computeNearFieldPx(this.expectedIconDiam), performance.now() + CAMERA_REJECT_MS);
+    this.debugSink?.markEvent('reset');
+    console.log('[Tracking] Position reset by the user — rescanning' +
+      (was ? ' (avoiding (' + Math.round(was.x) + ',' + Math.round(was.y) + ') for the next lock, within ' + RESET_AVOID_MS / 1000 + 's)' : ''));
+    return true;
+  }
+
+  /**
+   * Another player in the game pressed RESET with shared RESET on (and so do
+   * we): scan the minimap again. Unlike resetPosition nothing is avoided —
+   * nobody has said OUR lock is wrong, only that one in the game was. And the
+   * scan starts as if the icon had just been lost where the lock was: an icon
+   * nothing identifies is taken only within walking reach of there, as after
+   * a hold runs out. A clean scan with nothing to go on takes whichever icon
+   * has the cleanest ring, so without this a lock that was right could be
+   * traded for a teammate across the map. Returns false while dead, as
+   * resetPosition does.
+   */
+  rescan(): boolean {
+    if (this.state === TrackingState.DEAD) return false;
+    const was = this.state === TrackingState.LOCKED && this.lastPixelPos && this.minimapRegion
+      ? { x: this.lastPixelPos.x - this.minimapRegion.x, y: this.lastPixelPos.y - this.minimapRegion.y }
+      : null;
+    const wasLost = this.lostAt;
+    this.restartScan();
+    this.avoidPoint = null;
+    this.avoidOrigin = null;
+    this.avoidUntilMs = 0;
+    // Already scanning after a loss: keep that loss's spot and clock.
+    if (was) {
+      this.lostAt = was;
+      this.lostAtMs = performance.now();
+    } else {
+      this.lostAt = wasLost;
+    }
+    this.debugSink?.markEvent('shared-reset');
+    console.log('[Tracking] Rescanning — shared RESET from another player' +
+      (this.lostAt ? ' (within reach of (' + Math.round(this.lostAt.x) + ',' + Math.round(this.lostAt.y) + '))' : ''));
+    return true;
+  }
+
+  /** What every rescan the tracker is told to do starts from. */
+  private restartScan(): void {
+    this.state = TrackingState.SCANNING;
+    this.lostAt = null;
+    this.bystanders = [];
+    this.bystanderBlobs = [];
+    this.lastCleanReg = null;
     this.lastPixelPos = null;
     this.lockedTickCount = 0;
     this.scanFrameCount = 0;
@@ -778,10 +821,6 @@ export class TrackingService {
     this.wrongLock = emptyWrongLockEvidence();
     this.wrongLockTarget = null;
     this.resetOcclusion();
-    this.debugSink?.markEvent('reset');
-    console.log('[Tracking] Position reset by the user — rescanning' +
-      (was ? ' (avoiding (' + Math.round(was.x) + ',' + Math.round(was.y) + ') for the next lock, within ' + RESET_AVOID_MS / 1000 + 's)' : ''));
-    return true;
   }
 
   // --- Color classification ---

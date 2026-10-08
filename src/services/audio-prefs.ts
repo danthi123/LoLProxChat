@@ -1,8 +1,9 @@
-// Audio playback preferences: the "ally proximity" and "voice on camera"
-// toggles. Both default ON since v0.5.18, so each is stored explicitly as '1'
-// or '0' and a missing key reads as the default. Before v0.5.18 they defaulted
-// off and "off" was stored by removing the key, so an install that had turned
-// one off reads as on after the update; there is no way to tell the two apart.
+// Panel toggles: the "ally proximity" and "voice on camera" audio settings,
+// and shared RESET (bottom of the file). The two audio toggles default ON
+// since v0.5.18, so each is stored explicitly as '1' or '0' and a missing key
+// reads as the default. Before v0.5.18 they defaulted off and "off" was stored
+// by removing the key, so an install that had turned one off reads as on after
+// the update; there is no way to tell the two apart.
 
 const ALLY_PROXIMITY_KEY = 'lolproxchat.allyProximity';
 const CAMERA_LISTEN_KEY = 'lolproxchat.cameraListen';
@@ -47,4 +48,26 @@ export function getCameraListen(): boolean {
 
 export function setCameraListen(enabled: boolean): void {
   writeToggle(CAMERA_LISTEN_KEY, enabled);
+}
+
+// Shared RESET: pressing RESET also asks everyone else in the game to re-find
+// their own icon, and their RESETs re-find ours — but only between players who
+// have all turned this on. Off by default and stored as '1' only, unlike the
+// two toggles above: a missing or unreadable key is off.
+//
+// With it off the client tells the server so on join, the server sends it no
+// shared RESET at all, and a 'reset' that arrives anyway (an older or
+// misbehaving server) is dropped here — see Orchestrator.handleRemoteReset.
+const SHARED_RESET_KEY = 'lolproxchat.sharedReset';
+
+export function getSharedReset(): boolean {
+  try {
+    return localStorage.getItem(SHARED_RESET_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function setSharedReset(enabled: boolean): void {
+  writeToggle(SHARED_RESET_KEY, enabled);
 }

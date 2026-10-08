@@ -110,6 +110,15 @@ export class ScriptedTracker {
     this.holdSec = 0;
     return true;
   }
+  rescans = 0;
+  /** Mirrors the real rescan (shared RESET): the same, counted apart. */
+  rescan(): boolean {
+    if (this.state === TrackingState.DEAD) return false;
+    this.rescans++;
+    this.state = TrackingState.SCANNING;
+    this.holdSec = 0;
+    return true;
+  }
 
   /** Walk the champion to a new game coordinate. */
   moveTo(x: number, y: number): void {

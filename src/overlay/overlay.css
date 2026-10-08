@@ -47,6 +47,7 @@ html, body {
 .panel.collapsed #btn-settings { display: none; }
 .panel.collapsed .player-list { display: none; }
 .panel.collapsed .settings-panel { display: none; }
+.panel.collapsed .reset-notice { display: none; }
 
 .widget-header {
   display: flex;
@@ -82,6 +83,15 @@ html, body {
 .icon-btn:hover { background: rgba(100, 120, 160, 0.15); }
 .icon-btn.active { color: #e74c4c; border-color: #e74c4c; }
 .icon-btn.searching { color: #4cc3e7; border-color: #4cc3e7; }
+
+/* Shared RESET: who just asked us to rescan. Collapsed, the POS button's
+   glow says it instead. */
+.reset-notice {
+  padding: 4px 10px;
+  font-size: 11px;
+  color: #4cc3e7;
+  text-align: center;
+}
 
 .player-list {
   max-height: 300px;

@@ -85,6 +85,19 @@ const STRINGS = {
     es: 'Si los jugadores cercanos no te oyen, puede que la app esté siguiendo el icono equivocado en tu minimapa (puede quedarse pegada a un ward junto al que pasaste). Esto descarta la posición actual y vuelve a buscar a tu campeón; muévete después de pulsarlo para que pueda distinguirte. Hasta que te encuentre, solo te oye tu equipo.',
   },
   'settings.reset': { en: 'RESET', es: 'REINICIAR' },
+  'settings.sharedReset': { en: 'Shared RESET', es: 'REINICIAR compartido' },
+  'settings.sharedResetHint': {
+    en: "When ON, pressing RESET also makes everyone else in the game who has this on find their champion on the minimap again, and their RESETs do the same for you. Off by default. Only works between players who have it on: leave it off and nobody's RESET reaches you. Either team can use it, at most once every 15 seconds per game.",
+    es: 'Si está activado, al pulsar REINICIAR también hace que todos los demás jugadores de la partida que lo tengan activado vuelvan a buscar a su campeón en el minimapa, y sus REINICIAR hacen lo mismo contigo. Viene desactivado por defecto. Solo funciona entre jugadores que lo tengan activado: si lo dejas desactivado, el REINICIAR de nadie te afecta. Funciona con los dos equipos, como mucho una vez cada 15 segundos por partida.',
+  },
+  'notice.sharedReset': {
+    en: '{name} pressed RESET — finding you again',
+    es: '{name} pulsó REINICIAR — buscándote de nuevo',
+  },
+  'notice.sharedResetAnon': {
+    en: 'Another player pressed RESET — finding you again',
+    es: 'Otro jugador pulsó REINICIAR — buscándote de nuevo',
+  },
   'settings.searching': { en: 'SEARCHING', es: 'BUSCANDO' },
   'settings.debug': { en: 'Debug', es: 'Depuración' },
   'settings.debugLogs': { en: 'Debug Logs', es: 'Registros' },

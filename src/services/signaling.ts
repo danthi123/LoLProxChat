@@ -30,6 +30,7 @@ type OnPeerPosition = (peer: PositionBroadcast) => void;
 type OnSignal = (signal: SignalMessage) => void;
 type OnPeerLeave = (summonerName: string) => void;
 type OnPeerJoined = (name: string) => void;
+type OnRemoteReset = (from: string) => void;
 
 export class SignalingService {
   private ws: WebSocket | null = null;
@@ -48,6 +49,10 @@ export class SignalingService {
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionallyClosed = false;
+  // Shared RESET opt-in, as last told to the server (on join, and with
+  // 'shared_reset' on every change since). See setSharedReset.
+  private sharedReset = false;
+  private onRemoteReset: OnRemoteReset | null = null;
 
   joinRoom(
     roomId: string,
@@ -90,7 +95,9 @@ export class SignalingService {
       console.log('[Signaling] WebSocket connected');
       this.reconnectAttempt = 0;
       // v0.3: include team in join. Older servers ignore the extra field.
-      ws.send(JSON.stringify({ type: 'join', room: roomId, name: localName, team }));
+      // sharedReset re-declares the opt-in on every (re)connect: the server
+      // keeps it per connection, never carrying it over from an earlier one.
+      ws.send(JSON.stringify({ type: 'join', room: roomId, name: localName, team, sharedReset: this.sharedReset }));
     });
 
     ws.addEventListener('message', (event) => {
@@ -152,6 +159,20 @@ export class SignalingService {
               console.warn('[Signaling] Failed to parse position blob from:', msg.from);
             }
           }
+          break;
+        }
+
+        case 'reset': {
+          // Shared RESET from another player. The server sends it only to
+          // clients that have opted in, but this one does not rely on that:
+          // with the setting off it is dropped unread. Only `from` is looked
+          // at, and only as a name to show — the message carries no
+          // instruction beyond "rescan", which is what receiving it means.
+          if (!this.sharedReset) {
+            console.warn('[Signaling] Dropped a shared RESET — the setting is off here');
+            break;
+          }
+          this.onRemoteReset?.(typeof msg.from === 'string' ? msg.from : '');
           break;
         }
 
@@ -235,6 +256,35 @@ export class SignalingService {
     this.ws.send(JSON.stringify(camera
       ? { type: 'coords', x, y, cx: camera.x, cy: camera.y }
       : { type: 'coords', x, y }));
+  }
+
+  /**
+   * Shared RESET opt-in. Remembered for the next join, and told to the server
+   * at once if it changed while connected. Off, the server stops relaying
+   * resets to us, and any that still arrive are dropped (see 'reset' above).
+   */
+  setSharedReset(on: boolean): void {
+    if (on === this.sharedReset) return;
+    this.sharedReset = on;
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'shared_reset', on }));
+    }
+  }
+
+  /** Who to tell when a shared RESET arrives. */
+  setOnRemoteReset(handler: OnRemoteReset | null): void {
+    this.onRemoteReset = handler;
+  }
+
+  /**
+   * Ask everyone in the game with shared RESET on to re-find their icon.
+   * Sent only while we are opted in; the server enforces the same and
+   * rate-limits it per room and per sender.
+   */
+  requestResetAll(): void {
+    if (!this.sharedReset) return;
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'reset_all' }));
   }
 
   /** Current room ID + local player name, for HTTP requests that need them

@@ -77,6 +77,12 @@ describe('TrackingService state transitions', () => {
     expect(svc.resetPosition()).toBe(false);
     expect(svc.getState()).toBe(TrackingState.DEAD);
   });
+
+  test('a shared RESET is refused while DEAD too', () => {
+    svc.onDeath();
+    expect(svc.rescan()).toBe(false);
+    expect(svc.getState()).toBe(TrackingState.DEAD);
+  });
 });
 
 describe('setLastPosition jump warning', () => {
