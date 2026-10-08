@@ -79,9 +79,9 @@ For the rest — every Settings toggle, troubleshooting, log-grab flow, uninstal
 2. **Position** — the app captures the minimap image, finds champion icons on it by color and shape, and identifies which champion each one is with a trained image-recognition model — producing your position in in-game coordinates.
 3. **Signaling** — players in the same match join a deterministic WebSocket room (room ID = hash of sorted player names) on a self-hosted Node server.
 4. **Voice** — WebRTC peer-to-peer audio between players (Opus 128 kbps, DTLS-SRTP). No audio touches any server.
-5. **Proximity volume** — each client streams its XY coordinates to the signaling server (over the same WebSocket used for presence/signaling); the server computes pairwise volumes for everyone in the room. **Team voice is always full volume** (no proximity); **cross-team (enemy) voice fades in at ~champion vision range (~1350 game units)** and is at full volume inside ~900 units, about the distance two ranged laners hold. Server-enforced — a modified client cannot bypass the team filter or range cutoff. Clients only ever receive `{ peerName: volume }`, never another peer's raw position.
+5. **Proximity volume** — each client streams its XY coordinates to the signaling server (over the same WebSocket used for presence/signaling); the server computes pairwise volumes for everyone in the room. **Everyone's voice fades in at ~champion vision range (~1350 game units)** and is at full volume inside ~900 units, about the distance two ranged laners hold — teammates included, unless you turn **Ally proximity** off to hear your whole team at full volume everywhere. Server-enforced — a modified client cannot bypass the team filter or range cutoff. Clients only ever receive `{ peerName: volume }`, never another peer's raw position.
 
-Optional, off by default: **Voice on camera** also lets you hear from wherever your camera is looking — one-way, and only between players who have both turned it on.
+On by default (you can turn it off): **Voice on camera** also lets you hear from wherever your camera is looking — one-way, and only between players who both have it on.
 
 Hearing is based on distance only: the app can't see vision, so an enemy in a brush is as audible as one in the open. [`docs/compliance.md`](docs/compliance.md) covers this and the camera setting in full.
 
