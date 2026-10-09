@@ -1179,6 +1179,23 @@ export const TEAMMATE_VERDICT_RUNS = 2;
 /** ...and the latest within this, for the icon to be set aside. */
 export const TEAMMATE_VERDICT_TTL_MS = 2000;
 
+/**
+ * How close, in icon diameters, the camera rectangle's centre must be to the
+ * icon we follow to count as on it (TrackingService.cameraCentredOn). A locked
+ * camera puts our champion about a third of an icon from the centre (measured
+ * on 2026-10-08 frames), and in a teammate cover the icon on top can sit up to
+ * about half an icon off ours. The rectangle itself is only about 3.4 by 1.9
+ * icons, so this alone says little; see TEAMMATE_COVER_CAMERA_MS.
+ */
+export const TEAMMATE_COVER_CAMERA_ICONS = 0.75;
+
+/**
+ * How long the camera must have stayed centred on the icon we follow, while
+ * it moved at least an icon's width, before a teammate's icon over ours is
+ * followed rather than let go — the sign of a camera locked on us.
+ */
+export const TEAMMATE_COVER_CAMERA_MS = 2000;
+
 interface TeammateMark { x: number; y: number; runs: number; lastMs: number }
 
 /**

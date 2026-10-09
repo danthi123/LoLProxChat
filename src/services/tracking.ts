@@ -19,6 +19,7 @@ import {
   iconCropBox,
   TeammateVerdicts,
   TEAMMATE_VERDICT_RUNS,
+  TEAMMATE_VERDICT_TTL_MS,
   pickBestBlobInRange,
   pickClassifierReacquisition,
   reacquireThresholdAt,
@@ -39,6 +40,8 @@ import {
   MAX_OCCLUDED_MS,
   COVERED_PIXEL_FRACTION,
   OCCLUDER_GRACE_MS,
+  TEAMMATE_COVER_CAMERA_ICONS,
+  TEAMMATE_COVER_CAMERA_MS,
   isPossibleStack,
   findStack,
   positionInStack,
@@ -158,6 +161,29 @@ export class TrackingService {
   // Region px. Fixed for the whole episode: where the covering icon was when
   // ours vanished. We report this, not wherever that enemy goes next.
   private occlusionAnchor: { x: number; y: number } | null = null;
+  /** The cover is a teammate's icon over ours, not an enemy's (startTeammateCover). */
+  private coverByTeammate = false;
+  /** When the camera last confirmed a teammate cover (teammateCoverStep). */
+  private coverCameraSeenMs = 0;
+  /**
+   * Since when the camera has stayed centred on the icon we follow
+   * (noteCameraOnUs), where that run started, and whether the icon has moved
+   * an icon's width within it. A camera that follows a moving icon that
+   * closely is locked on it.
+   */
+  private cameraOnUsSinceMs = 0;
+  private cameraOnUsFrom: { x: number; y: number } | null = null;
+  private cameraOnUsMoved = false;
+  /**
+   * When the first teammate cover since we were last vouched for began. All
+   * covers until the classifier vouches for our icon again share one
+   * MAX_OCCLUDED_MS budget: one the skin match briefly lost and started again
+   * is the same cover, and once it is spent we are only following someone
+   * else's icon on the camera's word, so no more until we are seen.
+   */
+  private coverBudgetStartMs = 0;
+  /** When a teammate cover last had a skin-marked teammate on its spot. */
+  private coverMarkSeenMs = 0;
   private occluderLastSeenMs = 0;
   // Typical pixel count of our icon when nothing overlaps it (EMA), and whether
   // the last frame we saw it on showed it overlapped AND shrunk — the signature
@@ -342,7 +368,9 @@ export class TrackingService {
     }
     this.lastPosition = newPos;
     this.lastPositionUpdateMs = performance.now();
-    if (source !== 'extrapolate') this.lastSeenPosition = newPos;
+    // Neither is a sighting of our own icon. The death position comes from
+    // lastSeenPosition, and a teammate cover moves with the teammate.
+    if (source !== 'extrapolate' && source !== 'teammate-cover') this.lastSeenPosition = newPos;
   }
   getFilteredImageUrl(): string | null { return this.filteredImageUrl; }
   /** Seconds since the last successful frame-to-frame lock, or 0 if currently tracking. */
@@ -722,11 +750,15 @@ export class TrackingService {
     this.holdStartMs = 0;
     this.holdReason = null;
     this.resetOcclusion();
+    this.resetCameraOnUs();
   }
 
   onRespawn(): void {
     if (this.state !== TrackingState.DEAD) return;
     this.state = TrackingState.SCANNING;
+    // A new life: teammate covers may be used again (see coverBudgetStartMs).
+    this.coverBudgetStartMs = 0;
+    this.resetCameraOnUs();
     this.cameraDwell.reset();
     this.lostAt = null;
     this.bystanders = [];
@@ -757,6 +789,8 @@ export class TrackingService {
       ? { x: this.lastPixelPos.x - this.minimapRegion.x, y: this.lastPixelPos.y - this.minimapRegion.y }
       : null;
     this.restartScan();
+    // The user telling us to look again re-arms teammate covers, as a respawn does.
+    this.coverBudgetStartMs = 0;
     this.avoidPoint = was;
     this.avoidOrigin = was;
     this.avoidUntilMs = performance.now() + RESET_AVOID_MS;
@@ -819,6 +853,7 @@ export class TrackingService {
     this.wrongLock = emptyWrongLockEvidence();
     this.wrongLockTarget = null;
     this.resetOcclusion();
+    this.resetCameraOnUs();
   }
 
   // --- Color classification ---
@@ -1561,6 +1596,7 @@ export class TrackingService {
   /** Lock onto a teal blob as the local player */
   private lockOnBlob(blob: Blob, reason: string): void {
     if (!this.minimapRegion) return;
+    this.resetCameraOnUs();
 
     const cx = this.minimapRegion.x + blob.cx;
     const cy = this.minimapRegion.y + blob.cy;
@@ -1630,6 +1666,7 @@ export class TrackingService {
       };
       this.lostAtMs = performance.now();
       this.markBystanders(iconBlobs.filter(b => b.color === 'teal'), this.lostAt);
+      this.resetCameraOnUs();
       this.state = TrackingState.SCANNING;
       this.holdStartMs = 0;
       this.holdReason = null;
@@ -1658,16 +1695,18 @@ export class TrackingService {
       const mate = this.nearestBlob(this.teammateBlobs, at, same);
       const ours = this.nearestBlob(tealBlobs, at, same);
       if (mate && (!ours || Math.hypot(mate.cx - at.x, mate.cy - at.y) < Math.hypot(ours.cx - at.x, ours.cy - at.y))) {
-        this.debugSink?.markEvent('teammate');
-        console.warn('[Tracking] The icon we were following is a teammate\'s (skin match) — rescanning');
-        this.lostAt = at;
-        this.lostAtMs = performance.now();
-        this.state = TrackingState.SCANNING;
-        this.holdStartMs = 0;
-        this.holdReason = null;
-        this.resetOcclusion();
-        this.scanFrameCount = 0;
-        this.scanStartMs = performance.now();
+        // Unless the camera is centred on it: then ours is most likely under
+        // it. Two teammates fighting side by side draw one icon over the
+        // other, and the 2026-10-08 test showed the rescan that followed
+        // locking the same (top) icon through the camera, dropping it, and
+        // locking it again — four times in half a minute, each time with no
+        // position at all, so the enemy in the fight could not hear us.
+        if (this.cameraLockedOnUs() && this.cameraCentredOn({ x: mate.cx, y: mate.cy }) === true &&
+            this.coverBudgetLeft()) {
+          this.startTeammateCover(mate);
+          return;
+        }
+        this.dropTeammateLock(at);
         return;
       }
     }
@@ -1903,6 +1942,7 @@ export class TrackingService {
   /** Phase 2 success path: snap position, reset velocity, log, fire callback. */
   private acquireViaClassifier(blob: Blob, clsScore: number, via?: string): void {
     if (!this.minimapRegion) return;
+    this.resetCameraOnUs();
     this.lastLockChangeMs = performance.now();
     const cx = this.minimapRegion.x + blob.cx;
     const cy = this.minimapRegion.y + blob.cy;
@@ -1966,6 +2006,10 @@ export class TrackingService {
     }
 
     this.lastPixelPos = { x: cx, y: cy };
+    this.noteCameraOnUs(centre);
+    // The classifier vouching for the icon we are on: whatever teammate covers
+    // came before, we have been seen since.
+    if (this.getClassifierScore(blob) >= 0.5) this.coverBudgetStartMs = 0;
     this.setLastPosition(this.pixelToGamePosition(cx, cy, this.minimapRegion), 'locked-track');
     this.lockedTickCount = 0;
     this.holdStartMs = 0;
@@ -2129,6 +2173,7 @@ export class TrackingService {
       this.occlusionAnchor = occluder;
       console.log('[Tracking] Own icon covered by an enemy icon — holding there until ours reappears');
     } else {
+      if (this.coverByTeammate) return this.teammateCoverStep(now);
       if (now - this.occludedSinceMs > MAX_OCCLUDED_MS) {
         return this.stopOccluded('the ' + (MAX_OCCLUDED_MS / 1000) + 's cap');
       }
@@ -2137,6 +2182,132 @@ export class TrackingService {
       } else if (now - this.occluderLastSeenMs > OCCLUDER_GRACE_MS) {
         return this.stopOccluded('no enemy icon left on the spot');
       }
+    }
+    this.holdOccluded();
+    return true;
+  }
+
+  /**
+   * The icon we follow is a teammate's (skin match) and nothing else of ours
+   * is in sight: let it go and look for ourselves again, near where we were.
+   */
+  private dropTeammateLock(at: { x: number; y: number }): void {
+    this.debugSink?.markEvent('teammate');
+    console.warn('[Tracking] The icon we were following is a teammate\'s (skin match) — rescanning');
+    this.resetCameraOnUs();
+    this.lostAt = at;
+    this.lostAtMs = performance.now();
+    this.state = TrackingState.SCANNING;
+    this.holdStartMs = 0;
+    this.holdReason = null;
+    this.resetOcclusion();
+    this.scanFrameCount = 0;
+    this.scanStartMs = performance.now();
+  }
+
+  /**
+   * Whether the camera rectangle read this frame is centred on `p`, within an
+   * icon — null when it was not readable. A player with the camera locked has
+   * their own champion there, a little off centre; on the 2026-10-08 frames
+   * the pair sat under a third of an icon from it.
+   */
+  private cameraCentredOn(p: { x: number; y: number }): boolean | null {
+    const box = this.cameraBox;
+    if (!box) return null;
+    const cx = (box.x0 + box.x1) / 2;
+    const cy = (box.y0 + box.y1) / 2;
+    return Math.hypot(cx - p.x, cy - p.y) <= this.expectedIconDiam * TEAMMATE_COVER_CAMERA_ICONS;
+  }
+
+  /**
+   * Keep the camera-on-us run going on a locked frame at `p` (region pixels),
+   * or end it. An unreadable camera neither extends nor ends it.
+   */
+  private noteCameraOnUs(p: { x: number; y: number }): void {
+    const on = this.cameraCentredOn(p);
+    if (on === null) return;
+    if (!on) {
+      this.resetCameraOnUs();
+      return;
+    }
+    if (this.cameraOnUsSinceMs === 0 || !this.cameraOnUsFrom) {
+      this.cameraOnUsSinceMs = performance.now();
+      this.cameraOnUsFrom = { x: p.x, y: p.y };
+      this.cameraOnUsMoved = false;
+    } else if (Math.hypot(p.x - this.cameraOnUsFrom.x, p.y - this.cameraOnUsFrom.y) >= this.expectedIconDiam) {
+      this.cameraOnUsMoved = true;
+    }
+  }
+
+  /** Forget the camera-on-us run: it is evidence about the icon we were on. */
+  private resetCameraOnUs(): void {
+    this.cameraOnUsSinceMs = 0;
+    this.cameraOnUsFrom = null;
+    this.cameraOnUsMoved = false;
+  }
+
+  /**
+   * The camera has followed the icon we track, closely, for a while and as it
+   * moved: a locked camera, so wherever it is centred is where we are. Just
+   * having the teammate on screen is not enough — the camera shows about three
+   * icons by two, so it says that of any icon near the middle.
+   */
+  private cameraLockedOnUs(): boolean {
+    return this.cameraOnUsSinceMs > 0 && this.cameraOnUsMoved &&
+      performance.now() - this.cameraOnUsSinceMs >= TEAMMATE_COVER_CAMERA_MS;
+  }
+
+  private coverBudgetLeft(): boolean {
+    return this.coverBudgetStartMs === 0 || performance.now() - this.coverBudgetStartMs < MAX_OCCLUDED_MS;
+  }
+
+  /**
+   * Our icon is under a teammate's, the camera says: report theirs as our
+   * position, as the enemy cover does with an enemy's — not a hold, so we are
+   * not disowned two seconds in. Unlike the enemy cover it follows the icon
+   * on top, because two teammates who stand together usually move together;
+   * the camera is what stops it carrying us away when we are not there (a
+   * recall moves a locked camera to the fountain at once), and it ends as the
+   * enemy cover does, after MAX_OCCLUDED_MS at most.
+   */
+  private startTeammateCover(mate: Blob): void {
+    const now = performance.now();
+    this.occluded = true;
+    this.coverByTeammate = true;
+    this.occludedSinceMs = now;
+    this.occluderLastSeenMs = now;
+    this.coverCameraSeenMs = now;
+    if (this.coverBudgetStartMs === 0) this.coverBudgetStartMs = now;
+    this.coverMarkSeenMs = now;
+    this.occlusionAnchor = { x: mate.cx, y: mate.cy };
+    this.debugSink?.markEvent('teammate-cover');
+    console.log('[Tracking] Own icon under a teammate\'s, camera on them — following theirs until ours reappears');
+    this.holdOccluded();
+  }
+
+  /** One frame of a teammate cover. Always true: it either holds or rescans. */
+  private teammateCoverStep(now: number): boolean {
+    const anchor = this.occlusionAnchor!;
+    const stop = (why: string): true => {
+      console.log('[Tracking] Stopped following the teammate\'s icon over ours (' + why + ')');
+      this.dropTeammateLock({ x: anchor.x, y: anchor.y });
+      return true;
+    };
+    if (!this.coverBudgetLeft()) return stop('the ' + (MAX_OCCLUDED_MS / 1000) + 's cap');
+    const mate = this.nearestBlob(this.teammateBlobs, anchor, computeNearFieldPx(this.expectedIconDiam));
+    if (mate) {
+      // The camera is the only thing saying we are under them, so it has to
+      // keep saying it. Not readable is not good enough for long either: a
+      // camera locked on a champion in the fountain is cut off by the map's
+      // corner, which is exactly where a recall puts it.
+      const centred = this.cameraCentredOn({ x: mate.cx, y: mate.cy });
+      if (centred === false) return stop('the camera moved off them');
+      if (centred === true) this.coverCameraSeenMs = now;
+      else if (now - this.coverCameraSeenMs > OCCLUDER_GRACE_MS) return stop('the camera is not readable');
+      this.occluderLastSeenMs = now;
+      this.occlusionAnchor = { x: mate.cx, y: mate.cy };
+    } else if (now - this.occluderLastSeenMs > OCCLUDER_GRACE_MS) {
+      return stop('no teammate icon left on the spot');
     }
     this.holdOccluded();
     return true;
@@ -2175,7 +2346,8 @@ export class TrackingService {
     const cx = this.minimapRegion.x + this.occlusionAnchor.x;
     const cy = this.minimapRegion.y + this.occlusionAnchor.y;
     this.lastPixelPos = { x: cx, y: cy };
-    this.setLastPosition(this.pixelToGamePosition(cx, cy, this.minimapRegion), 'occluded');
+    this.setLastPosition(this.pixelToGamePosition(cx, cy, this.minimapRegion),
+      this.coverByTeammate ? 'teammate-cover' : 'occluded');
     if (this.onPositionUpdate && this.lastPosition) {
       this.onPositionUpdate(this.lastPosition);
     }
@@ -2195,6 +2367,7 @@ export class TrackingService {
     this.occludedSinceMs = 0;
     this.occlusionAnchor = null;
     this.lastSeenPartlyCovered = false;
+    this.coverByTeammate = false;
     this.stacked = false;
     this.stackedSinceMs = 0;
     this.stackPartner = null;
@@ -2272,6 +2445,24 @@ export class TrackingService {
     const minRuns = this.state === TrackingState.SCANNING ? 1 : TEAMMATE_VERDICT_RUNS;
     this.teammateBlobs = blobs.filter(b =>
       b.color === 'teal' && this.teammateVerdicts.isTeammate(b.cx, b.cy, now, this.expectedIconDiam, minRuns));
+    // The icon over ours in a teammate cover stays the teammate's while the
+    // skin match is merely unsure of it. Let back in, the locked path would take
+    // it on continuity as ours, and the next verdict would start a fresh cover.
+    // Only the classifier vouching for it (ours after all) lets it back.
+    //
+    // Only while a teammate's was marked there lately, though: once they have
+    // gone (a recall), the icon left on the spot is most likely ours, and Phase
+    // 1 should have it back.
+    if (this.coverByTeammate && this.occlusionAnchor) {
+      const near = computeNearFieldPx(this.expectedIconDiam);
+      const anchor = this.occlusionAnchor;
+      if (this.nearestBlob(this.teammateBlobs, anchor, near)) {
+        this.coverMarkSeenMs = now;
+      } else if (now - this.coverMarkSeenMs <= 2 * TEAMMATE_VERDICT_TTL_MS) {
+        const top = this.nearestBlob(blobs.filter(b => b.color === 'teal'), anchor, near);
+        if (top && this.getClassifierScore(top) < 0.5) this.teammateBlobs.push(top);
+      }
+    }
     if (this.teammateBlobs.length === 0) return blobs;
     return blobs.filter(b => !this.teammateBlobs.includes(b));
   }
