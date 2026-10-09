@@ -220,6 +220,15 @@ describe('E2b a player the tracker loses is placed where they were last seen, fo
       () => volumesFor(b).slice(-1).some((e) => e.request?.myPosition?.x === 13000 && !(a in (e.response?.peerVolumes ?? {}))),
       'B, far from where A was last seen, to stop hearing A',
     );
+
+    // A presses RESET, which drops the last sighting: both sides go back to
+    // full team volume rather than keep scoring a place the user called wrong.
+    one.tracker.lastSeen = null;
+    await waitFor(
+      () => volumesFor(b).slice(-1).some((e) => e.response?.peerVolumes?.[a] === 1),
+      'B to hear A at full volume once A drops the sighting',
+    );
+    await waitFor(() => one.peerFor(b)!.volume === 1, 'A to hear B at full volume');
   });
 
   it('with nowhere to start from, a lost player hears its teammates at full volume, as before', async () => {

@@ -295,6 +295,41 @@ describe('tiered proximity — end-to-end against the real server', () => {
     me.close(); enemy.close(); ally.close();
   });
 
+  it('a disown that says where it last saw itself keeps its teammates, and only them, scored from there', async () => {
+    const room = 'r-seen';
+    const me = await joinRoom(room, 'SeenMe', 'ORDER');
+    const enemy = await joinRoom(room, 'SeenEnemy', 'CHAOS');
+    const ally = await joinRoom(room, 'SeenAlly', 'ORDER');
+    sendCoords(me, 5000, 0);
+    sendCoords(enemy, 300, 0);
+    sendCoords(ally, 1200, 0);
+    await sleep(200);
+    const allyView = async () => {
+      const resp = await fetch(`${BASE}/compute-volumes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ myPosition: { x: 1200, y: 0 }, roomId: room, name: 'SeenAlly', allyProximity: true }),
+      });
+      return (await resp.json() as { peerVolumes: Record<string, number> }).peerVolumes;
+    };
+
+    // Lost: the last sighting (0,0) a second ago, not the extrapolated 5000.
+    me.send(JSON.stringify({ type: 'coords', x: 0, y: 0, stale: true, seen: true, seenAgoMs: 1000 }));
+    await sleep(200);
+    const lost = await allyView();
+    expect(lost.SeenMe).toBeGreaterThan(0.3);
+    expect(lost.SeenMe).toBeLessThan(0.8);
+    const enemyView = await computeVolumes({ x: 300, y: 0 }, room, 'SeenEnemy');
+    expect(enemyView.peerVolumes.SeenMe).toBeUndefined();
+
+    // RESET: the client no longer stands by it, so neither does the server.
+    disownCoords(me, 0, 0);
+    await sleep(200);
+    expect((await allyView()).SeenMe).toBe(1.0);
+
+    me.close(); enemy.close(); ally.close();
+  });
+
   it('an older client that never sends the flag is unaffected', async () => {
     // Back-compat in the direction that matters: pre-0.5.9 clients keep the
     // old behaviour, where a position lingers until the staleness window.

@@ -253,7 +253,10 @@ export function handleConnection(
           // window keeps cross-team peers scored against a place it has
           // already left.
           if (msg.stale === true) {
-            rooms.clearPosition(ws);
+            // Where it last saw itself, which its teammates may go on being
+            // scored against for a little while; see RoomManager.clearPosition.
+            const ago = typeof msg.seenAgoMs === 'number' && isFinite(msg.seenAgoMs) ? msg.seenAgoMs : 0;
+            rooms.clearPosition(ws, msg.seen === true ? { x: msg.x, y: msg.y, agoMs: ago } : undefined);
             break;
           }
           rooms.setPosition(ws, msg.x, msg.y);

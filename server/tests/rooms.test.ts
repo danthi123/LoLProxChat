@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { RoomManager } from '../src/rooms.js';
+import { LOST_ALLY_ANCHOR_MS } from '../src/volumes.js';
 import { handleConnection } from '../src/ws-handler.js';
 import type { LivenessTracker } from '../src/heartbeat.js';
 import type { WebSocket } from 'ws';
@@ -499,16 +500,25 @@ describe('clearPosition', () => {
     expect(() => rooms.clearPosition(mockWs())).not.toThrow();
   });
 
-  it('keeps the disowned position as lastSeen until a new one arrives', () => {
+  it('keeps where the client says it last saw itself, until a disown without it or a new position', () => {
     const rooms = new RoomManager();
     const ws = mockWs();
     rooms.join('r1', 'Alice', ws, 'ORDER');
-    rooms.setPosition(ws, 500, 600);
+    rooms.setPosition(ws, 900, 900);
+    rooms.clearPosition(ws, { x: 500, y: 600, agoMs: 3000 });
+    const kept = rooms.getRoomClients('r1')[0].lastSeen!;
+    expect(kept).toMatchObject({ x: 500, y: 600 });
+    expect(Date.now() - kept.updatedMs).toBeGreaterThanOrEqual(3000);
+    // An age past the window is clamped to it, a negative one to now.
+    rooms.clearPosition(ws, { x: 1, y: 1, agoMs: 1e12 });
+    expect(Date.now() - rooms.getRoomClients('r1')[0].lastSeen!.updatedMs).toBeLessThanOrEqual(LOST_ALLY_ANCHOR_MS + 50);
+    rooms.clearPosition(ws, { x: 1, y: 1, agoMs: -5000 });
+    expect(rooms.getRoomClients('r1')[0].lastSeen!.updatedMs).toBeLessThanOrEqual(Date.now());
+    // A disown that does not stand by any sighting (RESET, respawn, an older
+    // client) drops it.
     rooms.clearPosition(ws);
-    expect(rooms.getRoomClients('r1')[0].lastSeen).toMatchObject({ x: 500, y: 600 });
-    // A second disown with nothing to disown does not wipe it.
-    rooms.clearPosition(ws);
-    expect(rooms.getRoomClients('r1')[0].lastSeen).toMatchObject({ x: 500, y: 600 });
+    expect(rooms.getRoomClients('r1')[0].lastSeen).toBeUndefined();
+    rooms.clearPosition(ws, { x: 500, y: 600, agoMs: 0 });
     rooms.setPosition(ws, 700, 800);
     expect(rooms.getRoomClients('r1')[0].lastSeen).toBeUndefined();
   });
@@ -517,8 +527,7 @@ describe('clearPosition', () => {
     const rooms = new RoomManager();
     const ws = mockWs();
     rooms.join('r1', 'Alice', ws, 'ORDER');
-    rooms.setPosition(ws, 500, 600);
-    rooms.clearPosition(ws);
+    rooms.clearPosition(ws, { x: 500, y: 600, agoMs: 0 });
     rooms.join('r1', 'Alice', mockWs(), 'ORDER');
     expect(rooms.getRoomClients('r1')[0].lastSeen).toMatchObject({ x: 500, y: 600 });
   });

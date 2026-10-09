@@ -384,11 +384,16 @@ export class TrackingService {
    * Where we were last actually seen, if that was within `maxAgeMs` — for the
    * orchestrator to keep scoring teammates from while the tracker has lost us.
    * Null while dead, after a RESET (the user has said that position is wrong)
-   * and before the first lock.
+   * or a respawn, after the minimap region changes, and before the first lock.
    */
   getLastSeenPosition(maxAgeMs: number): Position | null {
     if (this.state === TrackingState.DEAD || !this.lastSeenPosition) return null;
     return performance.now() - this.lastSeenMs <= maxAgeMs ? this.lastSeenPosition : null;
+  }
+
+  /** How long ago getLastSeenPosition's position was seen, in ms. */
+  getLastSeenAgeMs(): number {
+    return performance.now() - this.lastSeenMs;
   }
   getFilteredImageUrl(): string | null { return this.filteredImageUrl; }
   /** Seconds since the last successful frame-to-frame lock, or 0 if currently tracking. */
@@ -467,6 +472,8 @@ export class TrackingService {
     this.state = TrackingState.SCANNING;
     this.lostAt = null;
     this.lostByReset = false;
+    // Measured against the old region; not worth scoring teammates from.
+    this.lastSeenPosition = null;
     this.bystanders = [];
     this.bystanderBlobs = [];
     this.teammateVerdicts.clear();
@@ -515,6 +522,8 @@ export class TrackingService {
     this.state = TrackingState.SCANNING;
     this.lostAt = null;
     this.lostByReset = false;
+    // Measured against the old region; not worth scoring teammates from.
+    this.lastSeenPosition = null;
     this.bystanders = [];
     this.bystanderBlobs = [];
     this.teammateVerdicts.clear();
@@ -1471,7 +1480,12 @@ export class TrackingService {
     // moment it moves: what RESET is for is a lock stuck on something static
     // (a ward). A blob that walks away is a champion — quite possibly us, with
     // RESET pressed on a lock that was right — and the ordinary scan decides.
-    if (this.avoidPoint && performance.now() < this.avoidUntilMs && this.avoidOrigin) {
+    //
+    // After the user's own RESET the blob stays left out, still, for the whole
+    // scan rather than RESET_AVOID_MS: the scan looks within walking reach of
+    // it, and once the window ran out it was often the only icon there, so
+    // the scan took it straight back.
+    if (this.avoidPoint && (performance.now() < this.avoidUntilMs || this.lostByReset) && this.avoidOrigin) {
       const radius = Math.max(5, this.expectedIconDiam * 0.6);
       // Follow it in small steps only: a champion moves under a pixel a frame,
       // and anything further is a different icon or a frame the avoided blob
@@ -1532,7 +1546,7 @@ export class TrackingService {
       const resetRadius = Math.max(5, this.expectedIconDiam * 0.6);
       const avoided = this.avoidPoint && performance.now() < this.avoidUntilMs &&
         Math.hypot(favourite.x - this.avoidPoint.x, favourite.y - this.avoidPoint.y) <= resetRadius;
-      const outOfReach = !this.lostByReset && this.beyondReach(favourite, region);
+      const outOfReach = !this.lostByReset && this.beyondReach(favourite, region, true);
       const pick = avoided || outOfReach ? null : this.nearestBlob(tealBlobs, favourite, near);
       if (pick) {
         this.lockOnBlob(pick, 'camera(on screen ' + Math.round(favourite.dwell * 100) + '% of the last ' +
@@ -1594,9 +1608,17 @@ export class TrackingService {
         // The smoothed score is normalized to the best icon in view, so a
         // near-silent model makes one icon "identified" at 1.0; the raw output
         // has to say something too (the 2026-10-07 log's far re-locks).
-        const identified = classifierUsable && clsScore >= 0.5 &&
+        //
+        // In a base, where a recall lands, less will do: the smoothed score
+        // alone, or a movement path — players walk out of the fountain, and
+        // in a base white marks are far more often our path than anything
+        // else. With neither, an icon there is as likely a teammate shopping
+        // or respawning while ours is still hidden in lane.
+        const vouched = classifierUsable && clsScore >= 0.5;
+        const identified = vouched &&
           this.getClassifierScore(b, this.rawClassifierScores) >= FAR_REACQUIRE_MIN_RAW;
-        if (!identified && this.beyondReach({ x: b.cx, y: b.cy }, region)) continue;
+        const baseOk = vouched || whiteScore >= 0.5;
+        if (!identified && this.beyondReach({ x: b.cx, y: b.cy }, region, baseOk)) continue;
       }
 
       if (score > bestScore) {
@@ -1622,7 +1644,7 @@ export class TrackingService {
     // then follows and nothing corrects. Wait instead (we are team-only while
     // scanning) until the player walks or the classifier speaks, for as long
     // as the reset's window lasts; after that, scan as usual.
-    if (avoidedSomething && !classifierUsable && bestWhite <= 0) {
+    if (avoidedSomething && performance.now() < this.avoidUntilMs && !classifierUsable && bestWhite <= 0) {
       return;
     }
 
@@ -1633,17 +1655,20 @@ export class TrackingService {
 
   /**
    * Whether a point (region px) is further from where we were lost than we
-   * could have walked since. A base is never out of reach: a recall lands
-   * there, and the tracker cannot follow one — the same exception
-   * reacquireThresholdAt makes for a hold.
+   * could have walked since. With `baseOk`, a base is never out of reach: a
+   * recall lands there, and the tracker cannot follow one — the exception
+   * reacquireThresholdAt makes for a hold, which also wants the classifier to
+   * say something.
    */
   private beyondReach(
     p: { x: number; y: number },
     region: { x: number; y: number; width: number; height: number },
+    baseOk: boolean,
   ): boolean {
     if (!this.lostAt) return false;
     const reach = rescanReachPx(this.expectedIconDiam, performance.now() - this.lostAtMs);
     if (Math.hypot(p.x - this.lostAt.x, p.y - this.lostAt.y) <= reach) return false;
+    if (!baseOk) return true;
     const at = this.pixelToGamePosition(region.x + p.x, region.y + p.y, region);
     return !isInBaseZone(at, MAP_DIMENSIONS[this.mapType]);
   }

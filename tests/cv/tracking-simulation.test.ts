@@ -24,6 +24,7 @@ import {
   FORCED_REACQUIRE_HOLD_MS,
   MAX_OCCLUDED_MS,
   OCCLUDER_GRACE_MS,
+  RESET_AVOID_MS,
 } from '../../src/services/tracking-helpers';
 import { driveTracker, FRAME_MS, metrics, newTracker } from './harness/drive';
 import {
@@ -415,11 +416,27 @@ describe('losing the icon', () => {
     expect(last.state).toBe(TrackingState.SCANNING);
   });
 
-  test('an icon that turns up in a base is taken however far it is: a recall', async () => {
+  test('an icon walking out of a base is taken however far it is: a recall', async () => {
     // The fountain, clear of the backdrop's turret drawn over the base.
     const last = await returnAfterForcedRescan({ x: 25, y: 250 }, { x: 1, y: 0 }, { ...BACKDROP, turrets: [] });
     expect(last.state).toBe(TrackingState.LOCKED);
     expect(distance(last.px!, last.truth!)).toBeLessThanOrEqual(3);
+  });
+
+  test('a teammate standing in a base, with nothing to say it is us, is not taken', async () => {
+    // Shopping or respawning while our own icon is still hidden in lane: a
+    // base is reachable from anywhere only for an icon something vouches for.
+    const holdFrames = Math.ceil(FORCED_REACQUIRE_HOLD_MS / FRAME_MS) + 4;
+    const SHOPPING: SceneSpec = { ...BACKDROP, turrets: [], allies: [{ x: 28, y: 248 }] };
+    const scenes = renderScenes([
+      ...walk(16),
+      ...Array.from({ length: holdFrames }, () => NO_TEAL),
+      ...vanished(16, SHOPPING),
+    ]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const records = await driveTracker(h, scenes);
+    expect(metrics(records).scanningReentries).toBe(1);
+    expect(records[records.length - 1].state).toBe(TrackingState.SCANNING);
   });
 
   test('a minion wave standing where the champion was does not inherit the lock', async () => {
@@ -440,6 +457,48 @@ describe('losing the icon', () => {
     // so the tracker holds instead of latching onto the wave.
     expect(records[records.length - 1].state).toBe(TrackingState.LOCKED);
     expect(distance(records[records.length - 1].px!, vanishPoint)).toBeLessThan(12);
+  });
+});
+
+describe('where we were last seen (for teammates\' volumes while lost)', () => {
+  test('is the last sighting, not the extrapolation, kept through the rescan, and ages out', async () => {
+    const holdFrames = Math.ceil(FORCED_REACQUIRE_HOLD_MS / FRAME_MS) + 4;
+    const scenes = renderScenes([...walk(16), ...Array.from({ length: holdFrames }, () => NO_TEAL)]);
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    const walked = await driveTracker(h, scenes.slice(0, 16));
+    const sighting = h.svc.getLastPosition()!;
+    expect(walked[15].state).toBe(TrackingState.LOCKED);
+    await driveTracker(h, scenes.slice(16));
+    expect(h.svc.getState()).toBe(TrackingState.SCANNING);
+    expect(h.svc.getLastSeenPosition(60_000)).toEqual(sighting);
+    const age = h.svc.getLastSeenAgeMs();
+    expect(age).toBeGreaterThanOrEqual(FORCED_REACQUIRE_HOLD_MS);
+    expect(h.svc.getLastSeenPosition(age - 1)).toBeNull();
+  });
+
+  test('is dropped by RESET, by death and by respawn', async () => {
+    const scenes = renderScenes(walk(16));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    await driveTracker(h, scenes);
+    expect(h.svc.getLastSeenPosition(60_000)).not.toBeNull();
+    expect(h.svc.resetPosition()).toBe(true);
+    expect(h.svc.getLastSeenPosition(60_000)).toBeNull();
+
+    const again = renderScenes(walk(16));
+    const h2 = newTracker(again.map(s => s.frame), { classifier: new ZeroScorer() });
+    await driveTracker(h2, again);
+    h2.svc.onDeath();
+    expect(h2.svc.getLastSeenPosition(60_000)).toBeNull();
+    h2.svc.onRespawn();
+    expect(h2.svc.getLastSeenPosition(60_000)).toBeNull();
+  });
+
+  test('a shared RESET from another player keeps it', async () => {
+    const scenes = renderScenes(walk(16));
+    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
+    await driveTracker(h, scenes);
+    expect(h.svc.rescan()).toBe(true);
+    expect(h.svc.getLastSeenPosition(60_000)).not.toBeNull();
   });
 });
 
@@ -1224,6 +1283,27 @@ describe('a lock that ends up on a static teal marker (v0.5.10 Briar log)', () =
     expect(logs.some(l => l.includes('Position reset by the user'))).toBe(true);
     for (const r of records.slice(resetAt)) {
       if (r.state === TrackingState.LOCKED) expect(distance(r.px!, FAR)).toBeGreaterThan(ICON_DIAM);
+    }
+    const last = records[records.length - 1];
+    expect(last.state).toBe(TrackingState.LOCKED);
+    expect(distance(last.px!, last.truth!)).toBeLessThanOrEqual(3);
+  });
+
+  test('RESET never goes back to the rejected icon just because the champion is further than it can reach yet', async () => {
+    // The scan looks within walking reach of the rejected icon. With the
+    // champion further than that and the camera unreadable, nothing in reach
+    // is left but the rejected icon — which, once the 10s window ran out, the
+    // scan took straight back. It now waits for the reach to grow instead.
+    // Top left: far from the ward, and in neither base.
+    const FAR: Point = { x: 30, y: 30 };
+    const ALONE: SceneSpec = { ...BACKDROP, allies: [WARD], camera: null };
+    expect(distance(FAR, WARD)).toBeGreaterThan(48 + 8 * (RESET_AVOID_MS / 1000) + 20);
+    const after = Array.from({ length: 24 * 8 }, () => ({ ...ALONE, self: FAR, selfTrail: { x: 1, y: -1 } }));
+    const resetAt = specs(after.length, after).length - after.length + 4;
+    const { records } = await drive('zero', after.length, resetAt, after);
+    expect(distance(records[resetAt - 1].px!, WARD)).toBeLessThanOrEqual(3);
+    for (const r of records.slice(resetAt)) {
+      if (r.state === TrackingState.LOCKED) expect(distance(r.px!, WARD)).toBeGreaterThan(ICON_DIAM);
     }
     const last = records[records.length - 1];
     expect(last.state).toBe(TrackingState.LOCKED);

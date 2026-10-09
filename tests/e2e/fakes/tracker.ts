@@ -81,6 +81,7 @@ export class ScriptedTracker {
    *  means no anchor, so the orchestrator falls back to team-only. */
   lastSeen: Position | null = null;
   getLastSeenPosition(_maxAgeMs: number): Position | null { return this.lastSeen; }
+  getLastSeenAgeMs(): number { return 0; }
   getCameraPosition(): Position | null {
     return this.cameraTrackingEnabled ? this.cameraPosition : null;
   }

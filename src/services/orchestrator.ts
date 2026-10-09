@@ -26,7 +26,7 @@ import {
   resolveGameRect,
   WARN_QUERY_FAILED,
 } from '../core/game-window';
-import { MapType, PeerState, Player } from '../core/types';
+import { MapType, PeerState, Player, Position } from '../core/types';
 import '../core/window-globals';
 import { isStreamerMode } from '../core/streamer-detect';
 import {
@@ -161,6 +161,8 @@ export class Orchestrator {
   /** True once we have told the server our position is stale, so the message
    *  goes out on the transition rather than at the tick rate. */
   private coordsDisowned = false;
+  // The last-seen position the disown told the server about, if any.
+  private disownedWith: Position | null = null;
   // The last-seen position teammates are being scored from while lost, for
   // logging when that starts and stops.
   private lostAnchor: { x: number; y: number } | null = null;
@@ -766,6 +768,7 @@ export class Orchestrator {
     // Push our latest XY to server-side room state. /compute-volumes reads
     // every peer's stored position from there — no more P2P blob exchange.
     this.coordsDisowned = false;
+    this.disownedWith = null;
     this.lostAnchor = null;
     this.signaling.sendCoords(position.x, position.y, /*stale*/ false, camera);
 
@@ -815,15 +818,27 @@ export class Orchestrator {
    * follow, so an enemy standing where we recalled from goes on hearing us
    * long after we are in base.
    *
-   * Idempotent: `coordsDisowned` is cleared only when real coordinates start
-   * flowing again, so this sends one message however long the episode lasts.
+   * The disown carries where the tracker last actually saw us, while that is
+   * recent (LOST_ALLY_ANCHOR_MS): the server scores our teammates against it,
+   * as we score them (applyLostVolumes). It is sent again when that changes —
+   * a RESET or a respawn drops it, or it ages out — so the server never holds
+   * one our own tracker has given up on.
+   *
+   * Otherwise idempotent: `coordsDisowned` is cleared only when real
+   * coordinates start flowing again, so this sends one message, or two,
+   * however long the episode lasts.
    */
   private disownCoords(): void {
-    if (this.coordsDisowned) return;
-    const position = this.tracking?.getLastPosition();
-    if (!position || (position.x === 0 && position.y === 0)) return;
+    const seen = this.tracking?.getLastSeenPosition(LOST_ALLY_ANCHOR_MS) ?? null;
+    if (this.coordsDisowned && seen === this.disownedWith) return;
+    const position = this.tracking?.getLastPosition() ?? null;
+    if (!this.coordsDisowned && (!position || (position.x === 0 && position.y === 0))) return;
+    const at = seen ?? position ?? this.disownedWith;
+    if (!at) return;
     this.coordsDisowned = true;
-    this.signaling.sendCoords(position.x, position.y, /*stale*/ true);
+    this.disownedWith = seen;
+    this.signaling.sendCoords(at.x, at.y, /*stale*/ true, null,
+      seen ? this.tracking!.getLastSeenAgeMs() : undefined);
   }
 
   /**
@@ -865,7 +880,8 @@ export class Orchestrator {
       this.applyTeamOnlyVolumes();
       return;
     }
-    if (!this.audio || this.session !== session) return;
+    // Ended, or found again, while we waited: this answer is out of date.
+    if (!this.audio || this.session !== session || this.lostAnchor !== seen) return;
     const allies: Record<string, number> = {};
     for (const [name, state] of this.peerStates) {
       if (state.team !== session.localPlayer.team) continue;

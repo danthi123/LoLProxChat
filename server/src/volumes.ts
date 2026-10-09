@@ -401,7 +401,7 @@ export function computeTieredVolumes(
 
     const ally = !legacy && peer.team === me.team;
     if (body.alliesOnly === true && !ally) {
-      if (DEBUG_VOLUMES) trace.push(peer.name + '[cross team=' + peer.team + ' ALLIES-ONLY]=skip');
+      if (DEBUG_VOLUMES) trace.push(peer.name + '[team=' + peer.team + ' ALLIES-ONLY]=skip');
       continue;
     }
     const anchor = ally ? allyAnchor(peer, now) : undefined;
