@@ -711,6 +711,51 @@ describe('the volume tick', () => {
       expect(staleCalls(h)).toHaveLength(1);
     });
 
+    it('tells the server where it last saw us, and takes it back when the tracker drops it', async () => {
+      const { h } = await heldFor(3, 'no-match');
+      // The fake's lastSeen starts null: a plain disown.
+      expect(staleCalls(h)).toHaveLength(1);
+      expect(staleCalls(h)[0][4]).toBeUndefined();
+
+      h.tracker.lastSeen = { x: 6900, y: 7000 };
+      await jest.advanceTimersByTimeAsync(300);
+      await settle();
+      expect(staleCalls(h)).toHaveLength(2);
+      expect(staleCalls(h)[1].slice(0, 3)).toEqual([6900, 7000, true]);
+      expect(staleCalls(h)[1][4]).toBe(0);
+
+      // Unchanged: nothing more is sent.
+      await jest.advanceTimersByTimeAsync(300);
+      await settle();
+      expect(staleCalls(h)).toHaveLength(2);
+
+      // A RESET (or respawn, or the window running out) drops it: the server
+      // is told, so it stops scoring our teammates against it.
+      h.tracker.lastSeen = null;
+      await jest.advanceTimersByTimeAsync(300);
+      await settle();
+      expect(staleCalls(h)).toHaveLength(3);
+      expect(staleCalls(h)[2][4]).toBeUndefined();
+    });
+
+    it('dying while lost withdraws the sighting from the server', async () => {
+      const { h } = await heldFor(3, 'no-match');
+      h.tracker.lastSeen = { x: 6900, y: 7000 };
+      h.tracker.state = TrackingState.SCANNING;
+      await jest.advanceTimersByTimeAsync(300);
+      await settle();
+      const before = staleCalls(h).length;
+      expect(staleCalls(h)[before - 1][4]).toBe(0);
+
+      // The real tracker has no body to keep, and no sighting while dead.
+      h.tracker.onDeath();
+      h.tracker.lastSeen = null;
+      await jest.advanceTimersByTimeAsync(300);
+      await settle();
+      expect(staleCalls(h)).toHaveLength(before + 1);
+      expect(staleCalls(h)[before][4]).toBeUndefined();
+    });
+
     it('disowns once per episode, and vouches again after recovery', async () => {
       const { h } = await heldFor(3, 'no-match');
       await jest.advanceTimersByTimeAsync(1000);

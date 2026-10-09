@@ -62,6 +62,11 @@ export interface VolumeRequestV2 {
   // as well, and only used when both players in a pair have published one.
   // See computeTieredVolumes.
   listenPosition?: { x: number; y: number };
+  // Since v0.5.23. The requester has lost track of itself and `myPosition` is
+  // where it was last seen, which it no longer vouches for: score its
+  // teammates from there (ally proximity) and leave everyone else out. Only
+  // ever narrows the response; the client drops cross-team peers too.
+  alliesOnly?: boolean;
 }
 
 export interface VolumeResponse {
@@ -79,6 +84,21 @@ export interface VolumeResponse {
  * stall without flickering them silent.
  */
 const STALE_POSITION_MS = 5_000;
+
+/**
+ * How long a teammate the tracker has lost goes on being scored, by players
+ * with ally proximity on, at the last position anyone saw them at. A
+ * champion walks ~350 units a second, so past this the last position says
+ * little about where they are and they go back to full volume.
+ *
+ * Before v0.5.23 an ally with no fresh position was at full volume straight
+ * away. Trackers lose players often in a lane full of icons, and a 2026-10-09
+ * test heard other lanes "all the time" on the strength of it.
+ *
+ * Allies only, never cross-team: a position the client has disowned must not
+ * keep an enemy hearing them. The client applies the same window to itself.
+ */
+export const LOST_ALLY_ANCHOR_MS = 20_000;
 
 // ---------- helpers ----------
 
@@ -282,6 +302,23 @@ export interface TieredRoomClient {
   position?: { x: number; y: number; updatedMs: number };
   /** Camera centre, present only while the client has voice on camera ON. */
   camera?: { x: number; y: number; updatedMs: number };
+  /** The position it reported before disowning it (RoomManager.clearPosition). */
+  lastSeen?: { x: number; y: number; updatedMs: number };
+}
+
+/**
+ * Where to score an ally from: their fresh position, else the latest one
+ * they reported within LOST_ALLY_ANCHOR_MS (stale, or disowned since), else
+ * nowhere.
+ */
+function allyAnchor(
+  peer: TieredRoomClient,
+  now: number,
+): { x: number; y: number; updatedMs: number } | undefined {
+  const latest = [peer.position, peer.lastSeen]
+    .filter((p): p is { x: number; y: number; updatedMs: number } => !!p)
+    .sort((a, b) => b.updatedMs - a.updatedMs)[0];
+  return latest && latest.updatedMs >= now - LOST_ALLY_ANCHOR_MS ? latest : undefined;
 }
 
 /**
@@ -351,7 +388,8 @@ export function computeTieredVolumes(
   const legacy = me.team === undefined;
   const range = MAX_HEARING_RANGE;
 
-  const cutoff = Date.now() - STALE_POSITION_MS;
+  const now = Date.now();
+  const cutoff = now - STALE_POSITION_MS;
   // Our own camera, read from room state rather than from the request. A
   // stale one counts as absent, the same as a stale position.
   const myCamera = me.camera && me.camera.updatedMs >= cutoff ? me.camera : undefined;
@@ -362,7 +400,12 @@ export function computeTieredVolumes(
     if (peer.name === me.name) continue;
 
     const ally = !legacy && peer.team === me.team;
-    const allyUnplaced = ally && (!peer.position || peer.position.updatedMs < cutoff);
+    if (body.alliesOnly === true && !ally) {
+      if (DEBUG_VOLUMES) trace.push(peer.name + '[team=' + peer.team + ' ALLIES-ONLY]=skip');
+      continue;
+    }
+    const anchor = ally ? allyAnchor(peer, now) : undefined;
+    const allyUnplaced = ally && !anchor;
     if (ally && (!body.allyProximity || allyUnplaced)) {
       // Global ally voice (ally proximity off): always full volume, no
       // proximity. We even skip the staleness check — an ally in SCANNING /
@@ -376,25 +419,31 @@ export function computeTieredVolumes(
       //
       // With ally proximity on (the client default since v0.5.18), allies fall
       // through to the distance falloff below like cross-team peers — except
-      // one we cannot place. A teammate with no fresh position (game start,
-      // after a recall the tracker lost, after RESET) is heard by their team at
-      // full volume until they are found again, the same team-only fallback
-      // the requester's own client applies while it cannot place itself.
-      // Silencing them instead cut players out of their own team's voice for
-      // as long as their tracking was lost.
+      // one we cannot place. A teammate whose tracker lost them is scored at
+      // where they were last seen for LOST_ALLY_ANCHOR_MS; with no position
+      // in that window (game start, a long loss, after RESET) they are heard
+      // by their team at full volume until they are found again, the same
+      // fallback the requester's own client applies while it cannot place
+      // itself. Silencing them instead cut players out of their own team's
+      // voice for as long as their tracking was lost.
       peerVolumes[peer.name] = 1.0;
       if (DEBUG_VOLUMES) trace.push(peer.name + '[ally team=' + peer.team + (allyUnplaced ? ' UNPLACED' : '') + ']=1.0');
       continue;
     }
 
-    if (!peer.position) {
+    // An ally here has ally proximity on and somewhere to be scored at,
+    // possibly where they were last seen; anyone else needs a fresh position.
+    const peerPos = anchor ?? peer.position;
+    if (!peerPos) {
       if (DEBUG_VOLUMES) trace.push(peer.name + '[cross team=' + peer.team + ' NO-POS]=skip');
       continue;
     }
-    if (peer.position.updatedMs < cutoff) {
+    if (!anchor && peerPos.updatedMs < cutoff) {
       if (DEBUG_VOLUMES) trace.push(peer.name + '[cross team=' + peer.team + ' STALE]=skip');
       continue;
     }
+    const tag = (ally ? 'ally' : 'cross') + ' team=' + peer.team +
+      (anchor && (anchor !== peer.position || anchor.updatedMs < cutoff) ? ' LAST-SEEN' : '');
 
     // "Voice on camera" (#36) is an opt-in BETWEEN TWO PLAYERS, not a setting
     // one of them applies to the other. Both sides have to be publishing a
@@ -418,15 +467,15 @@ export function computeTieredVolumes(
     const bothOptedIn = !!myCamera && !!peer.camera &&
       peer.camera.updatedMs >= cutoff;
     const myPoints = bothOptedIn ? [body.myPosition, myCamera!] : [body.myPosition];
-    const peerPoints = [peer.position];
+    const peerPoints = [peerPos];
 
     const dist = closestApproach(myPoints, peerPoints);
     if (dist >= range) {
-      if (DEBUG_VOLUMES) trace.push(peer.name + '[cross team=' + peer.team + ' dist=' + Math.round(dist) + ' >= range=' + range + ']=skip');
+      if (DEBUG_VOLUMES) trace.push(peer.name + '[' + tag + ' dist=' + Math.round(dist) + ' >= range=' + range + ']=skip');
       continue;
     }
     peerVolumes[peer.name] = calculateVolume(dist);
-    if (DEBUG_VOLUMES) trace.push(peer.name + '[cross team=' + peer.team + (bothOptedIn ? ' camera' : '') + ' dist=' + Math.round(dist) + ']=' + calculateVolume(dist).toFixed(2));
+    if (DEBUG_VOLUMES) trace.push(peer.name + '[' + tag + (bothOptedIn ? ' camera' : '') + ' dist=' + Math.round(dist) + ']=' + calculateVolume(dist).toFixed(2));
   }
 
   if (DEBUG_VOLUMES) {

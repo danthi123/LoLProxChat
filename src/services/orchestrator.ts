@@ -26,7 +26,7 @@ import {
   resolveGameRect,
   WARN_QUERY_FAILED,
 } from '../core/game-window';
-import { MapType, PeerState, Player } from '../core/types';
+import { MapType, PeerState, Player, Position } from '../core/types';
 import '../core/window-globals';
 import { isStreamerMode } from '../core/streamer-detect';
 import {
@@ -112,6 +112,14 @@ export const SHARED_RESET_RECEIVE_MS = 15_000;
 /** How long the panel says who asked us to rescan. */
 const SHARED_RESET_NOTICE_MS = 4_000;
 
+/**
+ * While the tracker has lost us, how long teammates go on being scored from
+ * where we were last seen (ally proximity on) before they are all back at
+ * full volume. The server holds a lost teammate to the same window
+ * (LOST_ALLY_ANCHOR_MS in server/src/volumes.ts).
+ */
+export const LOST_ALLY_ANCHOR_MS = 20_000;
+
 export class Orchestrator {
   private readonly deps: OrchestratorDeps;
   private gameState: GameStateService;
@@ -153,6 +161,11 @@ export class Orchestrator {
   /** True once we have told the server our position is stale, so the message
    *  goes out on the transition rather than at the tick rate. */
   private coordsDisowned = false;
+  // The last-seen position the disown told the server about, if any.
+  private disownedWith: Position | null = null;
+  // The last-seen position teammates are being scored from while lost, for
+  // logging when that starts and stops.
+  private lostAnchor: { x: number; y: number } | null = null;
   private gameStatePollRunning = false;
   private geometryPollRunning = false;
   /** Panel-facing reason the capture geometry may be wrong, or null. */
@@ -691,14 +704,18 @@ export class Orchestrator {
       // written it off. No-op before the first lock, when there is nothing to
       // disown.
       this.disownCoords();
-      this.applyTeamOnlyVolumes();
+      await this.applyLostVolumes();
       this.broadcastOverlayState();
       return;
     }
 
     const position = this.tracking.getLastPosition();
     if (!position || (position.x === 0 && position.y === 0)) {
-      this.applyTeamOnlyVolumes();
+      // Dead with no body to keep (we died while scanning): a sighting the
+      // server still holds for our teammates is withdrawn. No-op before the
+      // first lock.
+      this.disownCoords();
+      await this.applyLostVolumes();
       this.broadcastOverlayState();
       return;
     }
@@ -727,7 +744,7 @@ export class Orchestrator {
       // used to freeze every peer at whatever gain they last had, so after a
       // recall a player went on hearing everyone they could hear from the lane
       // they had just left, for as long as the tracker stayed lost.
-      this.applyTeamOnlyVolumes();
+      await this.applyLostVolumes();
       this.broadcastOverlayState();
       return;
     }
@@ -755,6 +772,8 @@ export class Orchestrator {
     // Push our latest XY to server-side room state. /compute-volumes reads
     // every peer's stored position from there — no more P2P blob exchange.
     this.coordsDisowned = false;
+    this.disownedWith = null;
+    this.lostAnchor = null;
     this.signaling.sendCoords(position.x, position.y, /*stale*/ false, camera);
 
     // Log our position whenever it moves >500 game units so we can see the
@@ -803,15 +822,77 @@ export class Orchestrator {
    * follow, so an enemy standing where we recalled from goes on hearing us
    * long after we are in base.
    *
-   * Idempotent: `coordsDisowned` is cleared only when real coordinates start
-   * flowing again, so this sends one message however long the episode lasts.
+   * The disown carries where the tracker last actually saw us, while that is
+   * recent (LOST_ALLY_ANCHOR_MS): the server scores our teammates against it,
+   * as we score them (applyLostVolumes). It is sent again when that changes —
+   * a RESET or a respawn drops it, or it ages out — so the server never holds
+   * one our own tracker has given up on.
+   *
+   * Otherwise idempotent: `coordsDisowned` is cleared only when real
+   * coordinates start flowing again, so this sends one message, or two,
+   * however long the episode lasts.
    */
   private disownCoords(): void {
-    if (this.coordsDisowned) return;
-    const position = this.tracking?.getLastPosition();
-    if (!position || (position.x === 0 && position.y === 0)) return;
+    const seen = this.tracking?.getLastSeenPosition(LOST_ALLY_ANCHOR_MS) ?? null;
+    if (this.coordsDisowned && seen === this.disownedWith) return;
+    const position = this.tracking?.getLastPosition() ?? null;
+    if (!this.coordsDisowned && (!position || (position.x === 0 && position.y === 0))) return;
+    const at = seen ?? position ?? this.disownedWith;
+    if (!at) return;
     this.coordsDisowned = true;
-    this.signaling.sendCoords(position.x, position.y, /*stale*/ true);
+    this.disownedWith = seen;
+    this.signaling.sendCoords(at.x, at.y, /*stale*/ true, null,
+      seen ? this.tracking!.getLastSeenAgeMs() : undefined);
+  }
+
+  /**
+   * What to play while the tracker cannot place us: teammates by distance
+   * from where we were last seen, for LOST_ALLY_ANCHOR_MS, then (or with ally
+   * proximity off, or nowhere to start from) all of them at full volume.
+   * Nobody from the other team either way.
+   *
+   * Going straight to full volume made every teammate audible the moment the
+   * tracker lost us, which in a lane crowded with icons is often: a 2026-10-09
+   * test heard other lanes "all the time". A teammate the tracker lost is
+   * scored the same way by the server from their side.
+   *
+   * The position we were last seen at is not sent as ours — it was disowned,
+   * and cross-team peers stop hearing us. It goes only on this request, which
+   * asks the server for allies alone; anyone else in the answer (a server
+   * predating alliesOnly) is dropped here.
+   */
+  private async applyLostVolumes(): Promise<void> {
+    const session = this.session;
+    const seen = getAllyProximity() ? this.tracking?.getLastSeenPosition(LOST_ALLY_ANCHOR_MS) ?? null : null;
+    if (!seen || !session || !this.volumeClient) {
+      if (this.lostAnchor) console.log('[LoLProxChat] Still lost: teammates back at full volume');
+      this.lostAnchor = null;
+      this.applyTeamOnlyVolumes();
+      return;
+    }
+    if (seen !== this.lostAnchor) {
+      console.log('[LoLProxChat] Lost: scoring teammates from where we were last seen (' +
+        Math.round(seen.x) + ', ' + Math.round(seen.y) + ')');
+      this.lostAnchor = seen;
+    }
+    let result: { peerVolumes: Record<string, number> };
+    try {
+      result = await this.volumeClient.computeVolumes(
+        seen, session.roomId, this.localSummonerName, /*allyProximity*/ true, /*alliesOnly*/ true);
+    } catch (e) {
+      console.error('[LoLProxChat] Volume computation failed:', e);
+      this.applyTeamOnlyVolumes();
+      return;
+    }
+    // The game ended while we waited.
+    if (!this.audio || this.session !== session) return;
+    const allies: Record<string, number> = {};
+    for (const [name, state] of this.peerStates) {
+      if (state.team !== session.localPlayer.team) continue;
+      const v = result.peerVolumes[name];
+      if (typeof v === 'number' && Number.isFinite(v)) allies[name] = v;
+    }
+    this.audio.applyPeerVolumes(allies);
   }
 
   private applyTeamOnlyVolumes(): void {
@@ -1351,6 +1432,10 @@ export class Orchestrator {
     this.tracking?.stop();
     this.tracking = null;
     this.volumeClient = null;
+    // The next game starts with nothing disowned.
+    this.coordsDisowned = false;
+    this.disownedWith = null;
+    this.lostAnchor = null;
     if (this.debugBundle || isLoggingEnabled()) {
       this.debugBundle = null;
       this.bundleChain = this.bundleChain.then(async () => {

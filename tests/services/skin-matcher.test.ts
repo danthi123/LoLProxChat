@@ -20,6 +20,8 @@ const KAYN_LISTING = [
 ].map(f => `<a href="${f}">${f}</a>`).join('\n');
 
 describe('iconFilesForSkin', () => {
+  const listing = (...files: string[]): string => files.map(f => `<a href="${f}" title="${f}">${f}</a>`).join('\n');
+
   test('the base skin, in every form the champion takes', () => {
     expect(iconFilesForSkin(KAYN_LISTING, 'Kayn', 0))
       .toEqual(['kayn_ass_circle.png', 'kayn_circle.png', 'kayn_slay_circle.png']);
@@ -30,26 +32,38 @@ describe('iconFilesForSkin', () => {
       .toEqual(['kayn_ass_circle_15.png', 'kayn_circle_15.png', 'kayn_slay_circle_15.png']);
   });
 
-  test('a chroma wears its parent skin\'s icon', () => {
-    // 17 has no icon of its own: the highest below it is 15.
-    expect(iconFilesForSkin(KAYN_LISTING, 'kayn', 17))
-      .toEqual(['kayn_ass_circle_15.png', 'kayn_circle_15.png', 'kayn_slay_circle_15.png']);
+  test('a chroma wears its parent skin\'s icon, or the base one', () => {
+    // 17 has no icon of its own: the highest below it is 15, and the base icon
+    // goes in as well in case the game draws that instead.
+    expect(iconFilesForSkin(KAYN_LISTING, 'kayn', 17)).toEqual([
+      'kayn_ass_circle.png', 'kayn_ass_circle_15.png', 'kayn_circle.png', 'kayn_circle_15.png',
+      'kayn_slay_circle.png', 'kayn_slay_circle_15.png',
+    ]);
     // A form without the skin falls back within that form only.
-    expect(iconFilesForSkin(KAYN_LISTING, 'kayn', 21))
-      .toEqual(['kayn_ass_circle_15.png', 'kayn_circle_20.png', 'kayn_slay_circle_15.png']);
+    expect(iconFilesForSkin(KAYN_LISTING, 'kayn', 21)).toEqual([
+      'kayn_ass_circle.png', 'kayn_ass_circle_15.png', 'kayn_circle.png', 'kayn_circle_20.png',
+      'kayn_slay_circle.png', 'kayn_slay_circle_15.png',
+    ]);
+  });
+
+  test('a skin drawn with the base icon is still matched (Smolder\'s skin 6)', () => {
+    const smolder = listing('smolder_circle_0.png', 'smolder_circle_1.png', 'smolder_circle_11.png');
+    expect(iconFilesForSkin(smolder, 'smolder', 6)).toEqual(['smolder_circle_0.png', 'smolder_circle_1.png']);
+    // A skin with an icon of its own gets just that one.
+    expect(iconFilesForSkin(smolder, 'smolder', 11)).toEqual(['smolder_circle_11.png']);
   });
 
   test('a numbered base icon counts as the base skin', () => {
     const gwen = '<a href="gwen_circle_0.png"></a><a href="gwen_circle_11.png"></a>';
     expect(iconFilesForSkin(gwen, 'gwen', 0)).toEqual(['gwen_circle_0.png']);
-    expect(iconFilesForSkin(gwen, 'gwen', 12)).toEqual(['gwen_circle_11.png']);
+    expect(iconFilesForSkin(gwen, 'gwen', 12)).toEqual(['gwen_circle_0.png', 'gwen_circle_11.png']);
   });
-
-  const listing = (...files: string[]): string => files.map(f => `<a href="${f}" title="${f}">${f}</a>`).join('\n');
 
   test('every icon a skin has for one number: level-ups, elements, tiers, forms', () => {
     const kayle = listing('kayle_circle_0.png', 'kayle_circle_0_lvl11.png', 'kayle_circle_4.png', 'kayle_circle_4_lvl11.png');
-    expect(iconFilesForSkin(kayle, 'kayle', 5)).toEqual(['kayle_circle_4.png', 'kayle_circle_4_lvl11.png']);
+    expect(iconFilesForSkin(kayle, 'kayle', 5)).toEqual([
+      'kayle_circle_0.png', 'kayle_circle_0_lvl11.png', 'kayle_circle_4.png', 'kayle_circle_4_lvl11.png',
+    ]);
     const lux = listing('lux_circle_0.png', 'lux_circle_7_fire.png', 'lux_circle_7_ice.png', 'lux_circle_8.png');
     expect(iconFilesForSkin(lux, 'lux', 7)).toEqual(['lux_circle_7_fire.png', 'lux_circle_7_ice.png']);
     expect(iconFilesForSkin(lux, 'lux', 8)).toEqual(['lux_circle_8.png']);
@@ -76,8 +90,8 @@ describe('iconFilesForSkin', () => {
     expect(iconFilesForSkin(listing('jester_circle.png', 'anivia_circle_1.png'), 'anivia', 0)).toEqual([]);
     const xin = listing('xinzhao_circle_2.png', 'xinzhaorework_circle_0.png', 'xinzhaorework_circle_6.png');
     expect(iconFilesForSkin(xin, 'xinzhao', 0)).toEqual(['xinzhaorework_circle_0.png']);
-    expect(iconFilesForSkin(xin, 'xinzhao', 3)).toEqual(['xinzhao_circle_2.png']);
-    expect(iconFilesForSkin(xin, 'xinzhao', 7)).toEqual(['xinzhaorework_circle_6.png']);
+    expect(iconFilesForSkin(xin, 'xinzhao', 3)).toEqual(['xinzhao_circle_2.png', 'xinzhaorework_circle_0.png']);
+    expect(iconFilesForSkin(xin, 'xinzhao', 7)).toEqual(['xinzhaorework_circle_0.png', 'xinzhaorework_circle_6.png']);
   });
 
   test('another champion\'s files, and nothing at all, give nothing', () => {

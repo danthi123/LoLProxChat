@@ -246,11 +246,20 @@ export class SignalingService {
    * it and uses it as one of our listening points — only against peers who
    * have published one too, and never as a point we are heard at. Omitting it is how the client says the setting is off, which the
    * server acts on immediately rather than waiting for the value to age out.
+   *
+   * With `stale`, `seenAgoMs` says x/y are where we last actually saw
+   * ourselves, that long ago: the server scores our teammates against it for
+   * a short while. Without it the server forgets any such place.
    */
-  sendCoords(x: number, y: number, stale = false, camera?: { x: number; y: number } | null): void {
+  sendCoords(
+    x: number, y: number, stale = false,
+    camera?: { x: number; y: number } | null, seenAgoMs?: number,
+  ): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     if (stale) {
-      this.ws.send(JSON.stringify({ type: 'coords', x, y, stale: true }));
+      this.ws.send(JSON.stringify(seenAgoMs !== undefined
+        ? { type: 'coords', x, y, stale: true, seen: true, seenAgoMs: Math.round(seenAgoMs) }
+        : { type: 'coords', x, y, stale: true }));
       return;
     }
     this.ws.send(JSON.stringify(camera

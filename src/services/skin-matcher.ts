@@ -278,7 +278,11 @@ const NOT_FORMS = new Set(['certaindeath', 'whirlingdeath', 'trueshotbarrage']);
  *   `lux_circle_7_fire`, `kaisa_circle_71_form2` — all of which are kept.
  *
  * A chroma has no icon of its own and wears its parent skin's: the highest
- * number at or below its id, chosen separately for each form.
+ * number at or below its id, chosen separately for each form. That guess is
+ * not always right — Smolder's skin 6 is drawn with his base icon, not skin
+ * 1's (the 2026-10-09 test, where his own icon never matched) — so a skin
+ * without an icon of its own gets the form's base icon as well. Teammates are
+ * different champions, so the extra template cannot be mistaken for theirs.
  */
 export function iconFilesForSkin(listing: string, alias: string, skinId: number): string[] {
   const a = alias.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -304,6 +308,7 @@ export function iconFilesForSkin(listing: string, alias: string, skinId: number)
     let pick = -1;
     for (const n of byNum.keys()) if (n <= skinId && n > pick) pick = n;
     if (pick >= 0) for (const f of byNum.get(pick)!) files.add(f);
+    if (pick !== skinId && pick !== 0 && byNum.has(0)) for (const f of byNum.get(0)!) files.add(f);
   }
   return [...files].sort();
 }

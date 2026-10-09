@@ -1,6 +1,6 @@
 import type { WebSocket } from 'ws';
 import type { ClientInfo } from './types.js';
-import type { TieredRoomClient } from './volumes.js';
+import { LOST_ALLY_ANCHOR_MS, type TieredRoomClient } from './volumes.js';
 
 /** Outcome of a `join`. `evicted` is set when the name was already taken. */
 export interface JoinResult {
@@ -59,6 +59,7 @@ export class RoomManager {
       team: team ?? evicted?.team,
       position: evicted?.position,
       camera: evicted?.camera,
+      lastSeen: evicted?.lastSeen,
     };
     existing.push(info);
     this.rooms.set(roomId, existing);
@@ -143,6 +144,7 @@ export class RoomManager {
     const info = this.clients.get(ws);
     if (!info) return;
     info.position = { x, y, updatedMs: Date.now() };
+    info.lastSeen = undefined;
   }
 
   /**
@@ -206,13 +208,22 @@ export class RoomManager {
 
   /**
    * Forget a client's position without disconnecting them. They stay in the
-   * room and keep being heard by teammates, who are not scored on distance;
-   * cross-team peers stop hearing them at once rather than after the staleness
-   * window, because the client has told us the position is no longer true.
+   * room and keep being heard by teammates; cross-team peers stop hearing them
+   * at once rather than after the staleness window, because the client has
+   * told us the position is no longer true.
+   *
+   * `seen` is where the client last actually saw itself, if it still stands
+   * by that: kept as `lastSeen`, which teammates with ally proximity on are
+   * scored against for a short while (computeTieredVolumes). Without it any
+   * lastSeen goes too — after a RESET or a respawn the client has said the
+   * old place is wrong.
    */
-  clearPosition(ws: WebSocket): void {
+  clearPosition(ws: WebSocket, seen?: { x: number; y: number; agoMs: number }): void {
     const info = this.clients.get(ws);
     if (!info) return;
+    info.lastSeen = seen
+      ? { x: seen.x, y: seen.y, updatedMs: Date.now() - Math.min(Math.max(0, seen.agoMs), LOST_ALLY_ANCHOR_MS) }
+      : undefined;
     info.position = undefined;
     // The camera goes with it. Disowning the position means "I no longer know
     // where I am"; a peer with no position is skipped in scoring anyway, and
@@ -262,6 +273,7 @@ export class RoomManager {
       team: c.team,
       position: c.position,
       camera: c.camera,
+      lastSeen: c.lastSeen,
     }));
   }
 

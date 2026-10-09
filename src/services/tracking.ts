@@ -104,6 +104,7 @@ export class TrackingService {
   // The last position that came from actually seeing us (or the covered-icon
   // anchor) rather than from extrapolation — where onDeath puts the body.
   private lastSeenPosition: Position | null = null;
+  private lastSeenMs = 0;
   private expectedIconDiam = 0;
 
   // Velocity prediction (smoothed over recent frames)
@@ -240,6 +241,9 @@ export class TrackingService {
   // further from there than we could have walked — see handleScanning.
   private lostAt: { x: number; y: number } | null = null;
   private lostAtMs = 0;
+  // The rescan in progress was the user's RESET: the camera may then put us
+  // anywhere, since the user is likely looking at their champion.
+  private lostByReset = false;
   // Whether this frame showed anything at all on the minimap — any icon or
   // structure of either colour. See the no-teal branch of handleLocked.
   private minimapReadable = true;
@@ -370,7 +374,26 @@ export class TrackingService {
     this.lastPositionUpdateMs = performance.now();
     // Neither is a sighting of our own icon. The death position comes from
     // lastSeenPosition, and a teammate cover moves with the teammate.
-    if (source !== 'extrapolate' && source !== 'teammate-cover') this.lastSeenPosition = newPos;
+    if (source !== 'extrapolate' && source !== 'teammate-cover') {
+      this.lastSeenPosition = newPos;
+      this.lastSeenMs = performance.now();
+    }
+  }
+
+  /**
+   * Where we were last actually seen, if that was within `maxAgeMs` — for the
+   * orchestrator to keep scoring teammates from while the tracker has lost us.
+   * Null while dead, after a RESET (the user has said that position is wrong)
+   * or a respawn, after the minimap region changes, and before the first lock.
+   */
+  getLastSeenPosition(maxAgeMs: number): Position | null {
+    if (this.state === TrackingState.DEAD || !this.lastSeenPosition) return null;
+    return performance.now() - this.lastSeenMs <= maxAgeMs ? this.lastSeenPosition : null;
+  }
+
+  /** How long ago getLastSeenPosition's position was seen, in ms. */
+  getLastSeenAgeMs(): number {
+    return performance.now() - this.lastSeenMs;
   }
   getFilteredImageUrl(): string | null { return this.filteredImageUrl; }
   /** Seconds since the last successful frame-to-frame lock, or 0 if currently tracking. */
@@ -448,6 +471,9 @@ export class TrackingService {
 
     this.state = TrackingState.SCANNING;
     this.lostAt = null;
+    this.lostByReset = false;
+    // Measured against the old region; not worth scoring teammates from.
+    this.lastSeenPosition = null;
     this.bystanders = [];
     this.bystanderBlobs = [];
     this.teammateVerdicts.clear();
@@ -495,6 +521,9 @@ export class TrackingService {
     }
     this.state = TrackingState.SCANNING;
     this.lostAt = null;
+    this.lostByReset = false;
+    // Measured against the old region; not worth scoring teammates from.
+    this.lastSeenPosition = null;
     this.bystanders = [];
     this.bystanderBlobs = [];
     this.teammateVerdicts.clear();
@@ -761,6 +790,7 @@ export class TrackingService {
     this.resetCameraOnUs();
     this.cameraDwell.reset();
     this.lostAt = null;
+    this.lostByReset = false;
     this.bystanders = [];
     this.bystanderBlobs = [];
     this.lastCleanReg = null;
@@ -794,6 +824,18 @@ export class TrackingService {
     this.avoidPoint = was;
     this.avoidOrigin = was;
     this.avoidUntilMs = performance.now() + RESET_AVOID_MS;
+    // The rejected icon is usually one beside ours: a teammate we were stacked
+    // with in lane. Scanning the whole map instead (as RESET did up to v0.5.22)
+    // took whichever icon scored best anywhere, and testers pressing RESET saw
+    // the same wrong lane come straight back. So the rescan starts as if we
+    // had been lost there — icons nothing identifies are taken within walking
+    // reach of it — except that the camera, which the user has most likely
+    // just put on their champion, may place us anywhere.
+    this.lostAt = was;
+    this.lostAtMs = performance.now();
+    this.lostByReset = was !== null;
+    // Nor is the old position worth scoring teammates from (getLastSeenPosition).
+    this.lastSeenPosition = null;
     // The scan's avoidance ends at its lock; this keeps the camera from moving
     // us straight back onto the icon the user just rejected once it may.
     if (was) this.cameraDwell.reject(was, computeNearFieldPx(this.expectedIconDiam), performance.now() + CAMERA_REJECT_MS);
@@ -828,6 +870,7 @@ export class TrackingService {
     this.avoidOrigin = null;
     this.avoidUntilMs = 0;
     this.lostAt = was;
+    this.lostByReset = false;
     this.lostAtMs = performance.now();
     this.debugSink?.markEvent('shared-reset');
     console.log('[Tracking] Rescanning — shared RESET from another player (within reach of (' +
@@ -839,6 +882,7 @@ export class TrackingService {
   private restartScan(): void {
     this.state = TrackingState.SCANNING;
     this.lostAt = null;
+    this.lostByReset = false;
     this.bystanders = [];
     this.bystanderBlobs = [];
     this.lastCleanReg = null;
@@ -1436,7 +1480,12 @@ export class TrackingService {
     // moment it moves: what RESET is for is a lock stuck on something static
     // (a ward). A blob that walks away is a champion — quite possibly us, with
     // RESET pressed on a lock that was right — and the ordinary scan decides.
-    if (this.avoidPoint && performance.now() < this.avoidUntilMs && this.avoidOrigin) {
+    //
+    // After the user's own RESET the blob stays left out, still, for the whole
+    // scan rather than RESET_AVOID_MS: the scan looks within walking reach of
+    // it, and once the window ran out it was often the only icon there, so
+    // the scan took it straight back.
+    if (this.avoidPoint && (performance.now() < this.avoidUntilMs || this.lostByReset) && this.avoidOrigin) {
       const radius = Math.max(5, this.expectedIconDiam * 0.6);
       // Follow it in small steps only: a champion moves under a pixel a frame,
       // and anything further is a different icon or a frame the avoided blob
@@ -1489,16 +1538,15 @@ export class TrackingService {
     // Within walking reach of where a hold ran out, like any icon nothing
     // else identifies: after a recall the player's camera is often still on
     // the lane, on whichever teammate is there, while their own icon sits in
-    // the fountain where the camera is not.
+    // the fountain where the camera is not. Not after a RESET: the user who
+    // pressed it is usually looking at their champion.
     const favourite = cameraFavourite(this.cameraDwell.readings(performance.now()));
     if (favourite) {
       const near = computeNearFieldPx(this.expectedIconDiam);
       const resetRadius = Math.max(5, this.expectedIconDiam * 0.6);
       const avoided = this.avoidPoint && performance.now() < this.avoidUntilMs &&
         Math.hypot(favourite.x - this.avoidPoint.x, favourite.y - this.avoidPoint.y) <= resetRadius;
-      const outOfReach = this.lostAt &&
-        Math.hypot(favourite.x - this.lostAt.x, favourite.y - this.lostAt.y) >
-          rescanReachPx(this.expectedIconDiam, performance.now() - this.lostAtMs);
+      const outOfReach = !this.lostByReset && this.beyondReach(favourite, region, true);
       const pick = avoided || outOfReach ? null : this.nearestBlob(tealBlobs, favourite, near);
       if (pick) {
         this.lockOnBlob(pick, 'camera(on screen ' + Math.round(favourite.dwell * 100) + '% of the last ' +
@@ -1550,15 +1598,26 @@ export class TrackingService {
       // left the tracker stays SCANNING (team-only) until something identifies
       // us or comes within reach. The reach grows at walking speed, so this
       // cannot stall for good.
+      //
+      // White pixels by an icon do not count as identifying it. They are meant
+      // to be our movement path, but pings, wards and other icons' edges put
+      // them by any icon, and a 2026-10-09 test (14 logs) had most of its far
+      // re-locks — players put in another lane, heard by that lane — taken
+      // that way, including with a full white score.
       if (this.lostAt) {
         // The smoothed score is normalized to the best icon in view, so a
         // near-silent model makes one icon "identified" at 1.0; the raw output
         // has to say something too (the 2026-10-07 log's far re-locks).
-        const identified = (classifierUsable && clsScore >= 0.5 &&
-          this.getClassifierScore(b, this.rawClassifierScores) >= FAR_REACQUIRE_MIN_RAW) ||
-          whiteScore > 0;
-        const reach = rescanReachPx(this.expectedIconDiam, performance.now() - this.lostAtMs);
-        if (!identified && Math.hypot(b.cx - this.lostAt.x, b.cy - this.lostAt.y) > reach) continue;
+        //
+        // In a base, where a recall lands, a movement path will do as well:
+        // players walk out of the fountain, and in a base white marks are far
+        // more often our path than anything else. Without one, an icon there
+        // is as likely a teammate shopping or respawning while ours is still
+        // hidden in lane — and the smoothed score alone says nothing then, as
+        // it is normalized to the best icon in view, which may be theirs.
+        const identified = classifierUsable && clsScore >= 0.5 &&
+          this.getClassifierScore(b, this.rawClassifierScores) >= FAR_REACQUIRE_MIN_RAW;
+        if (!identified && this.beyondReach({ x: b.cx, y: b.cy }, region, whiteScore >= 0.5)) continue;
       }
 
       if (score > bestScore) {
@@ -1584,13 +1643,39 @@ export class TrackingService {
     // then follows and nothing corrects. Wait instead (we are team-only while
     // scanning) until the player walks or the classifier speaks, for as long
     // as the reset's window lasts; after that, scan as usual.
-    if (avoidedSomething && !classifierUsable && bestWhite <= 0) {
+    //
+    // After the user's own RESET the wait lasts for the whole scan, as the
+    // exclusion does: with RESET pressed on a lock that was right and the
+    // player standing still, the best ring in reach is a teammate, and no
+    // camera pick can undo it (the rejected icon is barred from that too).
+    if (avoidedSomething && (performance.now() < this.avoidUntilMs || this.lostByReset) &&
+        !classifierUsable && bestWhite <= 0) {
       return;
     }
 
     if (bestScore === -Infinity) return; // every candidate was out of reach
 
     this.lockOnBlob(bestBlob, 'composite(score=' + bestScore.toFixed(2) + ' ' + bestTerms + ')');
+  }
+
+  /**
+   * Whether a point (region px) is further from where we were lost than we
+   * could have walked since. With `baseOk`, a base is never out of reach: a
+   * recall lands there, and the tracker cannot follow one — the exception
+   * reacquireThresholdAt makes for a hold, which also wants the classifier to
+   * say something.
+   */
+  private beyondReach(
+    p: { x: number; y: number },
+    region: { x: number; y: number; width: number; height: number },
+    baseOk: boolean,
+  ): boolean {
+    if (!this.lostAt) return false;
+    const reach = rescanReachPx(this.expectedIconDiam, performance.now() - this.lostAtMs);
+    if (Math.hypot(p.x - this.lostAt.x, p.y - this.lostAt.y) <= reach) return false;
+    if (!baseOk) return true;
+    const at = this.pixelToGamePosition(region.x + p.x, region.y + p.y, region);
+    return !isInBaseZone(at, MAP_DIMENSIONS[this.mapType]);
   }
 
   /** Lock onto a teal blob as the local player */
@@ -1609,6 +1694,7 @@ export class TrackingService {
     this.wrongLockTarget = null;
     this.avoidPoint = null;
     this.lostAt = null;
+    this.lostByReset = false;
     this.bystanders = [];
     this.bystanderBlobs = [];
     this.lastCleanReg = null;
@@ -1664,6 +1750,7 @@ export class TrackingService {
         x: this.lastPixelPos.x - this.minimapRegion.x,
         y: this.lastPixelPos.y - this.minimapRegion.y,
       };
+      this.lostByReset = false;
       this.lostAtMs = performance.now();
       this.markBystanders(iconBlobs.filter(b => b.color === 'teal'), this.lostAt);
       this.resetCameraOnUs();
@@ -2196,6 +2283,7 @@ export class TrackingService {
     console.warn('[Tracking] The icon we were following is a teammate\'s (skin match) — rescanning');
     this.resetCameraOnUs();
     this.lostAt = at;
+    this.lostByReset = false;
     this.lostAtMs = performance.now();
     this.state = TrackingState.SCANNING;
     this.holdStartMs = 0;

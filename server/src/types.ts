@@ -20,6 +20,13 @@ export interface ClientMessage {
   // type of its own: an old client simply never sets it and the server falls
   // back to the staleness timeout exactly as before.
   stale?: boolean;
+  // 'coords' with stale: true only (v0.5.23). `seen: true` says x/y are where
+  // the client last actually saw itself, `seenAgoMs` how long ago: the server
+  // keeps that as `lastSeen` for its teammates' volumes. Without it (every
+  // older client, and a client whose user has just said the position is
+  // wrong) any lastSeen is dropped.
+  seen?: boolean;
+  seenAgoMs?: number;
   // 'coords' only — the centre of this client's in-game camera, in game
   // coordinates. Present if and only if the user has "voice on camera" ON.
   //
@@ -65,6 +72,11 @@ export interface ClientInfo {
   // Undefined when the client has the setting off, predates v0.5.9, or has
   // not reported one yet. See ClientMessage.cx — presence is consent.
   camera?: { x: number; y: number; updatedMs: number };
+  // Where the client last saw itself, as it said when it disowned its
+  // position (`coords` with stale and seen). Used for nothing but its
+  // teammates' volumes, and only for a short while — see LOST_ALLY_ANCHOR_MS
+  // in volumes.ts.
+  lastSeen?: { x: number; y: number; updatedMs: number };
   // v0.3: team for cross-team filtering. Undefined means a legacy v0.2 client —
   // server falls back to team-blind volume math (every peer audible if in range).
   team?: 'ORDER' | 'CHAOS';

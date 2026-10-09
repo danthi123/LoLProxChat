@@ -16,6 +16,7 @@ import { player } from './fakes/game-state';
 import { setAllyProximity, setCameraListen, setSharedReset } from '../../src/services/audio-prefs';
 import { SignalingService } from '../../src/services/signaling';
 import { Player } from '../../src/core/types';
+import { TrackingState } from '../../src/services/tracking';
 
 const A = 'PlayerOne';
 const B = 'PlayerTwo';
@@ -157,6 +158,93 @@ describe('E2 allies are audible at any distance with ally proximity off', () => 
     );
     expect(exchange.response.peerVolumes).toEqual({});
     await waitFor(() => one.peerFor(b)!.volume === 0, 'the far ally to fall silent');
+  });
+});
+
+describe('E2b a player the tracker loses is placed where they were last seen, for teammates only', () => {
+  // A 2026-10-09 test heard other lanes "all the time": the moment a tracker
+  // lost its player, every teammate went to full volume on both sides.
+  it('scores the lost player\'s teammates from there, both ways, and drops the enemy', async () => {
+    const tag = 'E2E' + (++tagSeq);
+    const players = [
+      player(A, tag, 'Ahri', 'ORDER'),
+      player(B, tag, 'Zed', 'ORDER'),
+      player('PlayerThree', tag, 'Lux', 'CHAOS'),
+    ];
+    const [a, b, c] = players.map((p) => p.summonerName);
+    setAllyProximity(true);
+    const [one, two, three] = track(makeClient(a, players), makeClient(b, players), makeClient(c, players));
+    // B 1200 units from A: inside hearing range, outside the full-volume
+    // plateau, so a distance score is told apart from the old 1.0.
+    one.tracker.moveTo(7000, 7000);
+    two.tracker.moveTo(8200, 7000);
+    three.tracker.moveTo(7300, 7000);
+    await startAll([one, two, three]);
+    await waitForMesh(one, two);
+    await waitForMesh(one, three);
+    await waitFor(
+      () => volumesFor(c).slice(-1).some((e) => (e.response?.peerVolumes?.[a] ?? 0) > 0.5),
+      'the enemy to hear A up close',
+    );
+
+    one.tracker.lastSeen = { x: 7000, y: 7000 };
+    one.tracker.state = TrackingState.SCANNING;
+
+    // A asks for its teammates only, from where it was last seen, and gets B
+    // by distance; the enemy beside it is neither asked for nor played.
+    const lost = await waitFor(
+      () => volumesFor(a).find((e) => e.request?.alliesOnly === true && b in (e.response?.peerVolumes ?? {})),
+      'A to ask for its allies from its last-seen position',
+    );
+    expect(lost.request.myPosition).toEqual({ x: 7000, y: 7000 });
+    expect(lost.response.peerVolumes[b]).toBeGreaterThan(0.3);
+    expect(lost.response.peerVolumes[b]).toBeLessThan(0.8);
+    expect(c in lost.response.peerVolumes).toBe(false);
+    await waitFor(() => one.peerFor(c)!.volume === 0, 'A to stop hearing the enemy');
+
+    // B scores A at the same place, not at the old full volume.
+    const fromB = await waitFor(
+      () => volumesFor(b).slice(-1).map((e) => e.response?.peerVolumes?.[a]).find((v) => v !== undefined && v < 0.8),
+      'B to hear A by distance from where A was last seen',
+    );
+    expect(fromB).toBeGreaterThan(0.3);
+    // And the enemy stops hearing A at all: the position was disowned.
+    await waitFor(
+      () => volumesFor(c).slice(-1).some((e) => !(a in (e.response?.peerVolumes ?? {}))),
+      'the enemy to stop hearing A',
+    );
+
+    // B walking off out of range of that spot no longer hears A.
+    two.tracker.moveTo(13000, 13000);
+    await waitFor(
+      () => volumesFor(b).slice(-1).some((e) => e.request?.myPosition?.x === 13000 && !(a in (e.response?.peerVolumes ?? {}))),
+      'B, far from where A was last seen, to stop hearing A',
+    );
+
+    // A presses RESET, which drops the last sighting: both sides go back to
+    // full team volume rather than keep scoring a place the user called wrong.
+    one.tracker.lastSeen = null;
+    await waitFor(
+      () => volumesFor(b).slice(-1).some((e) => e.response?.peerVolumes?.[a] === 1),
+      'B to hear A at full volume once A drops the sighting',
+    );
+    await waitFor(() => one.peerFor(b)!.volume === 1, 'A to hear B at full volume');
+  });
+
+  it('with nowhere to start from, a lost player hears its teammates at full volume, as before', async () => {
+    const { players, a, b } = roster('ORDER');
+    setAllyProximity(true);
+    const [one, two] = track(makeClient(a, players), makeClient(b, players));
+    one.tracker.moveTo(1000, 1000);
+    two.tracker.moveTo(13000, 13000);
+    await startAll([one, two]);
+    await waitForMesh(one, two);
+    await waitFor(() => one.peerFor(b)!.volume === 0, 'the far ally to be silent while A is placed');
+
+    one.tracker.state = TrackingState.SCANNING; // lastSeen stays null
+    const before = volumesFor(a).length;
+    await waitFor(() => one.peerFor(b)!.volume === 1, 'A to hear the ally at full volume');
+    expect(volumesFor(a).slice(before).some((e) => e.request?.alliesOnly)).toBe(false);
   });
 });
 

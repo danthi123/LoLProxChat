@@ -4,6 +4,12 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Fixed
+- **You could be placed in another lane, and heard there.** After losing your icon, the app does not jump to an icon further away than you could have walked, unless something actually recognises it as yours. White marks beside an icon used to count as recognising it: they are meant to be the path line you click, but pings, wards and other icons' edges make them too. In the 2026-10-09 test (14 logs), most of the jumps across the map came this way. Now white marks never count there. An icon in either base can still be taken from anywhere, because a recall lands there, as long as it is recognised or your path line starts from it, so a teammate shopping is not mistaken for you.
+- **RESET could put you straight back in the wrong lane.** RESET searched the whole minimap and took whichever icon looked best, wherever it was. The icon you reject is usually one beside yours, such as a teammate you were standing with in lane, so RESET now looks near it, and does not go back to the icon you rejected while it stays where it is. The exception is an icon your camera has been keeping on screen, which RESET may take anywhere, since you are most likely looking at your champion when you press it.
+- **Losing track of you made your whole team audible.** Whenever the app could not place you, every teammate went to full volume, and in a lane crowded with icons that happened often. Testers heard the mid and bot lanes "all the time". With Ally proximity on, the app now keeps hearing your teammates by distance from where you were last seen, for up to 20 seconds after that, and only then plays them all at full volume. The enemy team still stops hearing you at once. Your teammates hear you from the same spot, if they have Ally proximity on. Pressing RESET drops that spot, since you have said it is wrong. Needs the matching server build.
+- **Some skins' own icons were never recognised.** For a skin with no minimap icon of its own, the app used the nearest earlier skin's icon. For Smolder's skin 6 that is the wrong picture: it uses his base icon. Such skins now get the base icon as well.
+
 ## [v0.5.22] — 2026-10-08
 
 ### Changed
