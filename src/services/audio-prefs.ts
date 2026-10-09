@@ -28,6 +28,30 @@ export function setAllyProximity(enabled: boolean): void {
   writeToggle(ALLY_PROXIMITY_KEY, enabled);
 }
 
+// Put both toggles back to their defaults (on) once, on the first launch of a
+// build that carries this. A 2026-10-08 test had a player hear their ally at
+// full volume across the map for a whole game — what Ally proximity off does —
+// so every tester starts the next version from the same, known settings rather
+// than whatever an earlier version, or an earlier stray click, left stored.
+// Anyone who wants one off turns it off again, and it then stays off: this runs
+// once per install, not per launch. Shared RESET is left alone — it is an
+// opt-in, so its default is off, and a reset could only ever take it away.
+const AUDIO_DEFAULTS_KEY = 'lolproxchat.audioDefaultsApplied';
+const AUDIO_DEFAULTS_VERSION = '1';
+
+/** Returns whether it changed anything this time. Never throws. */
+export function applyAudioDefaultsOnce(): boolean {
+  try {
+    if (localStorage.getItem(AUDIO_DEFAULTS_KEY) === AUDIO_DEFAULTS_VERSION) return false;
+    writeToggle(ALLY_PROXIMITY_KEY, true);
+    writeToggle(CAMERA_LISTEN_KEY, true);
+    localStorage.setItem(AUDIO_DEFAULTS_KEY, AUDIO_DEFAULTS_VERSION);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // "Voice on camera" (#36): hear the map from wherever the camera is looking as
 // well as from the champion's own position.
 //

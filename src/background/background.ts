@@ -6,7 +6,14 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Orchestrator } from '../services/orchestrator';
 import { isAutoUpdateEnabled } from '../services/updater';
+import { applyAudioDefaultsOnce } from '../services/audio-prefs';
 import '../core/window-globals';
+
+// Ally proximity and Voice on camera back on, once per install (see
+// audio-prefs). Before the orchestrator, whose first session logs them.
+if (applyAudioDefaultsOnce()) {
+  console.warn('[LoLProxChat] Ally proximity and Voice on camera set back to on (one time, for this version)');
+}
 
 console.log('[LoLProxChat] Background script loading...');
 
