@@ -1,5 +1,6 @@
 import {
   getAllyProximity, setAllyProximity, getCameraListen, setCameraListen, getSharedReset, setSharedReset,
+  applyAudioDefaultsOnce,
 } from '../../src/services/audio-prefs';
 
 // The node test environment has no localStorage; a plain map is all the
@@ -30,6 +31,32 @@ describe('audio prefs', () => {
     setCameraListen(true);
     expect(getCameraListen()).toBe(true);
     expect(getAllyProximity()).toBe(false);
+  });
+
+  test('the first launch of this build puts both toggles back on, once', () => {
+    setAllyProximity(false);
+    setCameraListen(false);
+    setSharedReset(true);
+    expect(applyAudioDefaultsOnce()).toBe(true);
+    expect(getAllyProximity()).toBe(true);
+    expect(getCameraListen()).toBe(true);
+    // An opt-in is not a default to restore.
+    expect(getSharedReset()).toBe(true);
+
+    // Turned off again afterwards, it stays off across later launches.
+    setAllyProximity(false);
+    expect(applyAudioDefaultsOnce()).toBe(false);
+    expect(getAllyProximity()).toBe(false);
+  });
+
+  test('the one-time defaults never throw when storage does', () => {
+    const real = (globalThis as any).localStorage;
+    (globalThis as any).localStorage = { getItem: () => { throw new Error('denied'); } };
+    try {
+      expect(applyAudioDefaultsOnce()).toBe(false);
+    } finally {
+      (globalThis as any).localStorage = real;
+    }
   });
 
   test('an install that had turned a toggle on before v0.5.18 keeps it on', () => {
