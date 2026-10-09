@@ -34,7 +34,7 @@ import { invoke } from '@tauri-apps/api/core';
 import {
   Orchestrator, OrchestratorDeps, defaultDeps, STATUS_MIC_BLOCKED, SHARED_RESET_RECEIVE_MS,
 } from '../../src/services/orchestrator';
-import { setSharedReset } from '../../src/services/audio-prefs';
+import { setAllyProximity, setSharedReset } from '../../src/services/audio-prefs';
 import { AudioService } from '../../src/services/audio';
 import { GameStateService } from '../../src/services/game-state';
 import { SignalingService } from '../../src/services/signaling';
@@ -223,6 +223,28 @@ describe('panel settings across sessions', () => {
     h.orchestrator.start();
     await settle();
     expect(updateSettings).toHaveBeenCalledWith({ inputMode: 'ptt', inputVolume: 0.5 });
+  });
+
+  // The panel writes these straight to storage, so without this a toggle
+  // mid-game left no trace and the session-start line was all the log had.
+  it('logs a mid-game change to a toggle that changes what we hear, once', async () => {
+    try {
+      const h = await startInGame();
+      h.tracker.moveTo(7000, 7000);
+      await jest.advanceTimersByTimeAsync(300);
+      const changed = () => (console.log as jest.Mock).mock.calls
+        .map(c => c.join(' ')).filter(l => l.includes('Settings changed'));
+      expect(changed()).toEqual([]);
+
+      setAllyProximity(false);
+      await jest.advanceTimersByTimeAsync(500);
+      expect(changed()).toEqual([
+        '[LoLProxChat] Settings changed: allyProximity=false voiceOnCamera=true sharedReset=false' +
+          ' (was allyProximity=true voiceOnCamera=true sharedReset=false)',
+      ]);
+    } finally {
+      clearStoredPrefs();
+    }
   });
 });
 
