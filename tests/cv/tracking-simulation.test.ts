@@ -23,6 +23,7 @@ import {
   CAMERA_SWITCH_COOLDOWN_MS,
   FORCED_REACQUIRE_HOLD_MS,
   MAX_OCCLUDED_MS,
+  OCCLUDER_GRACE_MS,
 } from '../../src/services/tracking-helpers';
 import { driveTracker, FRAME_MS, metrics, newTracker } from './harness/drive';
 import {
@@ -2099,6 +2100,87 @@ describe('an icon the skin match calls a teammate\'s', () => {
     const lastOnMate = reportsMate.lastIndexOf(true);
     expect((lastOnMate + 1) * FRAME_MS).toBeLessThanOrEqual(1500);
     expect(logs.some(l => l.includes('is a teammate\'s (skin match)'))).toBe(true);
+  });
+
+  // Two teammates fighting side by side: theirs is drawn over ours, and the
+  // camera — locked on us — is centred on the pair. Until v0.5.22 the tracker
+  // let their icon go as soon as the skin match named it, and had no position
+  // at all until it locked it again (the 2026-10-08 test: four times in half
+  // a minute, with the enemy in the fight unable to hear us).
+  describe('over ours, with the camera centred on them', () => {
+    const P: Point = { x: 120, y: 150 };
+    const camOn = (p: Point) => ({ x: p.x - 55, y: p.y - 40, w: 110, h: 80 });
+    const BASE: SceneSpec = { enemies: BACKDROP.enemies };
+    const selfAt = (i: number): Point => ({ x: P.x - 20 + i, y: P.y });
+    const mateAt = (i: number): Point => ({ x: P.x + Math.floor(i / 4), y: P.y });
+
+    /** 20 frames walking to P alone, then `cover` frames hidden under the teammate. */
+    function coveredSpecs(cover: number): SceneSpec[] {
+      const specs: SceneSpec[] = [];
+      for (let i = 0; i < 20; i++) specs.push({ ...BASE, self: selfAt(i), selfTrail: { x: -1, y: 0 }, camera: camOn(selfAt(i)) });
+      for (let i = 0; i < cover; i++) specs.push({ ...BASE, self: null, allies: [mateAt(i)], camera: camOn(mateAt(i)) });
+      return specs;
+    }
+
+    async function drive(specs: SceneSpec[], mateFrom: number, mate: (frame: number) => Point | null, self: (frame: number) => Point | null = () => null) {
+      const scenes = renderScenes(specs);
+      let frame = 0;
+      const classifier = new SkinVerdictScorer(
+        () => { const p = self(frame); return p ? toFramePoint(p) : null; },
+        () => { const m = frame >= mateFrom ? mate(frame) : null; return m ? [toFramePoint(m)] : []; },
+      );
+      const h = newTracker(scenes.map(sc => sc.frame), { classifier });
+      const records = [];
+      for (let i = 0; i < scenes.length; i++) {
+        frame = i;
+        records.push(...await driveTracker(h, [scenes[i]]));
+      }
+      return records;
+    }
+
+    test('reports their spot as ours instead of nothing, following them', async () => {
+      const specs = coveredSpecs(70);
+      const records = await drive(specs, 20, f => mateAt(f - 20));
+      for (let i = 20; i < specs.length; i++) {
+        expect(records[i].state).toBe(TrackingState.LOCKED);
+        expect(distance(records[i].px!, mateAt(i - 20))).toBeLessThanOrEqual(3);
+      }
+      expect(logs.some(l => l.includes('under a teammate'))).toBe(true);
+      expect(logs.some(l => l.includes('is a teammate\'s (skin match)'))).toBe(false);
+    });
+
+    // A recall puts a locked camera on the fountain, where the map's corner
+    // cuts the rectangle off and it cannot be read; a pan leaves it readable
+    // somewhere else. Either way the teammate's spot stops being ours.
+    test.each([
+      ['moves off (a pan)', { x: 200, y: 70 }, 2, 'the camera moved off them'],
+      ['goes unreadable (a recall to the fountain)', { x: 262, y: 262 }, Math.ceil(OCCLUDER_GRACE_MS / FRAME_MS) + 2,
+        'the camera is not readable'],
+    ])('lets them go when the camera %s', async (_name, far, within, why) => {
+      const specs = coveredSpecs(40);
+      const moved = specs.length;
+      for (let i = 40; i < 70; i++) specs.push({ ...BASE, self: null, allies: [mateAt(i)], camera: camOn(far) });
+      const records = await drive(specs, 20, f => mateAt(f - 20));
+      const late = records.slice(moved);
+      const onMate = late.map(r => r.state === TrackingState.LOCKED && !!r.px && distance(r.px, mateAt(40)) <= 12);
+      expect(onMate.lastIndexOf(true) + 1).toBeLessThanOrEqual(within);
+      expect(logs.some(l => l.includes('Stopped following the teammate') && l.includes(why))).toBe(true);
+    });
+
+    test('takes ours back when they walk off it', async () => {
+      const specs = coveredSpecs(40);
+      const parted = specs.length;
+      const away = (i: number): Point => ({ x: mateAt(40).x + 2 * i, y: P.y - i });
+      for (let i = 0; i < 40; i++) specs.push({ ...BASE, self: mateAt(40), allies: [away(i)], camera: camOn(mateAt(40)) });
+      const records = await drive(
+        specs, 20,
+        f => (f < parted ? mateAt(f - 20) : away(f - parted)),
+        f => (f >= parted ? mateAt(40) : null),
+      );
+      const last = records[records.length - 1];
+      expect(last.state).toBe(TrackingState.LOCKED);
+      expect(distance(last.px!, mateAt(40))).toBeLessThanOrEqual(3);
+    });
   });
 
   test('walking past where an enemy covers us does not end the cover hold', async () => {

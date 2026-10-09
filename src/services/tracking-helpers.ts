@@ -1179,6 +1179,14 @@ export const TEAMMATE_VERDICT_RUNS = 2;
 /** ...and the latest within this, for the icon to be set aside. */
 export const TEAMMATE_VERDICT_TTL_MS = 2000;
 
+/**
+ * How close, in icon diameters, the camera rectangle's centre must be to a
+ * teammate's icon for the tracker to take ours to be under it rather than let
+ * that icon go (TrackingService.startTeammateCover). A locked camera puts our
+ * champion about a third of an icon from the centre.
+ */
+export const TEAMMATE_COVER_CAMERA_ICONS = 1;
+
 interface TeammateMark { x: number; y: number; runs: number; lastMs: number }
 
 /**
