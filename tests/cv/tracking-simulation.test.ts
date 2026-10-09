@@ -2220,6 +2220,21 @@ describe('an icon the skin match calls a teammate\'s', () => {
       expect(starts.filter(e => e.frame > capped!.frame)).toEqual([]);
     });
 
+    test('they recall off ours, the skin match unsure of us: ours is kept, without a gap', async () => {
+      // The covering icon is held back from the locked path only while the
+      // teammate was marked there lately; after that what is left is ours.
+      const specs = coveredSpecs(30);
+      const left = specs.length;
+      const spot = mateAt(30);
+      for (let i = 0; i < 120; i++) specs.push({ ...BASE, self: spot, camera: camOn(spot) });
+      const { records, events } = await drive(specs, f => (f < left ? mateAt(f - WALK) : null));
+      for (const r of records.slice(left)) {
+        expect(r.state).toBe(TrackingState.LOCKED);
+        expect(distance(r.px!, spot)).toBeLessThanOrEqual(3);
+      }
+      expect(events.some(e => e.line.includes('cap'))).toBe(false);
+    });
+
     test('a death under them keeps the spot where ours went under, not where they walked to', async () => {
       const specs = coveredSpecs(80);
       const deathAt = WALK + 79;
