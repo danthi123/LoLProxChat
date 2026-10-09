@@ -101,7 +101,11 @@ def files_for_skin(alias, files, skin):
         below = [n for n in by_num if n <= skin]
         if below:
             out += by_num[max(below)]
-    return sorted(out)
+            # As iconFilesForSkin: a skin without an icon of its own may be
+            # drawn with the base one (Smolder's skin 6).
+            if max(below) not in (skin, 0) and 0 in by_num:
+                out += by_num[0]
+    return sorted(set(out))
 
 
 def all_skins(alias, files):

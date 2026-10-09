@@ -6,7 +6,7 @@ import {
   computeVolumes,
   computeVolumesFromRoom,
 } from '../src/volumes.js';
-import { computeTieredVolumes, closestApproach } from '../src/volumes.js';
+import { computeTieredVolumes, closestApproach, LOST_ALLY_ANCHOR_MS } from '../src/volumes.js';
 
 // 64 hex chars = 256-bit test key
 const TEST_KEY = 'a'.repeat(64);
@@ -187,7 +187,8 @@ describe('computeTieredVolumes (v0.3 path)', () => {
   // getRoomClients signature: (roomId) => TieredRoomClient[]
   // Returns ALL clients in the room including the requester — the function
   // filters out self by name.
-  const makeGetter = (clients: Array<{ name: string; team?: 'ORDER' | 'CHAOS'; position?: { x: number; y: number; updatedMs: number } }>) =>
+  type Stamped = { x: number; y: number; updatedMs: number };
+  const makeGetter = (clients: Array<{ name: string; team?: 'ORDER' | 'CHAOS'; position?: Stamped; lastSeen?: Stamped }>) =>
     () => clients;
 
   it('returns ally at 1.0 regardless of distance', () => {
@@ -233,6 +234,55 @@ describe('computeTieredVolumes (v0.3 path)', () => {
       ]),
     );
     expect(result.peerVolumes).toEqual({ AllyNoPos: 1.0, AllyStale: 1.0 });
+  });
+
+  it('with allyProximity set, scores an ally the tracker lost at where they were last seen, for a while', () => {
+    // A 2026-10-09 test heard other lanes "all the time": lost allies went
+    // straight to full volume. Now they are placed at their last position
+    // until LOST_ALLY_ANCHOR_MS, and only then fall back to 1.0.
+    const recent = Date.now() - (LOST_ALLY_ANCHOR_MS - 5_000);
+    const old = Date.now() - (LOST_ALLY_ANCHOR_MS + 5_000);
+    const result = computeTieredVolumes(
+      { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me', allyProximity: true },
+      makeGetter([
+        { name: 'Me', team: 'ORDER', position: { x: 0, y: 0, updatedMs: Date.now() } },
+        { name: 'LostNear', team: 'ORDER', lastSeen: { x: 400, y: 0, updatedMs: recent } },
+        { name: 'LostFar', team: 'ORDER', lastSeen: { x: 9000, y: 0, updatedMs: recent } },
+        { name: 'StaleFar', team: 'ORDER', position: { x: 9000, y: 0, updatedMs: recent } },
+        { name: 'LostLongAgo', team: 'ORDER', lastSeen: { x: 9000, y: 0, updatedMs: old } },
+        // Cross-team peers never get this: a disowned position is not a place
+        // an enemy can hear them at.
+        { name: 'EnemyLost', team: 'CHAOS', lastSeen: { x: 400, y: 0, updatedMs: recent } },
+      ]),
+    );
+    expect(result.peerVolumes).toEqual({ LostNear: 1.0, LostLongAgo: 1.0 });
+  });
+
+  it('a requester that has lost itself and asks alliesOnly hears nobody from the other team', () => {
+    const now = Date.now();
+    const result = computeTieredVolumes(
+      { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me', allyProximity: true, alliesOnly: true },
+      makeGetter([
+        { name: 'Me', team: 'ORDER', lastSeen: { x: 0, y: 0, updatedMs: now } },
+        { name: 'AllyNear', team: 'ORDER', position: { x: 300, y: 0, updatedMs: now } },
+        { name: 'AllyFar', team: 'ORDER', position: { x: 9000, y: 0, updatedMs: now } },
+        { name: 'AllyUnplaced', team: 'ORDER' },
+        { name: 'EnemyNear', team: 'CHAOS', position: { x: 300, y: 0, updatedMs: now } },
+      ]),
+    );
+    expect(result.peerVolumes).toEqual({ AllyNear: 1.0, AllyUnplaced: 1.0 });
+  });
+
+  it('alliesOnly from a client with no team returns nobody', () => {
+    const now = Date.now();
+    const result = computeTieredVolumes(
+      { myPosition: { x: 0, y: 0 }, roomId: 'r1', name: 'Me', alliesOnly: true },
+      makeGetter([
+        { name: 'Me' },
+        { name: 'Other', team: 'CHAOS', position: { x: 300, y: 0, updatedMs: now } },
+      ]),
+    );
+    expect(result.peerVolumes).toEqual({});
   });
 
   it('makes cross-team enemies audible out to vision range, omitting those beyond', () => {

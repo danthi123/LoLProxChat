@@ -77,6 +77,10 @@ export class ScriptedTracker {
   getLastPosition(): Position | null { return this.position; }
   getHoldDurationSec(): number { return this.holdSec; }
   getHoldReason(): HoldReason { return this.holdSec > 0 ? this.holdReason : null; }
+  /** Where the script says we were last seen; null (the default) when lost
+   *  means no anchor, so the orchestrator falls back to team-only. */
+  lastSeen: Position | null = null;
+  getLastSeenPosition(_maxAgeMs: number): Position | null { return this.lastSeen; }
   getCameraPosition(): Position | null {
     return this.cameraTrackingEnabled ? this.cameraPosition : null;
   }

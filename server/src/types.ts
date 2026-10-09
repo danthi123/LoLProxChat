@@ -65,6 +65,10 @@ export interface ClientInfo {
   // Undefined when the client has the setting off, predates v0.5.9, or has
   // not reported one yet. See ClientMessage.cx — presence is consent.
   camera?: { x: number; y: number; updatedMs: number };
+  // The position the client last reported before it disowned it (a `coords`
+  // with stale: true). Used for nothing but its own teammates' volumes, and
+  // only for a short while — see LOST_ALLY_ANCHOR_MS in volumes.ts.
+  lastSeen?: { x: number; y: number; updatedMs: number };
   // v0.3: team for cross-team filtering. Undefined means a legacy v0.2 client —
   // server falls back to team-blind volume math (every peer audible if in range).
   team?: 'ORDER' | 'CHAOS';

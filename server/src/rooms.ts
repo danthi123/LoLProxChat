@@ -59,6 +59,7 @@ export class RoomManager {
       team: team ?? evicted?.team,
       position: evicted?.position,
       camera: evicted?.camera,
+      lastSeen: evicted?.lastSeen,
     };
     existing.push(info);
     this.rooms.set(roomId, existing);
@@ -143,6 +144,7 @@ export class RoomManager {
     const info = this.clients.get(ws);
     if (!info) return;
     info.position = { x, y, updatedMs: Date.now() };
+    info.lastSeen = undefined;
   }
 
   /**
@@ -206,13 +208,16 @@ export class RoomManager {
 
   /**
    * Forget a client's position without disconnecting them. They stay in the
-   * room and keep being heard by teammates, who are not scored on distance;
-   * cross-team peers stop hearing them at once rather than after the staleness
-   * window, because the client has told us the position is no longer true.
+   * room and keep being heard by teammates; cross-team peers stop hearing them
+   * at once rather than after the staleness window, because the client has
+   * told us the position is no longer true. It is kept as `lastSeen`, which
+   * teammates with ally proximity on go on being scored against for a short
+   * while (computeTieredVolumes).
    */
   clearPosition(ws: WebSocket): void {
     const info = this.clients.get(ws);
     if (!info) return;
+    if (info.position) info.lastSeen = info.position;
     info.position = undefined;
     // The camera goes with it. Disowning the position means "I no longer know
     // where I am"; a peer with no position is skipped in scoring anyway, and
@@ -262,6 +267,7 @@ export class RoomManager {
       team: c.team,
       position: c.position,
       camera: c.camera,
+      lastSeen: c.lastSeen,
     }));
   }
 

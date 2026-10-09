@@ -386,22 +386,38 @@ describe('losing the icon', () => {
     expect(across).toBeLessThan(2);
   });
 
-  test('a hold past the forced-reacquire budget drops to SCANNING and re-locks when the icon returns', async () => {
+  // Where the icon comes back once the hold has run out, and whether that
+  // gets it back: the classifier is silent, so only the place can vouch.
+  async function returnAfterForcedRescan(RETURN: Point, step: Point, over: SceneSpec = BACKDROP) {
     const holdFrames = Math.ceil(FORCED_REACQUIRE_HOLD_MS / FRAME_MS) + 4;
-    const RETURN: Point = { x: 200, y: 90 };
     const scenes = renderScenes([
       ...walk(16),
       ...Array.from({ length: holdFrames }, () => NO_TEAL),
-      ...walk(8, RETURN, { x: 1, y: 0 }),
+      ...walk(8, RETURN, step, over),
     ]);
     const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
-
     const records = await driveTracker(h, scenes);
-    const m = metrics(records);
-    const last = records[records.length - 1];
-
-    expect(m.scanningReentries).toBe(1);
+    expect(metrics(records).scanningReentries).toBe(1);
     expect(logs.some(l => l.includes('forcing re-acquisition'))).toBe(true);
+    return records[records.length - 1];
+  }
+
+  test('a hold past the forced-reacquire budget drops to SCANNING and re-locks when the icon returns', async () => {
+    const last = await returnAfterForcedRescan({ x: 104, y: 185 }, { x: 1, y: 0 });
+    expect(last.state).toBe(TrackingState.LOCKED);
+    expect(distance(last.px!, last.truth!)).toBeLessThanOrEqual(3);
+  });
+
+  test('an icon that turns up across the map is not taken on its movement trail alone', async () => {
+    // White pixels by an icon used to count as identifying it and skip the
+    // walking-reach check, which put testers in another lane (2026-10-09).
+    const last = await returnAfterForcedRescan({ x: 200, y: 90 }, { x: 1, y: 0 });
+    expect(last.state).toBe(TrackingState.SCANNING);
+  });
+
+  test('an icon that turns up in a base is taken however far it is: a recall', async () => {
+    // The fountain, clear of the backdrop's turret drawn over the base.
+    const last = await returnAfterForcedRescan({ x: 25, y: 250 }, { x: 1, y: 0 }, { ...BACKDROP, turrets: [] });
     expect(last.state).toBe(TrackingState.LOCKED);
     expect(distance(last.px!, last.truth!)).toBeLessThanOrEqual(3);
   });
@@ -1184,6 +1200,34 @@ describe('a lock that ends up on a static teal marker (v0.5.10 Briar log)', () =
       expect(r.state).toBe(TrackingState.LOCKED);
       expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
     }
+  });
+
+  test('RESET does not take an icon across the map for white pixels beside it (2026-10-09 logs)', async () => {
+    // Testers pressed RESET and got the same wrong lane straight back: with
+    // the classifier silent, the rescan took whichever icon had white pixels
+    // by it, anywhere on the map. Now it looks within walking reach of the
+    // icon the user rejected, where theirs almost always is.
+    const STAND: Point = { x: 185, y: 175 };
+    const FAR = BACKDROP.allies![1];
+    const PINGED: SceneSpec = {
+      ...BACKDROP,
+      allies: [WARD, FAR],
+      whiteBeside: [{ at: FAR, dir: { x: -1, y: 0 } }],
+    };
+    expect(distance(FAR, WARD)).toBeGreaterThan(ICON_DIAM * 4);
+    const after = [
+      ...Array.from({ length: 16 }, () => ({ ...PINGED, self: STAND, selfTrail: null })),
+      ...walk(24, STAND, { x: 0, y: -1 }, PINGED),
+    ];
+    const resetAt = specs(after.length, after).length - after.length + 4;
+    const { records } = await drive('zero', after.length, resetAt, after);
+    expect(logs.some(l => l.includes('Position reset by the user'))).toBe(true);
+    for (const r of records.slice(resetAt)) {
+      if (r.state === TrackingState.LOCKED) expect(distance(r.px!, FAR)).toBeGreaterThan(ICON_DIAM);
+    }
+    const last = records[records.length - 1];
+    expect(last.state).toBe(TrackingState.LOCKED);
+    expect(distance(last.px!, last.truth!)).toBeLessThanOrEqual(3);
   });
 
   test('a ward vanishing for one frame during the watch neither locks early nor counts as movement', async () => {

@@ -50,6 +50,12 @@ export interface SceneSpec {
   /** Direction the movement-path trail points, i.e. where the champion came from. */
   selfTrail?: Point | null;
   allies?: Point[];
+  /**
+   * White marks beside an icon that are not our movement path — a ping, a
+   * ward's outline, part of another icon. Drawn like a trail, which is what
+   * makes them a trap for anything that takes white pixels as identity.
+   */
+  whiteBeside?: { at: Point; dir: Point }[];
   enemies?: Point[];
   minions?: Point[];
   turrets?: Point[];
@@ -81,6 +87,7 @@ export function renderScene(spec: SceneSpec): RenderedScene {
   for (const p of spec.turrets ?? []) disc(f, ox + p.x, oy + p.y, 8, TEAL);
   for (const p of spec.minions ?? []) minionCluster(f, ox + p.x, oy + p.y);
   for (const p of spec.enemies ?? []) ring(f, ox + p.x, oy + p.y, ICON_DIAM, RED);
+  for (const w of spec.whiteBeside ?? []) movementPath(f, ox + w.at.x, oy + w.at.y, ICON_DIAM, w.dir.x, w.dir.y);
   for (const p of spec.allies ?? []) ring(f, ox + p.x, oy + p.y, ICON_DIAM, TEAL);
 
   if (spec.self) {

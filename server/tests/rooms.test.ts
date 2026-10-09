@@ -498,4 +498,28 @@ describe('clearPosition', () => {
     const rooms = new RoomManager();
     expect(() => rooms.clearPosition(mockWs())).not.toThrow();
   });
+
+  it('keeps the disowned position as lastSeen until a new one arrives', () => {
+    const rooms = new RoomManager();
+    const ws = mockWs();
+    rooms.join('r1', 'Alice', ws, 'ORDER');
+    rooms.setPosition(ws, 500, 600);
+    rooms.clearPosition(ws);
+    expect(rooms.getRoomClients('r1')[0].lastSeen).toMatchObject({ x: 500, y: 600 });
+    // A second disown with nothing to disown does not wipe it.
+    rooms.clearPosition(ws);
+    expect(rooms.getRoomClients('r1')[0].lastSeen).toMatchObject({ x: 500, y: 600 });
+    rooms.setPosition(ws, 700, 800);
+    expect(rooms.getRoomClients('r1')[0].lastSeen).toBeUndefined();
+  });
+
+  it('carries lastSeen over a reconnect under the same name', () => {
+    const rooms = new RoomManager();
+    const ws = mockWs();
+    rooms.join('r1', 'Alice', ws, 'ORDER');
+    rooms.setPosition(ws, 500, 600);
+    rooms.clearPosition(ws);
+    rooms.join('r1', 'Alice', mockWs(), 'ORDER');
+    expect(rooms.getRoomClients('r1')[0].lastSeen).toMatchObject({ x: 500, y: 600 });
+  });
 });

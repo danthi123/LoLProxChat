@@ -31,12 +31,17 @@ export class VolumeClient {
    * opted in. The camera now goes to room state over `coords` and the server
    * reads ours from there, so it cannot be asserted per-request. See
    * signaling.sendCoords.
+   *
+   * `alliesOnly`: the tracker has lost us and `myPosition` is only where we
+   * were last seen, which we no longer vouch for — score our teammates from
+   * there and nobody else (the caller drops anyone else the server returns).
    */
   async computeVolumes(
     myPosition: Position,
     roomId: string,
     name: string,
     allyProximity: boolean,
+    alliesOnly = false,
   ): Promise<VolumeResponse> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 3000);
@@ -52,6 +57,7 @@ export class VolumeClient {
           roomId,
           name,
           allyProximity,
+          ...(alliesOnly ? { alliesOnly: true } : {}),
         }),
         signal: controller.signal,
       });

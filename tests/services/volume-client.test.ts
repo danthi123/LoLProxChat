@@ -37,4 +37,12 @@ describe('VolumeClient.computeVolumes', () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body.allyProximity).toBe(false);
   });
+
+  test('asks for allies only when told to, and otherwise leaves the field off', async () => {
+    const client = new VolumeClient();
+    await client.computeVolumes({ x: 0, y: 0 }, 'room-3', 'Me', true, true);
+    await client.computeVolumes({ x: 0, y: 0 }, 'room-3', 'Me', true);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).alliesOnly).toBe(true);
+    expect('alliesOnly' in JSON.parse(fetchMock.mock.calls[1][1].body)).toBe(false);
+  });
 });
