@@ -4,6 +4,9 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Fixed
+- **Fighting side by side with a teammate could cut you out of the enemy's audio.** When a teammate's icon is drawn over yours, the app (since v0.5.21) recognises the visible icon as theirs and lets it go, then had no position for you until it found you again. In the 2026-10-08 test that happened four times in half a minute mid-fight, about 17 seconds in all, and the enemy right there could not hear the player. Now, if your camera has been following you (it stays centred on you as you move, as a locked camera does), the app takes your icon to be under the teammate's and uses their spot. It stops as soon as the camera moves off them (a recall puts a locked camera on the fountain), when your own icon reappears, or after 10 seconds, and not again until it has recognised your icon again. With an unlocked camera nothing changes.
+
 ## [v0.5.21] — 2026-10-08
 
 ### Added
