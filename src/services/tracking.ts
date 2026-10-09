@@ -1609,16 +1609,15 @@ export class TrackingService {
         // near-silent model makes one icon "identified" at 1.0; the raw output
         // has to say something too (the 2026-10-07 log's far re-locks).
         //
-        // In a base, where a recall lands, less will do: the smoothed score
-        // alone, or a movement path — players walk out of the fountain, and
-        // in a base white marks are far more often our path than anything
-        // else. With neither, an icon there is as likely a teammate shopping
-        // or respawning while ours is still hidden in lane.
-        const vouched = classifierUsable && clsScore >= 0.5;
-        const identified = vouched &&
+        // In a base, where a recall lands, a movement path will do as well:
+        // players walk out of the fountain, and in a base white marks are far
+        // more often our path than anything else. Without one, an icon there
+        // is as likely a teammate shopping or respawning while ours is still
+        // hidden in lane — and the smoothed score alone says nothing then, as
+        // it is normalized to the best icon in view, which may be theirs.
+        const identified = classifierUsable && clsScore >= 0.5 &&
           this.getClassifierScore(b, this.rawClassifierScores) >= FAR_REACQUIRE_MIN_RAW;
-        const baseOk = vouched || whiteScore >= 0.5;
-        if (!identified && this.beyondReach({ x: b.cx, y: b.cy }, region, baseOk)) continue;
+        if (!identified && this.beyondReach({ x: b.cx, y: b.cy }, region, whiteScore >= 0.5)) continue;
       }
 
       if (score > bestScore) {
@@ -1644,7 +1643,13 @@ export class TrackingService {
     // then follows and nothing corrects. Wait instead (we are team-only while
     // scanning) until the player walks or the classifier speaks, for as long
     // as the reset's window lasts; after that, scan as usual.
-    if (avoidedSomething && performance.now() < this.avoidUntilMs && !classifierUsable && bestWhite <= 0) {
+    //
+    // After the user's own RESET the wait lasts for the whole scan, as the
+    // exclusion does: with RESET pressed on a lock that was right and the
+    // player standing still, the best ring in reach is a teammate, and no
+    // camera pick can undo it (the rejected icon is barred from that too).
+    if (avoidedSomething && (performance.now() < this.avoidUntilMs || this.lostByReset) &&
+        !classifierUsable && bestWhite <= 0) {
       return;
     }
 

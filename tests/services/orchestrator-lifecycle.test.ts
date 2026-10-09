@@ -738,6 +738,24 @@ describe('the volume tick', () => {
       expect(staleCalls(h)[2][4]).toBeUndefined();
     });
 
+    it('dying while lost withdraws the sighting from the server', async () => {
+      const { h } = await heldFor(3, 'no-match');
+      h.tracker.lastSeen = { x: 6900, y: 7000 };
+      h.tracker.state = TrackingState.SCANNING;
+      await jest.advanceTimersByTimeAsync(300);
+      await settle();
+      const before = staleCalls(h).length;
+      expect(staleCalls(h)[before - 1][4]).toBe(0);
+
+      // The real tracker has no body to keep, and no sighting while dead.
+      h.tracker.onDeath();
+      h.tracker.lastSeen = null;
+      await jest.advanceTimersByTimeAsync(300);
+      await settle();
+      expect(staleCalls(h)).toHaveLength(before + 1);
+      expect(staleCalls(h)[before][4]).toBeUndefined();
+    });
+
     it('disowns once per episode, and vouches again after recovery', async () => {
       const { h } = await heldFor(3, 'no-match');
       await jest.advanceTimersByTimeAsync(1000);

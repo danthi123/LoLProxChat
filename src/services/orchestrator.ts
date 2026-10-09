@@ -711,6 +711,10 @@ export class Orchestrator {
 
     const position = this.tracking.getLastPosition();
     if (!position || (position.x === 0 && position.y === 0)) {
+      // Dead with no body to keep (we died while scanning): a sighting the
+      // server still holds for our teammates is withdrawn. No-op before the
+      // first lock.
+      this.disownCoords();
       await this.applyLostVolumes();
       this.broadcastOverlayState();
       return;
@@ -880,8 +884,8 @@ export class Orchestrator {
       this.applyTeamOnlyVolumes();
       return;
     }
-    // Ended, or found again, while we waited: this answer is out of date.
-    if (!this.audio || this.session !== session || this.lostAnchor !== seen) return;
+    // The game ended while we waited.
+    if (!this.audio || this.session !== session) return;
     const allies: Record<string, number> = {};
     for (const [name, state] of this.peerStates) {
       if (state.team !== session.localPlayer.team) continue;
@@ -1428,6 +1432,10 @@ export class Orchestrator {
     this.tracking?.stop();
     this.tracking = null;
     this.volumeClient = null;
+    // The next game starts with nothing disowned.
+    this.coordsDisowned = false;
+    this.disownedWith = null;
+    this.lostAnchor = null;
     if (this.debugBundle || isLoggingEnabled()) {
       this.debugBundle = null;
       this.bundleChain = this.bundleChain.then(async () => {

@@ -433,10 +433,16 @@ describe('losing the icon', () => {
       ...Array.from({ length: holdFrames }, () => NO_TEAL),
       ...vanished(16, SHOPPING),
     ]);
-    const h = newTracker(scenes.map(s => s.frame), { classifier: new ZeroScorer() });
-    const records = await driveTracker(h, scenes);
-    expect(metrics(records).scanningReentries).toBe(1);
-    expect(records[records.length - 1].state).toBe(TrackingState.SCANNING);
+    for (const classifier of [
+      new ZeroScorer(),
+      // A weak model leaning on them: normalized, its 0.1 reads as 1.0.
+      new OracleScorer(() => toFramePoint({ x: 28, y: 248 }), 0.1),
+    ]) {
+      const h = newTracker(scenes.map(s => s.frame), { classifier });
+      const records = await driveTracker(h, scenes);
+      expect(metrics(records).scanningReentries).toBe(1);
+      expect(records[records.length - 1].state).toBe(TrackingState.SCANNING);
+    }
   });
 
   test('a minion wave standing where the champion was does not inherit the lock', async () => {
@@ -1444,11 +1450,11 @@ describe('a shared RESET from another player, when our lock is not clean', () =>
 describe('RESET pressed when the lock was right', () => {
   const NEAR_ALLY: Point = { x: 120, y: 120 };
 
-  async function resetWhile(motion: (i: number) => Point, scorer: 'zero' | 'oracle', allies: Point[], how: 'reset' | 'rescan' = 'reset') {
+  async function resetWhile(motion: (i: number) => Point, scorer: 'zero' | 'oracle', allies: Point[], how: 'reset' | 'rescan' = 'reset', frames = 48) {
     const lockSpecs = walk(16);
     const from = lockSpecs[15].self!;
     const over: SceneSpec = { ...BACKDROP, allies };
-    const after = Array.from({ length: 48 }, (_, i) => {
+    const after = Array.from({ length: frames }, (_, i) => {
       const p = motion(i);
       return { ...over, self: { x: from.x + p.x, y: from.y + p.y }, selfTrail: p.x === 0 && p.y === 0 ? null : { x: -1, y: 0 } };
     });
@@ -1483,6 +1489,21 @@ describe('RESET pressed when the lock was right', () => {
     const own = await resetWhile(still, 'zero', [...BACKDROP.allies!, NEAR_ALLY], 'reset');
     const ownRelocked = own.findIndex((r, i) => i > 16 && r.state === TrackingState.LOCKED && distance(r.px!, r.truth!) <= 3);
     expect(ownRelocked === -1 || (ownRelocked - 16) * FRAME_MS > 1_500).toBe(true);
+  });
+
+  test('standing still past the 10s window, the player is not handed to the teammate beside them', async () => {
+    // The scan keeps the RESET icon out while it stays put, and with nothing
+    // identifying anyone the best ring in reach is the teammate's; it waits
+    // instead, team-only, until the player walks.
+    const STILL_FRAMES = 15 * 8;
+    const records = await resetWhile(
+      i => (i < STILL_FRAMES ? { x: 0, y: 0 } : { x: Math.round((i - STILL_FRAMES) * 0.75), y: 0 }),
+      'zero', [...BACKDROP.allies!, NEAR_ALLY], 'reset', STILL_FRAMES + 48);
+    for (const r of records.slice(16)) {
+      if (r.state === TrackingState.LOCKED) expect(distance(r.px!, r.truth!)).toBeLessThanOrEqual(3);
+    }
+    expect(records.slice(16, 16 + STILL_FRAMES).every(r => r.state === TrackingState.SCANNING)).toBe(true);
+    expect(records[records.length - 1].state).toBe(TrackingState.LOCKED);
   });
 
   test('a champion walking at ordinary speed is found again, not an ally', async () => {
