@@ -18,6 +18,7 @@ import {
 import { getForceTurnRelay, setForceTurnRelay } from '../services/privacy';
 import {
   getAllyProximity, setAllyProximity, getCameraListen, setCameraListen, getSharedReset, setSharedReset,
+  applyAudioDefaultsOnce,
 } from '../services/audio-prefs';
 import { computeDesiredHeight, shouldSendSize } from './resize-helpers';
 import { browserKeyToWin32Vk, humanizeVk } from '../core/keymap';
@@ -25,6 +26,10 @@ import {
   LANGUAGES, Lang, StringKey, applyTranslations, getLanguage, setLanguage, t, translateKey, translateStatus,
 } from './i18n';
 import '../core/window-globals';
+
+// Before any panel button reads them. The background window does the same; it
+// runs once per install whichever window gets there first.
+applyAudioDefaultsOnce();
 
 // v0.3 (#11): dynamic overlay-window resize so the panel grows to fit
 // debug-thumbnail / settings content and shrinks back when they collapse.

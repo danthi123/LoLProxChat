@@ -4,6 +4,9 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+### Changed
+- **Ally proximity and Voice on camera are switched back on once, the first time this version starts.** Every tester starts from the same, known settings, whatever an earlier version or a stray click left stored. Turn either off again and it stays off. Shared RESET is not touched: it is opt-in, so its default is off.
+
 ## [v0.5.21] — 2026-10-08
 
 ### Added
