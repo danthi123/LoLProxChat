@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.5.22] — 2026-10-08
+
 ### Changed
 - **Ally proximity and Voice on camera are switched back on once, the first time this version starts.** Every tester starts from the same, known settings, whatever an earlier version or a stray click left stored. Turn either off again and it stays off. Shared RESET is not touched: it is opt-in, so its default is off.
 - **The debug log now records Ally proximity, Voice on camera and Shared RESET being switched on or off during a game.** Until now it only had their state when the game started. In the 2026-10-08 test, one player heard their ally at full volume across the map for the rest of the game. What the server sent back could only happen with Ally proximity switched off, but the log said it was on at the start and had no way to show it being turned off.
