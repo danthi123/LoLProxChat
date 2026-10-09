@@ -2109,44 +2109,64 @@ describe('an icon the skin match calls a teammate\'s', () => {
   // a minute, with the enemy in the fight unable to hear us).
   describe('over ours, with the camera centred on them', () => {
     const P: Point = { x: 120, y: 150 };
-    const camOn = (p: Point) => ({ x: p.x - 55, y: p.y - 40, w: 110, h: 80 });
+    // A real camera rectangle is about 3.4 by 1.9 icons (2026-10-08 frames).
+    const camOn = (p: Point) => ({ x: p.x - 41, y: p.y - 23, w: 82, h: 46 });
     const BASE: SceneSpec = { enemies: BACKDROP.enemies };
-    const selfAt = (i: number): Point => ({ x: P.x - 20 + i, y: P.y });
+    const WALK = 50;
+    const selfAt = (i: number): Point => ({ x: P.x - WALK + i, y: P.y });
     const mateAt = (i: number): Point => ({ x: P.x + Math.floor(i / 4), y: P.y });
 
-    /** 20 frames walking to P alone, then `cover` frames hidden under the teammate. */
-    function coveredSpecs(cover: number): SceneSpec[] {
+    /** WALK frames walking to P alone, the camera locked on us, then `cover` frames hidden under the teammate. */
+    function coveredSpecs(cover: number, camera: (p: Point) => SceneSpec['camera'] = camOn): SceneSpec[] {
       const specs: SceneSpec[] = [];
-      for (let i = 0; i < 20; i++) specs.push({ ...BASE, self: selfAt(i), selfTrail: { x: -1, y: 0 }, camera: camOn(selfAt(i)) });
-      for (let i = 0; i < cover; i++) specs.push({ ...BASE, self: null, allies: [mateAt(i)], camera: camOn(mateAt(i)) });
+      for (let i = 0; i < WALK; i++) specs.push({ ...BASE, self: selfAt(i), selfTrail: { x: -1, y: 0 }, camera: camera(selfAt(i)) });
+      for (let i = 0; i < cover; i++) specs.push({ ...BASE, self: null, allies: [mateAt(i)], camera: camera(mateAt(i)) });
       return specs;
     }
 
-    async function drive(specs: SceneSpec[], mateFrom: number, mate: (frame: number) => Point | null, self: (frame: number) => Point | null = () => null) {
+    async function drive(
+      specs: SceneSpec[],
+      mate: (frame: number) => Point | null,
+      self: (frame: number) => Point | null = () => null,
+      at: Record<number, (h: any) => void> = {},
+    ) {
       const scenes = renderScenes(specs);
       let frame = 0;
       const classifier = new SkinVerdictScorer(
         () => { const p = self(frame); return p ? toFramePoint(p) : null; },
-        () => { const m = frame >= mateFrom ? mate(frame) : null; return m ? [toFramePoint(m)] : []; },
+        () => { const m = frame >= WALK ? mate(frame) : null; return m ? [toFramePoint(m)] : []; },
       );
       const h = newTracker(scenes.map(sc => sc.frame), { classifier });
       const records = [];
+      const events: Array<{ frame: number; line: string }> = [];
       for (let i = 0; i < scenes.length; i++) {
         frame = i;
+        at[i]?.(h);
+        const before = logs.length;
         records.push(...await driveTracker(h, [scenes[i]]));
+        for (const line of logs.slice(before)) events.push({ frame: i, line });
       }
-      return records;
+      return { records, h, events };
     }
 
     test('reports their spot as ours instead of nothing, following them', async () => {
       const specs = coveredSpecs(70);
-      const records = await drive(specs, 20, f => mateAt(f - 20));
-      for (let i = 20; i < specs.length; i++) {
+      const { records } = await drive(specs, f => mateAt(f - WALK));
+      for (let i = WALK; i < specs.length; i++) {
         expect(records[i].state).toBe(TrackingState.LOCKED);
-        expect(distance(records[i].px!, mateAt(i - 20))).toBeLessThanOrEqual(3);
+        expect(distance(records[i].px!, mateAt(i - WALK))).toBeLessThanOrEqual(3);
       }
       expect(logs.some(l => l.includes('under a teammate'))).toBe(true);
       expect(logs.some(l => l.includes('is a teammate\'s (skin match)'))).toBe(false);
+    });
+
+    test('a camera that merely has them on screen does not count', async () => {
+      // The camera parked on the spot all along, not following us there: no
+      // sign it is locked on us, so the v0.5.21 rule stands.
+      const specs = coveredSpecs(40, () => camOn(P));
+      await drive(specs, f => mateAt(f - WALK));
+      expect(logs.some(l => l.includes('under a teammate'))).toBe(false);
+      expect(logs.some(l => l.includes('is a teammate\'s (skin match)'))).toBe(true);
     });
 
     // A recall puts a locked camera on the fountain, where the map's corner
@@ -2160,7 +2180,7 @@ describe('an icon the skin match calls a teammate\'s', () => {
       const specs = coveredSpecs(40);
       const moved = specs.length;
       for (let i = 40; i < 70; i++) specs.push({ ...BASE, self: null, allies: [mateAt(i)], camera: camOn(far) });
-      const records = await drive(specs, 20, f => mateAt(f - 20));
+      const { records } = await drive(specs, f => mateAt(f - WALK));
       const late = records.slice(moved);
       const onMate = late.map(r => r.state === TrackingState.LOCKED && !!r.px && distance(r.px, mateAt(40)) <= 12);
       expect(onMate.lastIndexOf(true) + 1).toBeLessThanOrEqual(within);
@@ -2172,14 +2192,43 @@ describe('an icon the skin match calls a teammate\'s', () => {
       const parted = specs.length;
       const away = (i: number): Point => ({ x: mateAt(40).x + 2 * i, y: P.y - i });
       for (let i = 0; i < 40; i++) specs.push({ ...BASE, self: mateAt(40), allies: [away(i)], camera: camOn(mateAt(40)) });
-      const records = await drive(
-        specs, 20,
-        f => (f < parted ? mateAt(f - 20) : away(f - parted)),
+      const { records } = await drive(
+        specs,
+        f => (f < parted ? mateAt(f - WALK) : away(f - parted)),
         f => (f >= parted ? mateAt(40) : null),
       );
       const last = records[records.length - 1];
       expect(last.state).toBe(TrackingState.LOCKED);
-      expect(distance(last.px!, mateAt(40))).toBeLessThanOrEqual(3);
+      expect(distance(last.px!, mateAt(40)).toFixed(0)).toBe('0');
+    });
+
+    test('a skin match that keeps going unsure does not stretch it past the cap', async () => {
+      // Ours gone for good, their icon on screen with the camera following
+      // it, and the skin match unsure of them 2.5s out of every 6s. Each unsure
+      // stretch used to hand their icon back to the locked path as ours, and
+      // the next verdict started a fresh 10s cover. (Locking their icon again
+      // while the skin match is unsure is v0.5.21's behaviour, not the cover's.)
+      const FRAMES = Math.ceil(30_000 / FRAME_MS);
+      const specs = coveredSpecs(FRAMES);
+      const unsure = (f: number) => ((f - WALK) * FRAME_MS) % 6000 >= 3500;
+      const { events } = await drive(specs, f => (unsure(f) ? null : mateAt(f - WALK)));
+      const starts = events.filter(e => e.line.includes('under a teammate'));
+      const capped = events.find(e => e.line.includes('Stopped following the teammate') && e.line.includes('cap'));
+      expect(starts.length).toBeGreaterThan(0);
+      expect(capped).toBeDefined();
+      expect((capped!.frame - starts[0].frame) * FRAME_MS).toBeLessThanOrEqual(MAX_OCCLUDED_MS + 2 * FRAME_MS);
+      expect(starts.filter(e => e.frame > capped!.frame)).toEqual([]);
+    });
+
+    test('a death under them keeps the spot where ours went under, not where they walked to', async () => {
+      const specs = coveredSpecs(80);
+      const deathAt = WALK + 79;
+      const { h } = await drive(specs, f => mateAt(f - WALK), () => null, { [deathAt]: (hh: any) => hh.svc.onDeath() });
+      const lastSeen = h.svc.getLastPosition()!;
+      const startedAt = truthToGame(mateAt(0));
+      const walkedTo = truthToGame(mateAt(79));
+      expect(Math.hypot(lastSeen.x - startedAt.x, lastSeen.y - startedAt.y))
+        .toBeLessThan(Math.hypot(lastSeen.x - walkedTo.x, lastSeen.y - walkedTo.y));
     });
   });
 
