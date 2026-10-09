@@ -445,6 +445,7 @@ export class Orchestrator {
         ' hideIp=' + getForceTurnRelay() +
         ' inputDevice=' + (getStoredInputDeviceId() ? 'chosen' : 'default') +
         ' outputDevice=' + (getStoredOutputDeviceId() ? 'chosen' : 'default'));
+      this.lastAudioToggles = this.audioToggles();
     } catch (e) {
       console.warn('[LoLProxChat] Settings unreadable:', e);
     }
@@ -657,6 +658,7 @@ export class Orchestrator {
     // And the shared RESET opt-in with its toggle: told to the server only
     // when it changes.
     this.signaling.setSharedReset(getSharedReset());
+    this.logAudioToggleChange();
 
     // Broadcast presence over signaling so peers can discover us.
     // Coordinates go separately via sendCoords() — kept off this message so
@@ -819,6 +821,34 @@ export class Orchestrator {
       if (state.team === this.session.localPlayer.team) teamVolumes[name] = 1.0;
     }
     this.audio.applyPeerVolumes(teamVolumes);
+  }
+
+  /** The panel toggles that change what we hear, as they read right now. */
+  private audioToggles(): string {
+    return 'allyProximity=' + getAllyProximity() +
+      ' voiceOnCamera=' + getCameraListen() +
+      ' sharedReset=' + getSharedReset();
+  }
+
+  // The panel writes these straight to storage, so the session-start Settings
+  // line was the only record of them — and a 2026-10-08 test had a player hear
+  // their ally at full volume across the map for a whole game, which the
+  // volumes said could only be ally proximity switched off, while the log said
+  // it was on at the start. Logging the change itself settles that next time.
+  private lastAudioToggles: string | null = null;
+  private logAudioToggleChange(): void {
+    // Runs on every tick, including the unsupported-map one that reads no
+    // setting at all — a diagnostic must never be what breaks it.
+    let now: string;
+    try {
+      now = this.audioToggles();
+    } catch {
+      return;
+    }
+    if (this.lastAudioToggles !== null && now !== this.lastAudioToggles) {
+      console.log('[LoLProxChat] Settings changed: ' + now + ' (was ' + this.lastAudioToggles + ')');
+    }
+    this.lastAudioToggles = now;
   }
 
   // Log camera-listen transitions only — at 10 Hz a per-tick line would be the
@@ -1335,6 +1365,7 @@ export class Orchestrator {
     this.peerStates.clear();
     this.remoteReset = null;
     this.lastRemoteResetMs = -Infinity;
+    this.lastAudioToggles = null;
     this.localSummonerName = '';
     this.rosterIdentities = [];
     this.clearSessionAttemptState();
