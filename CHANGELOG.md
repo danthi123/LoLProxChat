@@ -4,6 +4,11 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.5.25] — 2026-10-21
+
+### Changed
+- Champion classifier retrained on the current-patch Community Dragon icon set (game patch 16.21.1).
+
 ### Changed
 - **Server: the fog-of-war check and the camera box for Voice on camera are rolled back** (public server, 2026-10-17) after reports of problems in games. The server is back to v0.5.23's. Camera mode is unaffected: it decides who you hear on your own PC, fog of war included. With Camera mode off, enemies are heard by distance again, brush or not, and Voice on camera listens from the camera's centre within the usual range. v0.5.24 apps keep working; the server ignores what they send for these.
 
@@ -556,6 +561,7 @@ Most of this release was contributed by a tester's friend, who reworked hearing 
 Initial public iteration: Overwolf → Tauri 2 migration, Supabase-stack → custom 1-container WebSocket signaling server, minimap CV pipeline (HSV color filter + blob detection + ONNX champion classifier), WebRTC P2P voice with AES-GCM encrypted position blobs computed server-side, in-app updater. See `docs/plans/` for the historical design + implementation documents from that period.
 
 [Unreleased]: https://github.com/danthi123/LoLProxChat/compare/v0.4.4...HEAD
+[v0.5.25]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.25
 [v0.5.7]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.7
 [v0.5.6]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.6
 [v0.5.5]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.5
