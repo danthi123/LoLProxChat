@@ -1,7 +1,7 @@
 {
-  "top1": 0.6724,
-  "top5": 0.8591,
-  "self_vs_4": 0.9498,
-  "val_samples": 873,
+  "top1": 0.7024,
+  "top5": 0.8712,
+  "self_vs_4": 0.946,
+  "val_samples": 877,
   "num_classes": 173
 }
