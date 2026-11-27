@@ -109,6 +109,15 @@ Riot's League policy rules out using "information not present in the game client
 - **Voice on camera** does not meet it: it lets you hear enemies your champion has no vision of. It is on by default.
 - **While dead**, hearing enemies near your body does not meet it either.
 
+### Left as is, and what that means
+
+Two things Riot's rules point at were looked at and deliberately left unchanged for now:
+
+- **Voice on camera stays on by default.** v0.5.24 also switched it back on, once, for every install that had it off. So unless a player turns it off themselves, they are running the setting that falls furthest short of the hidden-information rule above, including players who had turned it off before. Turning it off sticks.
+- **The non-endorsement notice is only in the README and these docs, not in the app.** Riot's policy wants it "readily visible to players". Someone who downloads only the exe from Releases never sees it, so this probably does not fully meet that requirement yet.
+
+Either is a small change if Riot's review asks for it.
+
 None of this involves reading memory, injecting or automating anything; it is about what the audio tells you. Until these are changed or Riot has reviewed them, the honest claim is the one above: registered, approved at v0.1.19, current features not yet reviewed.
 
 ## Honest caveats
