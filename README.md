@@ -6,7 +6,7 @@
 
 **Proximity voice chat for League of Legends.** Hear nearby players (allies *and* enemies) with volume that scales by in-game distance — enemy voices fade in at around champion-vision range and are at full volume within laning distance.
 
-Standalone Windows desktop app built with Tauri 2 + WebView2. No Overwolf, no third-party voice service, no telemetry. Registered on the Riot Developer Portal (App ID 809090); an early version (v0.1.19) was approved in June 2026, and later features have not been through Riot's review yet. See [`docs/compliance.md`](docs/compliance.md).
+Standalone Windows desktop app built with Tauri 2 + WebView2. No Overwolf, no third-party voice service, no telemetry. Approved on the Riot Developer Portal (App ID 809090): first in June 2026, and resubmitted with the current features (Camera mode, Voice on camera) in November 2026. See [`docs/compliance.md`](docs/compliance.md).
 
 ---
 

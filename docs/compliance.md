@@ -98,7 +98,7 @@ If you play ranked, turn it off. If Riot objects to this feature specifically, i
 
 LoLProxChat is registered on the Riot Developer Portal — **App ID 809090** — and was approved on 2026-06-01, at v0.1.19. The registration documents the LCU + Live Client Data endpoints used and the architectural approach (Tauri overlay, no memory reads, no injection).
 
-That approval covered the app as it was then: proximity by distance only, at a shorter range. Riot's [General Policies](https://developer.riotgames.com/policies/general) say "any new features or changes to a product must be audited", and the features added since (Voice on camera, Camera mode, hearing from where you died, the speakers overlay, the longer range) have not been submitted yet. Approval is also not an endorsement: the same policy requires the notice at the top of this page.
+That approval covered the app as it was then: proximity by distance only, at a shorter range. Riot's [General Policies](https://developer.riotgames.com/policies/general) say "any new features or changes to a product must be audited", so on 2026-11-27 the product description was updated to cover everything added since (Camera mode, Voice on camera and what it can reveal, hearing from where you died, the speakers overlay, the 1350-unit range, the TURN relay) and resubmitted. The status shown afterwards is **Approved**. Approval is not an endorsement: the same policy requires the notice at the top of this page.
 
 ## Where it falls short of Riot's rules
 
@@ -118,7 +118,7 @@ Two things Riot's rules point at were looked at and deliberately left unchanged 
 
 Either is a small change if Riot's review asks for it.
 
-None of this involves reading memory, injecting or automating anything; it is about what the audio tells you. Until these are changed or Riot has reviewed them, the honest claim is the one above: registered, approved at v0.1.19, current features not yet reviewed.
+None of this involves reading memory, injecting or automating anything; it is about what the audio tells you. The resubmitted description states each of these plainly, and the status is Approved; if Riot asks for changes to any of them, this page will say so.
 
 ## Honest caveats
 
