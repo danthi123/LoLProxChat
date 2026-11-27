@@ -19,6 +19,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write # dispatch ci.yml on the refresh branch (see the PR step)
 
 jobs:
   refresh:
@@ -146,6 +147,11 @@ jobs:
             || gh pr edit "$BRANCH" \
                  --title "Refresh champion classifier — game patch ${PATCH} (v${APP})" \
                  --body-file pr-body.md
+          # A PR opened with GITHUB_TOKEN gets no pull_request CI run (GitHub
+          # parks it at "action_required" with no jobs), so start CI by hand.
+          # Dispatch is the one trigger this token may fire; the run checks out
+          # the branch head, so its checks show up on the PR.
+          gh workflow run ci.yml --ref "$BRANCH"
 
       # One refresh PR at a time. Each retrains from scratch on the full icon
       # set, so a newer one contains everything an older one did; leaving the
