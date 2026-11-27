@@ -4,11 +4,17 @@ name: CI
 # to main. Nothing else verifies PRs, so this is the safety net — e.g. it catches
 # a model retrain that breaks the classifier label test before it can merge.
 # Runs entirely on GitHub-hosted runners.
+#
+# workflow_dispatch is how icon-watch.yml gets CI onto the refresh PRs it opens.
+# GitHub does not start pull_request runs for a PR opened with GITHUB_TOKEN (it
+# leaves a run stuck at "action_required" with no jobs), but a dispatch from that
+# same token is allowed, and its checks land on the PR's head commit.
 
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
