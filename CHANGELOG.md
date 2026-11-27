@@ -558,7 +558,7 @@ Most of this release was contributed by a tester's friend, who reworked hearing 
 
 Initial public iteration: Overwolf → Tauri 2 migration, Supabase-stack → custom 1-container WebSocket signaling server, minimap CV pipeline (HSV color filter + blob detection + ONNX champion classifier), WebRTC P2P voice with AES-GCM encrypted position blobs computed server-side, in-app updater. See `docs/plans/` for the historical design + implementation documents from that period.
 
-[Unreleased]: https://github.com/danthi123/LoLProxChat/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/danthi123/LoLProxChat/compare/v0.5.25...HEAD
 [v0.5.25]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.25
 [v0.5.7]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.7
 [v0.5.6]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.6
