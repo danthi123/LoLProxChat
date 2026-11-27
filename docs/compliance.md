@@ -1,10 +1,12 @@
 # Compliance with Riot's Third-Party Policy
 
-LoLProxChat is built to stay within the categories Riot Games explicitly publishes as allowed for third-party tools. The mechanisms it uses are the same as Discord's overlay, Mobalytics, Blitz, Porofessor, and similar widely-used apps that have operated continuously alongside League of Legends for years.
+The *mechanisms* LoLProxChat uses are ones Riot's published rules allow for third-party tools, the same as Discord's overlay, Mobalytics, Blitz, Porofessor and similar apps that have run alongside League of Legends for years. What it lets you *hear* is a different question: some settings let you hear enemies the game is hiding from you, which Riot's rules on hidden information do not allow. [Where it falls short](#where-it-falls-short-of-riots-rules) lists them.
+
+LoLProxChat isn't endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games, and all associated properties are trademarks or registered trademarks of Riot Games, Inc.
 
 ## What it does (Riot's "allowed" column)
 
-- Reads the **League Client (LCU) API** for game phase and your summoner identity, and the **Live Client Data API** (`https://127.0.0.1:2999`) for the player roster. Both are interfaces Riot specifically designed for third-party use. See the [LCU policy](https://www.riotgames.com/en/DevRel/changes-to-the-lcu-api-policy).
+- Reads the **League Client (LCU) API** for game phase and your summoner identity, and the **Live Client Data API** (`https://127.0.0.1:2999`) for the player roster. Riot allows third-party apps to use both, but lists them as officially unsupported. See the [LCU policy](https://www.riotgames.com/en/DevRel/changes-to-the-lcu-api-policy).
 - Captures the **minimap region only** via standard Win32 `BitBlt` — the same mechanism OBS, ShareX, and the Snipping Tool use. No video frames from the game render path are touched.
 - Locates the **game window** with `FindWindowW` + `GetClientRect` — read-only window-manager queries against a window handle, the same pair every overlay uses to position itself. It is what anchors the capture region to the game's bottom-right corner instead of the primary monitor's, so the app works when League runs windowed or on a second display. No memory read, no injection, and the rect never leaves the machine.
 - Renders an **overlay window** that paints **outside** the LoL process — never injects, never reads game memory, never hooks DirectX. Riot's own Vanguard FAQ confirms: *"Overlays and internal tools using the API, game client, and in-game APIs should continue to function"* ([Vanguard FAQ](https://www.riotgames.com/en/DevRel/vanguard-faq)).
@@ -30,7 +32,7 @@ The volume falloff drops to zero at ~1350 game units — roughly a champion's vi
 
 That inner plateau is a loudness choice, not a reach one: the ~1350-unit cutoff is what bounds *which* enemies are audible, and it is unchanged. Inside the plateau volume is constant, so it conveys nothing about how far away the enemy actually is.
 
-The app does not reveal *where* an enemy is — only that one is somewhere within hearing range. This is strictly less information than Discord voice chat with the same opponent already provides (which has zero distance modulation).
+The app does not reveal *where* an enemy is — only that one is somewhere within hearing range. While they talk, the speakers overlay (top-left of the game) names them and their champion, so you do learn *which* enemy it is.
 
 ### Fog of war, stated plainly
 
@@ -42,7 +44,7 @@ Up to v0.5.23 the app could not see any of that: an enemy sitting in a lane brus
 
 **Proximity mode still has the leak.** A server-side version of the same check (v0.5.24: the client sent the server its minimap's enemy icons, and the server left every other enemy out) was rolled back on the public server on 2026-10-17 after reports of problems in games. v0.5.24 clients still send the icons; the server ignores them and scores by distance, as in v0.5.23.
 
-What bounds the leak in proximity mode is the hearing radius: you learn that *an* enemy is within roughly vision range of you, not which one, not where, and not through any mechanism you could aim. Players who do not want even that should not run the app, and anyone running it in a competitive context should understand it is what they are opting into.
+What bounds the leak in proximity mode is the hearing radius: you learn that an enemy is within roughly vision range of you (and, while they talk, which one: the speakers overlay names them), not where, and not through any mechanism you could aim. Players who do not want even that should not run the app, and anyone running it in a competitive context should understand it is what they are opting into.
 
 For the precise threat-modeling around how a modified client *could* extract additional information from the volume side channel, see [`threat-model.md`](threat-model.md). Note that the volume value the server returns is **continuous** — the v0.1.26 bucket quantization and jitter were reverted in v0.1.33 because the bucket transitions were audible in real games; the mitigations that remain are the hard cutoff at vision range and the staleness window on peer coordinates.
 
@@ -52,7 +54,7 @@ A dead player stays where they died for proximity purposes, in both directions, 
 
 That is a real widening, and it is stated here because the argument above does not cover it. The case for hearing being anchored to your champion is that getting close enough to hear someone costs you the same risk it costs them. A dead champion is at no risk and gives no vision at the body. So a player killed at Baron or under a tower learns, for the length of the death timer (well over a minute late game), whether enemies are still near that spot and whether they are talking — which the stock client does not tell a dead player, whose camera shows only what their team can see.
 
-What bounds it is the same as everything else here: the ~1350-unit hearing radius from a fixed point (the body cannot move), only players running this app, voice and never game audio, and nothing about *which* enemy or exactly where. The alternative — dead players silent to enemies — was considered and set aside because players testing the app expected enemies to keep hearing them while dead; it is a small, contained change around `onDeath` in `src/services/tracking.ts` and the orchestrator's dead-state path if that judgement changes.
+What bounds it is the same as everything else here: the ~1350-unit hearing radius from a fixed point (the body cannot move), only players running this app, voice and never game audio, and nothing about exactly where (though the speakers overlay names whoever is talking). The alternative — dead players silent to enemies — was considered and set aside because players testing the app expected enemies to keep hearing them while dead; it is a small, contained change around `onDeath` in `src/services/tracking.ts` and the orchestrator's dead-state path if that judgement changes.
 
 ## Specifically: "Camera mode" (default ON since v0.5.24)
 
@@ -68,7 +70,7 @@ One exception, by design: an enemy whose icon disappears right beside a teammate
 
 **Mixing it with proximity.** Players still on proximity (camera mode off, or an older version) cannot score a camera-mode player as an enemy: enemies on proximity do not hear them. Teammates on proximity hear them by distance from that "last seen" spot (with Ally proximity on), or at full volume when their tracker has not seen them for 20 seconds. Everyone in a game should use the same version and mode for it to work both ways.
 
-If you play ranked, consider turning it off: it hears more of the map than plain proximity does.
+In ranked, note what turning it off does: it drops you into proximity mode, which hears through brush and fog. Of the two modes, Camera mode is the one closer to Riot's rules ([below](#where-it-falls-short-of-riots-rules)), though it hears anyone on your screen, however far away. If neither is acceptable for ranked, don't run the app there.
 
 ## Specifically: "Voice on camera" (mutual, default ON since v0.5.18, one-way)
 
@@ -94,7 +96,29 @@ If you play ranked, turn it off. If Riot objects to this feature specifically, i
 
 ## Riot Developer Portal status
 
-LoLProxChat is **registered and approved** on the Riot Developer Portal — **App ID 809090**. The registration documents the LCU + Live Client Data endpoints used and the architectural approach (Tauri overlay, no memory reads, no injection). This is the official sign-off that the app's design fits Riot's allowed-tools category.
+LoLProxChat is registered on the Riot Developer Portal — **App ID 809090** — and was approved on 2026-06-01, at v0.1.19. The registration documents the LCU + Live Client Data endpoints used and the architectural approach (Tauri overlay, no memory reads, no injection).
+
+That approval covered the app as it was then: proximity by distance only, at a shorter range. Riot's [General Policies](https://developer.riotgames.com/policies/general) say "any new features or changes to a product must be audited", so on 2026-11-27 the product description was updated to cover everything added since (Camera mode, Voice on camera and what it can reveal, hearing from where you died, the speakers overlay, the 1350-unit range, the TURN relay) and resubmitted. The status shown afterwards is **Approved**. Approval is not an endorsement: the same policy requires the notice at the top of this page.
+
+## Where it falls short of Riot's rules
+
+Riot's League policy rules out using "information not present in the game client" for a competitive edge, and any "game-session-specific information that would be previously unknown to the player" ([League developer docs](https://developer.riotgames.com/docs/lol)). Measured against that:
+
+- **Camera mode** (default) is close: you hear an enemy only while the game shows you their icon. The exception is the up-to-6-second grace when an enemy's icon disappears beside a teammate's.
+- **Proximity mode** (Camera mode off) does not meet it: it hears by distance, through brush, walls and fog.
+- **Voice on camera** does not meet it: it lets you hear enemies your champion has no vision of. It is on by default.
+- **While dead**, hearing enemies near your body does not meet it either.
+
+### Left as is, and what that means
+
+Two things Riot's rules point at were looked at and deliberately left unchanged for now:
+
+- **Voice on camera stays on by default.** v0.5.24 also switched it back on, once, for every install that had it off. So unless a player turns it off themselves, they are running the setting that falls furthest short of the hidden-information rule above, including players who had turned it off before. Turning it off sticks.
+- **The non-endorsement notice is only in the README and these docs, not in the app.** Riot's policy wants it "readily visible to players". Someone who downloads only the exe from Releases never sees it, so this probably does not fully meet that requirement yet.
+
+Either is a small change if Riot's review asks for it.
+
+None of this involves reading memory, injecting or automating anything; it is about what the audio tells you. The resubmitted description states each of these plainly, and the status is Approved; if Riot asks for changes to any of them, this page will say so.
 
 ## Honest caveats
 
@@ -104,7 +128,8 @@ LoLProxChat is **registered and approved** on the Riot Developer Portal — **Ap
 
 ## References
 
-- [League of Legends Third Party Applications policy](https://support-leagueoflegends.riotgames.com/hc/en-us/articles/225266848-Third-Party-Applications)
+- [League of Legends Third Party Applications policy](https://support.riotgames.com/en-us/riot/events/third-party-applications)
+- [League developer docs — game policy](https://developer.riotgames.com/docs/lol)
 - [Riot Developer Portal — General Policies](https://developer.riotgames.com/policies/general)
 - [Changes to the LCU API Policy](https://www.riotgames.com/en/DevRel/changes-to-the-lcu-api-policy)
 - [Vanguard FAQ for Third Party Applications](https://www.riotgames.com/en/DevRel/vanguard-faq)

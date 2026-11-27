@@ -288,7 +288,7 @@ Collisions between two *honest* players are not a practical concern: the name is
 | Threat | Status | Notes |
 |---|---|---|
 | Analytics / telemetry / fingerprinting | **Not applicable** | None collected. No SDKs, no usage stats, no crash reporting service |
-| Public IP exposure | **Mitigated (opt-in)** | Force-TURN toggle in Settings |
+| Public IP exposure | **Mitigated (on by default)** | Hide IP (Force TURN) in Settings, on by default since v0.5.24 |
 | Updater URL injection (RCE via compromised WebView) | **Mitigated** | `ALLOWED_DOWNLOAD_PREFIX` check in `updater.rs` |
 | Arbitrary file read (via compromised WebView) | **Mitigated** | No-arg `read_league_config_file`; no arbitrary-file-read primitive |
 | Server resource abuse / DoS | **Mitigated** | Per-player + per-IP rate limits, body cap, WS hardening |
